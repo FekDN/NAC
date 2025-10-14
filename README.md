@@ -1,58 +1,58 @@
 # NAC: The Universal Genome and ISA for Artificial Intelligence
-NAC is a universal Instruction Set Architecture (ISA) and compiler for AI, representing neural networks as a standardized 'genome' for deep analysis, optimization, and hardware synthesis.
+ NAC is a universal Instruction Set Architecture (ISA) and compiler for AI, representing neural networks as a standardized 'genome' for deep analysis, optimization, and hardware synthesis.
 
 ---
 
 ## The Problem: AI Models are Black Boxes
 
-Modern AI models are complex computational graphs, tightly coupled to their implementation frameworks (PyTorch, TensorFlow) and hardware. Each model is a "black box" where architecture and parameters are intertwined, making it impossible to transfer knowledge between architectures, compare them objectively, and develop universal AI systems.
+ Modern AI models are complex computational graphs, tightly coupled to their implementation frameworks (PyTorch, TensorFlow) and hardware. Each model is a "black box" where architecture and parameters are intertwined, making it impossible to transfer knowledge between architectures, compare them objectively, and develop universal AI systems.
 
 ## The Solution: A New Layer of Abstraction
 
-The NAC project introduces a fundamentally new abstraction layer: a unified binary format and instruction set where any neural network can be represented as standardized, executable code. NAC is a **universal machine language for AI**, analogous to a processor's ISA, but designed for the semantics of neural computation graphs.
+ The NAC project introduces a fundamentally new abstraction layer: a unified binary format and instruction set where any neural network can be represented as standardized, executable code. NAC is a **universal machine language for AI**, analogous to a processor's ISA, but designed for the semantics of neural computation graphs.
 
-This decouples the model's architectural "body" from its parametric "mind," enabling three powerful paradigms:
+ This decouples the model's architectural "body" from its parametric "mind," enabling three powerful paradigms:
 
 ### 1. NAC as an Instruction Set Architecture (ISA)
-*   **Hardware Synthesis:** NAC's formalized binary language can serve as an ISA specification for next-generation AI accelerators (ASICs, FPGAs). Each fundamental operation (`A >= 10`) is a potential hardware instruction.
-*   **Adaptive Computing:** This enables a new class of universal AI processors where any model runs as a `ABCD[]` microprogram, reconfiguring hardware blocks on the fly. This combines the speed of ASICs with the flexibility of GPUs.
+ *   **Hardware Synthesis:** NAC's formalized binary language can serve as an ISA specification for next-generation AI accelerators (ASICs, FPGAs). Each fundamental operation (`A >= 10`) is a potential hardware instruction.
+ *   **Adaptive Computing:** This enables a new class of universal AI processors where any model runs as a `ABCD[]` microprogram, reconfiguring hardware blocks on the fly. This combines the speed of ASICs with the flexibility of GPUs.
 
 ### 2. NAC as a Neural Genome
-*   **Comparative Genomics for AI:** We can create a "Phylogenetic Tree" of AI architectures by treating NAC signatures as genomes and recurring patterns as "genes." This allows us to map the entire AI ecosystem, discovering universal principles and tracking the "evolution" of models (e.g., from ResNet to ConvNeXt).
-*   **Discovering Foundational Building Blocks:** The system automatically mines a library of fundamental patterns (e.g., ConvBlock, ResidualBlock, TransformerLayer) from a vast corpus of models, creating a universal vocabulary of AI design.
+ *   **Comparative Genomics for AI:** We can create a "Phylogenetic Tree" of AI architectures by treating NAC signatures as genomes and recurring patterns as "genes." This allows us to map the entire AI ecosystem, discovering universal principles and tracking the "evolution" of models (e.g., from ResNet to ConvNeXt).
+ *   **Discovering Foundational Building Blocks:** The system automatically mines a library of fundamental patterns (e.g., ConvBlock, ResidualBlock, TransformerLayer) from a vast corpus of models, creating a universal vocabulary of AI design.
 
 ### 3. NAC for Generative AI & Knowledge Transfer
-*   **Generative Architecture Synthesis (NAS):** By learning the statistical "grammar" of AI design from the knowledge base, NAC enables a generative synthesizer that builds new, statistically sound architectures not by random search, but through informed construction.
-*   **Knowledge Transplantation:** By defining a canonical mapping between operations, NAC makes it possible to transfer trained weights ("skills") from a block in one model to a compatible block in another, drastically reducing retraining costs.
+ *   **Generative Architecture Synthesis (NAS):** By learning the statistical "grammar" of AI design from the knowledge base, NAC enables a generative synthesizer that builds new, statistically sound architectures not by random search, but through informed construction.
+ *   **Knowledge Transplantation:** By defining a canonical mapping between operations, NAC makes it possible to transfer trained weights ("skills") from a block in one model to a compatible block in another, drastically reducing retraining costs.
 
 ---
 
 ## How It Works: The NAC Compilation Pipeline
 
-The framework implements a full compilation and analysis pipeline:
+ The framework implements a full compilation and analysis pipeline:
 
-`AI Model (PyTorch) -> [Decomposer] -> Flat NAC Graph -> [Pattern Miner] -> [Compressor] -> Compressed NAC Signature & Rules`
+ `AI Model (PyTorch) -> [Decomposer] -> Flat NAC Graph -> [Pattern Miner] -> [Compressor] -> Compressed NAC Signature & Rules`
 
-1.  **Decomposition ("Sequencing"):** A model is traced and converted into a "flat" graph of fundamental NAC operations.
-2.  **Pattern Mining ("Gene Finding"):** The analyzer processes a large collection of flat graphs to discover recurring, statistically significant patterns ("genes").
-3.  **Compression ("Genomic Assembly"):** The original flat graph is re-encoded using the discovered patterns, creating a compact, high-level, hierarchical signature.
-4.  **Rule Extraction ("Comparative Genomics"):** A Rule Miner analyzes the compressed signatures to find high-level design principles, transition probabilities, and structural relationships.
+ 1.  **Decomposition ("Sequencing"):** A model is traced and converted into a "flat" graph of fundamental NAC operations.
+ 2.  **Pattern Mining ("Gene Finding"):** The analyzer processes a large collection of flat graphs to discover recurring, statistically significant patterns ("genes").
+ 3.  **Compression ("Genomic Assembly"):** The original flat graph is re-encoded using the discovered patterns, creating a compact, high-level, hierarchical signature.
+ 4.  **Rule Extraction ("Comparative Genomics"):** A Rule Miner analyzes the compressed signatures to find high-level design principles, transition probabilities, and structural relationships.
 
 ## Roadmap
 
-This project lays the groundwork for a new field of "neuro-compilation" and "computational genomics for AI."
+ This project lays the groundwork for a new field of "neuro-compilation" and "computational genomics for AI."
 
-#### Short-Term Goals
--   [ ] Develop robust decomposers for a wide range of architectures (CNNs, RNNs, GNNs).
--   [ ] Enhance the Pattern Miner to support graph-based and non-contiguous patterns (e.g., skip-connections).
--   [ ] Extend the NAC ISA to include control flow operations (`if`, `for`) for RNNs and dynamic models.
--   [ ] Execute the large-scale "Comparative Genomics" study on 90+ representative models to build the foundational Knowledge Base.
+ #### Short-Term Goals
+ -   [ ] Develop robust decomposers for a wide range of architectures (CNNs, RNNs, GNNs).
+ -   [ ] Enhance the Pattern Miner to support graph-based and non-contiguous patterns (e.g., skip-connections).
+ -   [ ] Extend the NAC ISA to include control flow operations (`if`, `for`) for RNNs and dynamic models.
+ -   [ ] Execute the large-scale "Comparative Genomics" study on 90+ representative models to build the foundational Knowledge Base.
 
-#### Long-Term Vision
--   [ ] Establish **NAC-ISA as a new open standard** for AI architecture representation.
--   [ ] Develop a prototype **NAC-native AI processor** (FPGA/ASIC).
--   [ ] Build a **generative AI system** that designs novel, high-performance architectures based on the NAC Knowledge Base.
--   [ ] Publish groundbreaking research on the "Universal Code of Neural Networks."
+ #### Long-Term Vision
+ -   [ ] Establish **NAC-ISA as a new open standard** for AI architecture representation.
+ -   [ ] Develop a prototype **NAC-native AI processor** (FPGA/ASIC).
+ -   [ ] Build a **generative AI system** that designs novel, high-performance architectures based on the NAC Knowledge Base.
+ -   [ ] Publish groundbreaking research on the "Universal Code of Neural Networks."
 
 ---
 
@@ -137,11 +137,43 @@ This project lays the groundwork for a new field of "neuro-compilation" and "com
  The NAC format is not self-contained. It requires a corresponding `registry.json` file
  for interpretation. The registry acts as a dictionary, mapping the integer IDs used
  in the binary format to their full string definitions, constant values, parameter
- names, and pattern definitions.
+ names, and pattern definitions:
+ ```json
+   {
+      "canonical_to_index": {},
+      "index_to_canonical": {},
+      "variation_to_index": {},
+      "constants": {},
+      "constant_group_to_index": {},
+      "index_to_constant_group": {},
+      "param_name_to_index": {},
+      "index_to_param_name": {},
+      "patterns": {},
+      "rules": {
+         "transition_rules": {},
+         "composition_rules": {},
+         "structural_rules": {}
+      }
+   }
+ ```
+
+ *   `canonical_to_index`: Maps a canonical operation signature string (e.g., `"aten.add.Tensor:node_args(2):kwargs()"`) to its unique integer ID (the `A` component).
+ *   `index_to_canonical`: The reverse mapping of the above, from an integer ID back to the signature string.
+ *   `variation_to_index`: Maps an input permutation signature (e.g., `"in0,in1"`) to its unique integer ID (the `B` component).
+ *   `constants`: A dictionary mapping a constant's unique integer ID to its serialized value (e.g., `{"type": "int", "value": 1}`). This is the primary store for literal constants (the `C` component).
+ *   `constant_group_to_index`: Maps a sorted string of constant assignments (e.g., `"arg1=10;arg2=True"`) to a unique group ID, used when a node has multiple constant inputs.
+ *   `index_to_constant_group`: The reverse mapping of the above.
+ *   `param_name_to_index`: Maps a parameter's string name (e.g., `"layer.0.weight"`) to its unique integer ID. Used by the `<CONST_REF>` operation.
+ *   `index_to_param_name`: The reverse mapping of the above.
+ *   `patterns`: Maps a pattern's unique integer ID to its Base64-encoded NAC binary representation. This is the library of discovered "genes."
+ *   `rules`: Contains high-level design principles discovered by the `RuleMiner`.
+     *   `transition_rules`: Probabilistic rules describing which node is likely to follow another (e.g., `"After 'LayerNorm' -> 'MultiHeadAttention' with 95% probability"`).
+     *   `composition_rules`: Frequently occurring combinations of (Operation, Variation, Constants), representing common "semantic idioms."
+     *   `structural_rules`: Multi-input relationships describing how a node is formed from a specific combination of parent node types.
 
 ---
 
- ## Why NAC? The Power of Canonical Representation
+## Why NAC? The Power of Canonical Representation
 
  The NAC standard is built on atomic primitives that cover over 95% of all computations in modern AI models. In effect, we are encoding the PyTorch ATen library into a binary instruction format.
 
