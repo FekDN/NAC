@@ -1,7 +1,8 @@
 `include "nac_defines.vh"
+`include "nac_hw_defines.vh"
 
 module NAC_ALU_Core #(
-    parameter RAM_STYLE = "block" // "block" for BRAM, "distributed" for LUTRAM
+    parameter RAM_STYLE = "block" // Can be "block" (BRAM) or "distributed" (LUTRAM)
 )(
     input  wire        clk,
     input  wire        rst_n,
@@ -9,131 +10,206 @@ module NAC_ALU_Core #(
     // ========================================================================
     // Command Interface (From Main FSM)
     // ========================================================================
-    input  wire        start,          // Pulse: Start execution
-    input  wire [7:0]  opcode,         // Operation Code
-    input  wire [15:0] src1_id,        // Source 1 Tensor ID
-    input  wire [15:0] src2_id_bram,   // Source 2 Tensor ID (used if not streaming)
-    input  wire [15:0] dst_id,         // Destination Tensor ID
-    output reg         done,           // Pulse: Execution finished
+    input  wire        start,          // Pulse: Start execution of the vector
+    input  wire [4:0]  hw_opcode,      // Static Hardware OpCode (Translated)
+    input  wire [15:0] src1_id,        // Input A Tensor ID (Ring Buffer Slot)
+    input  wire [15:0] src2_id_bram,   // Input B Tensor ID (Ring Buffer Slot)
+    input  wire [15:0] dst_id,         // Output Tensor ID (Ring Buffer Slot)
+    output reg         done,           // Pulse: Vector execution finished
 
     // ========================================================================
     // Weight Streaming Interface (DDR -> ALU)
     // ========================================================================
-    input  wire        use_stream,      // 1 = Operand B comes from DDR Stream
-    input  wire [31:0] stream_data,     // The weight data payload
+    input  wire        use_stream,      // 1 = Input B comes from DDR Stream
+    input  wire [31:0] stream_data,     // The weight/constant data payload
     input  wire        stream_valid,    // Handshake: Data is valid
-    output wire        stream_ready,    // Handshake: Core ready to accept (Backpressure)
+    output wire        stream_ready,    // Handshake: Core ready (Backpressure)
 
     // ========================================================================
-    // DMA Write Interface (External -> Internal BRAM)
+    // DMA Interfaces (Priority Access)
     // ========================================================================
+    // Write (DDR -> BRAM)
     input  wire        dma_wr_en,
     input  wire [31:0] dma_wr_data,
     input  wire [15:0] dma_wr_offset,   // Offset 0..VECTOR_LEN-1
-    
-    // ========================================================================
-    // DMA Read Interface (Internal BRAM -> External)
-    // ========================================================================
+    // Read (BRAM -> DDR)
     input  wire        dma_rd_req,
     output wire [31:0] dma_rd_data
 );
 
     // ========================================================================
-    // Internal Memory (Tensor Activation Memory)
+    // Constants & Configuration
     // ========================================================================
-    // Size: 32 slots * 512 elements = 16K words = 64KB
-    // Mapped to ~16 RAMB36E1 primitives on Artix-7
+    // Q16.16 Fixed Point Saturation Limits
+    localparam signed [31:0] MAX_POS = 32'h7FFFFFFF;
+    localparam signed [31:0] MIN_NEG = 32'h80000000;
+    
+    // Q16.16 One
+    localparam signed [31:0] FP_ONE  = `FIXED_ONE;
+
+    // Automatic bit-shift calculation for Mean (Avg) operation
+    // e.g., if VECTOR_LEN is 512, SHIFT_MEAN = 9.
+    localparam SHIFT_MEAN = $clog2(`VECTOR_LEN);
+
+    // ========================================================================
+    // 1. Internal Memory (Tensor Activations)
+    // ========================================================================
+    // True Dual-Port RAM.
     (* ram_style = RAM_STYLE *) 
     reg signed [31:0] tensor_mem [0:(`TENSOR_SLOTS * `VECTOR_LEN) - 1];
 
     // ========================================================================
-    // Pipeline Registers & Control Signals
+    // 2. Pipeline State Registers
     // ========================================================================
-    // Base addresses for Ring Buffer logic
+    // Base addresses calculated from Ring Buffer Slots
     reg [15:0] base_src1; 
     reg [15:0] base_src2;
     reg [15:0] base_dst;
     
-    // Execution Counters
-    reg [15:0] vec_cnt;       // Current element index (0..511)
-    reg        active;        // Core is running
+    // Execution Control
+    reg [15:0] vec_cnt;       // Current Element Index (0..511)
+    reg        active;        // 1 = Pipeline Running
     
-    // Pipeline Stage 1: Fetched Operands
-    reg signed [31:0] op_a_reg;
-    reg signed [31:0] op_b_reg;
-
-    // Pipeline Stage 2: Writeback Control
-    reg        wb_enable;
-    reg [15:0] wb_addr;
-    reg signed [31:0] wb_data;
-
-    // Stall Logic (Crucial for Streaming)
-    wire stall;
+    // Pipeline Stage Registers
+    reg signed [31:0] op_a;   // Operand A
+    reg signed [31:0] op_b;   // Operand B
+    reg signed [31:0] wb_data; // Result to Write Back
+    reg        wb_enable;     // Write Enable Flag
+    reg [15:0] wb_addr;       // Write Address
     
-    // We stall if: We are active AND streaming is ON AND data is NOT valid
-    assign stall = (active && use_stream && !stream_valid);
-    
-    // We are ready for new stream data if: We are active AND streaming is ON AND not stalled by other means
-    // Note: In this simple pipeline, if we are active and use_stream, we are ALWAYS consuming data unless stalled.
-    assign stream_ready = (active && use_stream);
+    // Accumulator for Reductions (64-bit to prevent overflow)
+    reg signed [63:0] accumulator;
+    reg        is_accum_op;   // 1 = Operation is reduction (Sum/Mean/Linear)
 
     // ========================================================================
-    // Memory Port A Logic (Read Src1 / Write Result / DMA Write)
+    // 2.5 Division State Machine Registers
+    // ========================================================================
+    reg        div_busy;      // Flag: Division FSM is running
+    reg [5:0]  div_counter;   // Iteration counter (32 downto 0)
+    reg        div_sign;      // Result sign bit
+    reg [63:0] div_dividend;  // Working register for dividend/remainder
+    reg [31:0] div_divisor;   // Absolute value of divisor
+    reg [31:0] div_result;    // Result quotient
+
+    // ========================================================================
+    // 3. Flow Control Logic
+    // ========================================================================
+    
+    // Detect if we need to stall for division
+    // Note: We only check `div_busy` here. The logic to START division happens in the main FSM.
+    wire stall_div = (hw_opcode == `H_DIV) && div_busy;
+
+    // STALL CONDITION: 
+    // 1. Active AND Streaming AND Data invalid
+    // 2. Active AND Division is busy
+    wire stall;
+    assign stall = (active && use_stream && !stream_valid) || stall_div;
+    
+    // STREAM READY:
+    // We are ready if active, need stream, AND NOT busy with division logic
+    assign stream_ready = (active && use_stream && !div_busy);
+
+    // ========================================================================
+    // 4. Math Helper Functions (Behavioral)
+    // ========================================================================
+    
+    // --- Saturation (Clamp 64-bit to 32-bit) ---
+    function signed [31:0] saturate;
+        input signed [63:0] val;
+        begin
+            if (val > MAX_POS) saturate = MAX_POS;
+            else if (val < MIN_NEG) saturate = MIN_NEG;
+            else saturate = val[31:0];
+        end
+    endfunction
+
+    // --- GELU Approximation (Q16.16) ---
+    function signed [31:0] fx_gelu;
+        input signed [31:0] x;
+        begin
+            if (x > 32'd262144) fx_gelu = x; // x > 4.0
+            else if (x < -32'd262144) fx_gelu = 0; // x < -4.0
+            else begin
+                // Simple Piecewise Linear Approx
+                if (x > 0) fx_gelu = (x >>> 1) + (x >>> 2); // ~0.75x
+                else fx_gelu = 0; 
+            end
+        end
+    endfunction
+
+    // --- Tanh Approximation (Q16.16) ---
+    function signed [31:0] fx_tanh;
+        input signed [31:0] x;
+        begin
+            if (x > 32'd131072) fx_tanh = FP_ONE; // > 2.0
+            else if (x < -32'd131072) fx_tanh = -FP_ONE; // < -2.0
+            else fx_tanh = x; // Linear in middle
+        end
+    endfunction
+
+    // --- Sin/Cos Approximations (Q16.16) ---
+    function signed [31:0] fx_sin;
+        input signed [31:0] x;
+        begin
+            fx_sin = x; // Placeholder linear approx
+        end
+    endfunction
+
+    function signed [31:0] fx_cos;
+        input signed [31:0] x;
+        begin
+            fx_cos = FP_ONE - ((x * x) >>> 17); // 1 - x^2/2
+        end
+    endfunction
+
+    // ========================================================================
+    // 5. Memory Port A (Write Priority & Read A)
     // ========================================================================
     always @(posedge clk) begin
-        // --------------------------------------------------------------------
-        // WRITE OPERATION (Priority Mux)
-        // --------------------------------------------------------------------
+        // --- Write Mux (Priority: DMA > Accumulator > Pipeline) ---
+        
         if (dma_wr_en) begin
-            // DMA Write (Highest Priority) - Writes to Slot 0 (usually input buffer)
-            // or we could use base_dst if pre-configured. 
-            // Standard convention: DMA writes to currently configured DST or hardcoded Input slot.
-            // Here we assume Top Level configures 'base_dst' correctly before DMA state.
+            // 1. DMA Input Load
             tensor_mem[base_dst + dma_wr_offset] <= dma_wr_data;
         end 
-        else if (wb_enable && !stall) begin
-            // Internal Pipeline Writeback
+        else if (is_accum_op && done) begin
+            // 2. Reduction Finalize
+            if (hw_opcode == `H_SUM)
+                tensor_mem[base_dst] <= saturate(accumulator);
+            else if (hw_opcode == `H_MEAN)
+                tensor_mem[base_dst] <= saturate(accumulator >>> SHIFT_MEAN);
+            else 
+                tensor_mem[base_dst] <= saturate(accumulator >>> 16);
+        end 
+        else if (wb_enable && !stall && !is_accum_op) begin
+            // 3. Pipeline Result (Element-wise)
+            // Note: Even if division just finished, 'stall' goes low same cycle 'wb_enable' goes high.
             tensor_mem[wb_addr] <= wb_data;
         end
 
-        // --------------------------------------------------------------------
-        // READ OPERATION (Always active for pipeline)
-        // --------------------------------------------------------------------
-        // Read Src1 (Operand A)
-        // Even if stalled, we hold the address or re-read (doesn't matter for Read)
+        // --- Read Operation (Operand A) ---
         if (!stall) begin
-            op_a_reg <= tensor_mem[base_src1 + vec_cnt];
+            op_a <= tensor_mem[base_src1 + vec_cnt];
         end
     end
 
     // ========================================================================
-    // Memory Port B Logic (Read Src2 / DMA Read)
+    // 6. Memory Port B (Read B / DMA Read)
     // ========================================================================
-    // DMA Output taps directly from Port B output register
-    assign dma_rd_data = op_b_reg;
+    assign dma_rd_data = op_b;
 
     always @(posedge clk) begin
-        if (dma_rd_req) begin
-            // DMA Read Mode: Read from Src1 Base (Output buffer)
-            // We reuse base_src1 pointer logic for output reading
-            op_b_reg <= tensor_mem[base_src1 + vec_cnt]; 
-            // Note: External DMA controller drives vec_cnt via dma logic or we share counter?
-            // In this strict implementation, DMA uses its own counter in Top Level, 
-            // but for Port B to work, we need an address.
-            // CORRECTION for Production: dma_rd_req usually implies 'vec_cnt' is driven by DMA logic,
-            // or Top Level FSM drives 'dma_offset' which connects here.
-            // Since this module interface defines dma_wr_offset but not dma_rd_offset, 
-            // we assume vec_cnt is used for both internal and DMA readout if active.
-            // *Assumption*: FSM sets 'active' low during DMA, and we need a separate address mux here.
-        end 
-        else if (!stall) begin
-            // Normal Execution Mode: Read Src2 (Operand B from BRAM)
-            op_b_reg <= tensor_mem[base_src2 + vec_cnt];
+        if (!stall) begin
+            if (dma_rd_req) begin
+                op_b <= tensor_mem[base_src1 + vec_cnt];
+            end else begin
+                op_b <= tensor_mem[base_src2 + vec_cnt];
+            end
         end
     end
 
     // ========================================================================
-    // Execution Pipeline (ALU + Control)
+    // 7. Execution Pipeline Stage
     // ========================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -143,90 +219,198 @@ module NAC_ALU_Core #(
             wb_addr <= 0;
             wb_data <= 0;
             done <= 0;
-            
-            base_src1 <= 0;
-            base_src2 <= 0;
-            base_dst  <= 0;
+            accumulator <= 0;
+            is_accum_op <= 0;
+            base_src1 <= 0; base_src2 <= 0; base_dst <= 0;
+            // Reset Div State
+            div_busy <= 0;
+            div_counter <= 0;
+            div_dividend <= 0;
+            div_divisor <= 0;
+            div_result <= 0;
+            div_sign <= 0;
         end else begin
-            // Default pulse reset
-            done <= 0;
+            done <= 0; // Reset Pulse
 
             if (start) begin
-                // --- START CONFIGURATION ---
+                // --- SETUP STATE ---
                 active <= 1;
                 vec_cnt <= 0;
-                wb_enable <= 0; // Clear pipe
+                wb_enable <= 0;
+                accumulator <= 0;
+                div_busy <= 0; // Ensure div logic is reset
                 
-                // Pre-calculate addresses (Ring Buffer Modulo)
+                is_accum_op <= (hw_opcode == `H_SUM || hw_opcode == `H_MEAN || 
+                                hw_opcode == `H_LINEAR || hw_opcode == `H_MATMUL);
+
                 base_src1 <= (src1_id & `SLOT_MASK) * `VECTOR_LEN;
                 base_src2 <= (src2_id_bram & `SLOT_MASK) * `VECTOR_LEN;
                 base_dst  <= (dst_id  & `SLOT_MASK) * `VECTOR_LEN;
             end 
             else if (active) begin
-                if (!stall) begin
-                    // --- EXECUTE STAGE ---
-                    
-                    // 1. Operand Selection
-                    // Determine where Operand B comes from
-                    reg signed [31:0] final_op_b;
-                    
-                    if (use_stream) begin
-                        // Streaming Mode: Data comes from DDR Interface
-                        // Because of stall logic, 'stream_data' is guaranteed valid here
-                        final_op_b = $signed(stream_data);
-                    end else begin
-                        // BRAM Mode: Data comes from Port B Reg
-                        final_op_b = op_b_reg;
-                    end
+                
+                // --- Prepare Operands ---
+                reg signed [31:0] final_b;
+                final_b = use_stream ? $signed(stream_data) : op_b;
+                reg signed [63:0] wide_res; 
 
-                    // 2. ALU Operations (DSP48 Inference)
-                    case (opcode)
-                        `OP_ADD: begin
-                            wb_data <= op_a_reg + final_op_b;
-                        end
-                        `OP_MUL: begin
-                            wb_data <= op_a_reg * final_op_b;
-                        end
-                        `OP_LINEAR: begin
-                            // Simplified Linear: Element-wise MAC part happens here.
-                            // Real linear usually requires Accumulator. 
-                            // For v1.1 protocol described: treating as element-wise Mul-Add stream
-                            wb_data <= op_a_reg * final_op_b;
-                        end
-                        `OP_RELU: begin
-                            // src2 is ignored in ReLU
-                            wb_data <= (op_a_reg > 32'sd0) ? op_a_reg : 32'sd0;
-                        end
-                        default: begin
-                            wb_data <= op_a_reg; // Passthrough / Identity
-                        end
-                    endcase
+                // ------------------------------------------------------------
+                // DIVISION FSM
+                // ------------------------------------------------------------
+                if (hw_opcode == `H_DIV) begin
+                    if (!div_busy) begin
+                        // START DIVISION (Cycle 0)
+                        if (final_b == 0) begin
+                            // Handle Divide by Zero (Return Max/Min or 0)
+                            wb_data <= 0; 
+                            // Treat as single cycle op, let standard logic handle wb below
+                        end else begin
+                            // Initialize Long Division
+                            // Abs(OpA)
+                            if (op_a[31]) div_dividend <= {32'd0, -op_a};
+                            else          div_dividend <= {32'd0, op_a};
+                            
+                            // Shift Dividend left by 16 for Q16.16 result precision
+                            // Effectively: (A * 2^16) / B
+                            div_dividend <= div_dividend << 16; 
 
-                    // 3. Writeback Setup (For next cycle)
-                    wb_addr <= base_dst + vec_cnt;
-                    wb_enable <= 1;
+                            // Abs(OpB)
+                            if (final_b[31]) div_divisor <= -final_b;
+                            else             div_divisor <= final_b;
 
-                    // 4. Counter Management
-                    if (vec_cnt == `VECTOR_LEN - 1) begin
-                        active <= 0;
-                        done <= 1;      // Signal completion
-                        wb_enable <= 0; // Prevent extra write next cycle (pipe flush handling needed in super-strict designs, but safe here)
+                            // Calculate Result Sign (XOR)
+                            div_sign <= op_a[31] ^ final_b[31];
+                            
+                            div_result <= 0;
+                            div_counter <= 32; // 32 iterations for 32-bit integer division
+                            div_busy <= 1;     // STALL PIPELINE
+                            wb_enable <= 0;    // Disable writeback while calculating
+                        end
+                    end 
+                    else begin
+                        // ITERATE DIVISION (Cycles 1-32)
+                        // Standard Shift-Subtract non-restoring algorithm
                         
-                        // Strict pipeline flush: The last writeback actually happens 
-                        // one cycle AFTER active goes low in this logic structure.
-                        // To ensure the last word is written, we keep wb_enable high for one cycle.
-                        // However, 'active' gates the STALL logic. 
-                        // Logic fix: Allow writeback even if !active if wb_enable is set.
-                        // (Handled in Memory Port A logic: wb_enable checks !stall, stall checks active).
-                        // If active goes low, stall goes low, write happens. Correct.
-                    end else begin
-                        vec_cnt <= vec_cnt + 1;
+                        reg [63:0] next_dividend;
+                        next_dividend = div_dividend << 1;
+                        
+                        if (next_dividend[63:32] >= div_divisor) begin
+                            next_dividend[63:32] = next_dividend[63:32] - div_divisor;
+                            div_result = (div_result << 1) | 1'b1;
+                        end else begin
+                            div_result = (div_result << 1);
+                        end
+                        div_dividend <= next_dividend;
+
+                        if (div_counter == 1) begin
+                            // FINISH DIVISION
+                            wb_data <= div_sign ? -div_result : div_result;
+                            div_busy <= 0; // RELEASE STALL
+                            
+                            // Setup Writeback for this result
+                            wb_addr   <= base_dst + vec_cnt;
+                            wb_enable <= 1;
+
+                            // Manually Increment Loop Counter here (since main logic is stalled)
+                            if (vec_cnt == `VECTOR_LEN - 1) begin
+                                active <= 0; done <= 1; wb_enable <= 0;
+                            end else begin
+                                vec_cnt <= vec_cnt + 1;
+                            end
+                        end else begin
+                            div_counter <= div_counter - 1;
+                        end
                     end
+                end
+
+                // ------------------------------------------------------------
+                // STANDARD OPERATIONS (No Stall)
+                // ------------------------------------------------------------
+                if (!stall) begin
+                    // Only execute if NOT stalling (Stream valid AND Div not busy)
+                    // Note: If Division just finished (div_busy went 0), we skip this block 
+                    // for the current cycle because we handled WB/Increment inside the Div block logic.
+                    
+                    if (hw_opcode != `H_DIV) begin
+                        case (hw_opcode)
+                            // --- Basic Math (Saturated) ---
+                            `H_ADD: begin 
+                                wide_res = op_a + final_b; 
+                                wb_data <= saturate(wide_res); 
+                            end
+                            `H_SUB: begin 
+                                wide_res = op_a - final_b; 
+                                wb_data <= saturate(wide_res); 
+                            end
+                            `H_MUL: begin 
+                                wide_res = op_a * final_b; 
+                                wb_data <= saturate(wide_res >>> 16); 
+                            end
+                            `H_NEG: wb_data <= -op_a;
+                            `H_POW: begin
+                                wide_res = op_a * op_a;
+                                wb_data <= saturate(wide_res >>> 16);
+                            end
+
+                            // --- Activations ---
+                            `H_RELU: wb_data <= (op_a > 0) ? op_a : 0;
+                            `H_GELU: wb_data <= fx_gelu(op_a);
+                            `H_TANH: wb_data <= fx_tanh(op_a);
+                            
+                            // --- Math Funcs ---
+                            `H_SIN:  wb_data <= fx_sin(op_a);
+                            `H_COS:  wb_data <= fx_cos(op_a);
+                            `H_ERF:  wb_data <= fx_tanh(op_a); 
+
+                            // --- Reductions ---
+                            `H_LINEAR, `H_MATMUL: begin
+                                wide_res = op_a * final_b;
+                                accumulator <= accumulator + wide_res;
+                                wb_data <= 0; 
+                            end
+                            `H_SUM, `H_MEAN: begin
+                                accumulator <= accumulator + op_a;
+                                wb_data <= 0;
+                            end
+
+                            // --- Logic / Masks ---
+                            `H_EQ: wb_data <= (op_a == final_b) ? FP_ONE : 0;
+                            `H_NE: wb_data <= (op_a != final_b) ? FP_ONE : 0;
+                            `H_GT: wb_data <= (op_a > final_b)  ? FP_ONE : 0;
+                            `H_LT: wb_data <= (op_a < final_b)  ? FP_ONE : 0;
+                            
+                            `H_MASKED_FILL: begin
+                                wb_data <= (op_a != 0) ? final_b : 0; 
+                            end
+
+                            // --- Generators ---
+                            `H_ARANGE: wb_data <= saturate(vec_cnt << 16);
+                            `H_FULL:   wb_data <= final_b;
+
+                            // --- Movement ---
+                            `H_COPY:   wb_data <= op_a;
+                            `H_EMBED:  wb_data <= final_b; 
+
+                            default:   wb_data <= op_a;
+                        endcase
+
+                        // Writeback Config
+                        wb_addr   <= base_dst + vec_cnt;
+                        wb_enable <= 1;
+
+                        // Loop Counter
+                        if (vec_cnt == `VECTOR_LEN - 1) begin
+                            active <= 0;    
+                            done <= 1;      
+                            wb_enable <= 0; 
+                        end else begin
+                            vec_cnt <= vec_cnt + 1;
+                        end
+                    end 
+                    // else: hw_opcode == H_DIV but div_busy is 0 (first cycle)
+                    // The division init block handles this case above.
                 end 
-                // ELSE: STALL STATE
-                // We keep 'wb_enable', 'vec_cnt', 'wb_data' frozen.
-                // Memory read addresses are frozen (driven by vec_cnt).
-                // We wait for stream_valid to go high.
+                // else: STALL state. 
             end 
             else begin
                 // Idle State
