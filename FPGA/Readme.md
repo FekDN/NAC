@@ -25,8 +25,10 @@ The FPGA is configured once with a generic "NAC Processor" bitstream.
 *   **`NAC_Byte_Fetcher`:** An intelligent pre-fetcher that bridges the gap between the 32-bit/64-bit DDR interface and the variable-length 8-bit NAC instruction stream. It handles alignment and buffering transparently.
 *   **`NAC_Processor_Top` (The Controller):** A complex FSM that parses the NAC Header (`A-B-C-D`) format. It manages:
     *   **Hardware Recursion:** Uses a hardware stack to handle `OP_PATTERN` calls (subroutines), allowing for highly compressed nested graph execution.
-    *   **RLE Engine:** Natively executes `OP_COPY` (Run-Length Encoding) loops without fetching new instructions, saving memory bandwidth.
-*   **`NAC_ALU_Core` (The Math Engine):** A pipelined vector processor mapped to DSP48E1 slices. It uses a Ring Buffer in BRAM for activation storage.
+    *   **RLE Engine:** Natively executes `OP_COPY` (Run-Length Encoding) loops. The decoding logic correctly maps the NAC specification (Template `A` from byte B, Template `B`/`C` from D-field), saving memory bandwidth.
+*   **`NAC_ALU_Core` (The Math Engine):** A pipelined vector processor mapped to DSP48E1 slices.
+    *   **Fixed Point Arithmetic:** Uses **Q16.16** signed format (16 integer bits, 16 fractional bits) with hardware saturation logic to prevent wraparound artifacts.
+    *   **Stall-Capable Pipeline:** Supports automatic pipeline stalling for data hazards or multi-cycle operations.
 
 ### 3. Weight Streaming (Zero-BRAM-Weight)
 A critical feature of this implementation is that **weights are never stored in FPGA BRAM**. 
@@ -42,24 +44,25 @@ The system implements a strict priority arbiter for the single DDR bus:
 
 ## 🛠️ Current Implementation Status
 
-This code is a **high-fidelity concept**. It implements the full control logic and data flow required for a production chip, but uses simplified arithmetic for clarity.
+This code is a **high-fidelity concept**. It implements the full control logic and data flow required for a production chip, with Q16.16 arithmetic logic ready for synthesis on Artix-7.
 
 *   ✅ **Full NAC v1.1 Parsing:** Header, Payload, Variable D-field.
 *   ✅ **Pattern Support:** Hardware stack for nested patterns.
-*   ✅ **Compression:** Native RLE (`COPY`) execution.
-*   ✅ **Streaming:** Direct DDR-to-DSP weight path.
+*   ✅ **Compression:** Correctly implemented RLE (`COPY`) execution with proper field mapping.
+*   ✅ **Arithmetic:** **Q16.16 Fixed Point** math with saturation logic (Clamp 64-bit to 32-bit).
+*   ✅ **Division Support:** Implemented **Iterative Divider FSM**. The ALU automatically stalls the pipeline to perform 32-cycle long division (`H_DIV`) without breaking timing constraints, ensuring support for Normalization layers.
+*   ✅ **Streaming:** Direct DDR-to-DSP weight path with flow control.
 *   ✅ **Protocol:** Control Block memory map for model switching.
-*   ⚠️ **Arithmetic:** Currently configured for INT32 (for logic verification).
 
 ## Roadmap (TODO)
 
 To make this a viable competitor to commercial NPUs, the following features need to be implemented:
 
 1.  **Full OpCode Support:**
-    *   Expand `NAC_ALU_Core` to support all 255 fundamental operations (currently supports basic ADD/MUL/RELU/LINEAR).
+    *   Expand `NAC_ALU_Core` to support all 255 fundamental operations (currently supports basic ADD/MUL/RELU/LINEAR/DIV/GELU/TANH).
     *   Implement `Conv2d` tiling logic.
 2.  **Precision Upgrade (FP16 / BF16):**
-    *   Move from INT32 to **BF16 (Bfloat16)** or **FP16**.
+    *   Move from Q16.16 to **BF16 (Bfloat16)** or **FP16** for wider dynamic range.
     *   **DSP Trick:** Utilize the Artix-7 DSP48E1 pre-adders and SIMD modes to process two 16-bit operations per clock cycle per DSP slice.
 3.  **Multi-Core Scaling:**
     *   Implement a "Cluster" architecture with 4–8 `NAC_ALU_Core` instances working in parallel on different tensor tiles.
@@ -68,8 +71,6 @@ To make this a viable competitor to commercial NPUs, the following features need
     *   Integrate a Xilinx **MIG (Memory Interface Generator)** controller for physical DDR3 access on Nexys/Arty boards.
 5.  **Control Flow Support:**
     *   Add hardware support for `IF`, `WHILE`, and `JMP` instructions to support dynamic graphs (e.g., Mixture of Experts).
-6.  **Auto-Registry Loading:**
-    *   Harden the `S_LOAD_REGISTRY` state machine to robustly parse variable-length Registry tables directly from storage.
 
 ## Hardware Requirements
 
