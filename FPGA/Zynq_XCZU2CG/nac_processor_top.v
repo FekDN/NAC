@@ -2,17 +2,38 @@
 `include "nac_hw_defines.vh"
 
 module NAC_Processor_Top #(
-    parameter CONTROL_BASE = 32'h0000_0000,
     parameter C_M_AXI_ADDR_WIDTH = 40,
-    parameter C_M_AXI_DATA_WIDTH = 32,
-    parameter DMA_BURST_LEN = 16, // Words per burst
-    parameter INT8_MODE = 1       // 1 = Enable Packing logic for INT8
+    parameter C_M_AXI_DATA_WIDTH = 32, // Рекомендуется 128 для макс. скорости, но 32 совместимо с текущим адаптером
+    parameter DMA_BURST_LEN = 16,      // Words per burst
+    parameter INT8_MODE = 1            // 1 = Enable Packing logic for INT8
 )(
     input  wire        clk,       
     input  wire        rst_n,     
 
     // ========================================================================
-    // AXI4 Master Interface (To Zynq S_AXI_HP)
+    // AXI4-Lite Slave Interface (Control & Status from Zynq PS)
+    // ========================================================================
+    // Адреса: 0x00=Control, 0x04=Status, 0x08...=Pointers
+    input  wire [5:0]  s_axi_awaddr,
+    input  wire        s_axi_awvalid,
+    output wire        s_axi_awready,
+    input  wire [31:0] s_axi_wdata,
+    input  wire [3:0]  s_axi_wstrb,
+    input  wire        s_axi_wvalid,
+    output wire        s_axi_wready,
+    output wire [1:0]  s_axi_bresp,
+    output wire        s_axi_bvalid,
+    input  wire        s_axi_bready,
+    input  wire [5:0]  s_axi_araddr,
+    input  wire        s_axi_arvalid,
+    output wire        s_axi_arready,
+    output wire [31:0] s_axi_rdata,
+    output wire [1:0]  s_axi_rresp,
+    output wire        s_axi_rvalid,
+    input  wire        s_axi_rready,
+
+    // ========================================================================
+    // AXI4 Master Interface (To Zynq S_AXI_HP / DDR4)
     // ========================================================================
     output wire [C_M_AXI_ADDR_WIDTH-1:0] m_axi_awaddr,
     output wire [7:0]                    m_axi_awlen,
@@ -39,18 +60,44 @@ module NAC_Processor_Top #(
     
     output wire [2:0] m_axi_awsize, output wire [1:0] m_axi_awburst,
     output wire [2:0] m_axi_arsize, output wire [1:0] m_axi_arburst,
+    
+    // AXI ID Signals (Required for Zynq HP Ports)
+    output wire [5:0] m_axi_awid,
+    output wire [5:0] m_axi_arid,
+    input  wire [5:0] m_axi_bid, // Ignored
+    input  wire [5:0] m_axi_rid, // Ignored
 
     // ========================================================================
-    // Status Interface
+    // Status Interface (External Pins)
     // ========================================================================
     output reg  [3:0]  led,
-    output reg         irq_done,
-    output reg         busy
+    output reg         irq_done
 );
 
+    // Hardwire unused IDs (Single Master)
+    assign m_axi_awid = 6'd0;
+    assign m_axi_arid = 6'd0;
+
     // ========================================================================
-    // Internal Memory Bus
+    // Internal Signals
     // ========================================================================
+    
+    // Control Signals from AXI-Lite Slave
+    wire        cmd_start;       // Pulse start
+    wire [31:0] reg_ptr_registry;
+    wire [31:0] reg_ptr_code;
+    wire [31:0] reg_ptr_weights;
+    wire [31:0] reg_ptr_input;
+    wire [31:0] reg_ptr_output;
+    wire [31:0] reg_ptr_opmap;
+    wire [31:0] reg_ptr_varmap;
+    
+    // Status Signal to AXI-Lite Slave
+    reg [31:0] status_reg; // [0]=Busy, [1]=Done, [2]=Error
+    reg        busy_flag;
+    reg        error_flag;
+
+    // Memory Arbiter Bus (Connecting Fetcher/FSM/Prefetcher to AXI Master)
     reg  [31:0] mem_addr;
     reg  [7:0]  mem_len;
     reg         mem_req;
@@ -58,14 +105,44 @@ module NAC_Processor_Top #(
     reg  [31:0] mem_wdata;
     reg         mem_wvalid;
     wire        mem_wready; 
-    
     wire        mem_grant;
     wire        mem_valid;
     wire [31:0] mem_rdata;
     wire        axi_error; 
 
     // ========================================================================
-    // AXI Adapter
+    // 1. AXI-Lite Slave Instantiation
+    // ========================================================================
+    NAC_AXILite_Slave #(
+        .C_S_AXI_DATA_WIDTH(32), 
+        .C_S_AXI_ADDR_WIDTH(6)
+    ) axi_ctrl (
+        .S_AXI_ACLK(clk), .S_AXI_ARESETN(rst_n),
+        .S_AXI_AWADDR(s_axi_awaddr), .S_AXI_AWVALID(s_axi_awvalid), .S_AXI_AWREADY(s_axi_awready),
+        .S_AXI_WDATA(s_axi_wdata), .S_AXI_WSTRB(s_axi_wstrb), .S_AXI_WVALID(s_axi_wvalid), .S_AXI_WREADY(s_axi_wready),
+        .S_AXI_BRESP(s_axi_bresp), .S_AXI_BVALID(s_axi_bvalid), .S_AXI_BREADY(s_axi_bready),
+        .S_AXI_ARADDR(s_axi_araddr), .S_AXI_ARVALID(s_axi_arvalid), .S_AXI_ARREADY(s_axi_arready),
+        .S_AXI_RDATA(s_axi_rdata), .S_AXI_RRESP(s_axi_rresp), .S_AXI_RVALID(s_axi_rvalid), .S_AXI_RREADY(s_axi_rready),
+        
+        // Internal Links
+        .slv_start_pulse(cmd_start),
+        .slv_ptr_registry(reg_ptr_registry),
+        .slv_ptr_code(reg_ptr_code),
+        .slv_ptr_weights(reg_ptr_weights),
+        .slv_ptr_input(reg_ptr_input),
+        .slv_ptr_output(reg_ptr_output),
+        .slv_ptr_opmap(reg_ptr_opmap),
+        .slv_ptr_varmap(reg_ptr_varmap),
+        .slv_status_reg(status_reg)
+    );
+
+    // Update Status Register Logic
+    always @(posedge clk) begin
+        status_reg <= {29'd0, error_flag, irq_done, busy_flag};
+    end
+
+    // ========================================================================
+    // 2. AXI Master Adapter Instantiation
     // ========================================================================
     NAC_AXI_Master_Adapter #(
         .C_M_AXI_ADDR_WIDTH(C_M_AXI_ADDR_WIDTH), .C_M_AXI_DATA_WIDTH(C_M_AXI_DATA_WIDTH)
@@ -86,25 +163,25 @@ module NAC_Processor_Top #(
     );
 
     // ========================================================================
-    // Buffers & Packers
+    // FSM & Execution Logic Definitions
     // ========================================================================
+    
     // DMA Output Buffer (Write Burst FIFO) - Uses LUTRAM
     (* ram_style = "distributed" *) reg [31:0] dma_buf [0:DMA_BURST_LEN-1];
     reg [4:0]  dma_buf_ptr;
+    reg [7:0]  dma_burst_target;
 
     // INT8 Packing Logic
     reg [1:0]  pack_cnt;
-    reg [23:0] pack_reg; // Holds partial bytes
-    reg [31:0] dma_wr_data_packed; // Final data to ALU
+    reg [23:0] pack_reg; 
+    reg [31:0] dma_wr_data_packed; 
 
-    // ========================================================================
-    // Core Logic Signals
-    // ========================================================================
+    // Translation Lookaside Buffers (LUTs)
     (* ram_style = "distributed" *) reg [7:0] opcode_lut [0:255]; 
     (* ram_style = "distributed" *) reg [7:0] variation_lut [0:255];
     (* ram_style = "block" *)       reg [31:0] pattern_lut [0:255]; 
 
-    reg [31:0] ptr_registry, ptr_code, ptr_weights, ptr_input, ptr_output, ptr_opmap, ptr_varmap;
+    // Registers
     reg [31:0] pc;
     reg [31:0] call_stack [0:`STACK_DEPTH-1];
     reg [4:0]  sp;
@@ -133,7 +210,8 @@ module NAC_Processor_Top #(
     
     // Streaming / Prefetch Signals
     wire [15:0] eff_C = rle_active ? rle_template_C : raw_C;
-    wire [31:0] stream_base_addr = ptr_weights + (eff_C * `VECTOR_LEN * 4);
+    // Combinational address calculation
+    wire [31:0] stream_base_addr = reg_ptr_weights + (eff_C * `VECTOR_LEN * 4);
     
     wire [31:0] stream_data_pipe;
     wire        stream_valid_pipe;
@@ -144,18 +222,36 @@ module NAC_Processor_Top #(
     reg [1:0] arbiter_sel; 
     
     // FSM States
-    localparam S_BOOT=0, S_READ_CFG_PTRS=1, S_UNPACK_OPMAP=2, S_UNPACK_VARMAP=3, S_LOAD_REGISTRY=4;
-    localparam S_IDLE=5, S_FETCH_HEADER=6, S_FETCH_PAYLOAD=7, S_TRANSLATE=8, S_EXEC_DISPATCH=9;
-    localparam S_DMA_INPUT_REQ=10, S_DMA_INPUT_WAIT=11; 
-    localparam S_DMA_OUTPUT_FILL=12, S_DMA_OUTPUT_FLUSH=13; 
-    localparam S_PREP_MATH=14, S_RUN_MATH=15, S_DONE=16, S_ERROR=17;
+    localparam S_BOOT=0, S_UNPACK_OPMAP=1, S_UNPACK_VARMAP=2, S_LOAD_REGISTRY=3;
+    localparam S_IDLE=4, S_FETCH_HEADER=5, S_FETCH_PAYLOAD=6, S_TRANSLATE=7, S_EXEC_DISPATCH=8;
+    localparam S_DMA_INPUT_REQ=9, S_DMA_INPUT_WAIT=10; 
+    localparam S_DMA_OUTPUT_FILL=11, S_DMA_OUTPUT_FLUSH=12; 
+    localparam S_PREP_MATH=13, S_RUN_MATH=14, S_DONE=15, S_ERROR=16;
     
     reg [4:0] state;
-    reg [2:0] cfg_seq_cnt, word_unpack_cnt;
+    reg [2:0] word_unpack_cnt;
     reg [8:0] lut_load_idx;
 
     // ========================================================================
-    // Submodules
+    // Helper: 4KB Boundary Calculators
+    // ========================================================================
+    
+    // Input DMA
+    wire [31:0] calc_input_addr = reg_ptr_input + (dma_cnt * (INT8_MODE ? 16 : 4)); // INT8 uses 16 bytes per 4-elem word
+    wire [11:0] input_pg_off  = calc_input_addr[11:0];
+    wire [12:0] input_bytes_rem = 13'h1000 - {1'b0, input_pg_off};
+    wire [10:0] input_words_rem = input_bytes_rem[12:2];
+    wire [7:0]  input_safe_burst = (input_words_rem < DMA_BURST_LEN) ? input_words_rem[7:0] : DMA_BURST_LEN[7:0];
+
+    // Output DMA
+    wire [31:0] calc_output_addr = reg_ptr_output + (dma_cnt * 4);
+    wire [11:0] output_pg_off = calc_output_addr[11:0];
+    wire [12:0] output_bytes_rem = 13'h1000 - {1'b0, output_pg_off};
+    wire [10:0] output_words_rem = output_bytes_rem[12:2];
+    wire [7:0]  output_safe_burst = (output_words_rem < DMA_BURST_LEN) ? output_words_rem[7:0] : DMA_BURST_LEN[7:0];
+
+    // ========================================================================
+    // Submodules: Fetcher, Prefetcher, ALU
     // ========================================================================
 
     // 1. Fetcher
@@ -198,7 +294,7 @@ module NAC_Processor_Top #(
     );
 
     // ========================================================================
-    // Memory Arbiter
+    // Memory Arbiter Logic
     // ========================================================================
     reg [31:0] fsm_mem_addr, fsm_mem_wdata;
     reg [7:0]  fsm_mem_len;
@@ -229,11 +325,11 @@ module NAC_Processor_Top #(
     // ========================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= S_BOOT; pc <= 0; sp <= 0; busy <= 0; irq_done <= 0; led <= 0;
+            state <= S_BOOT; pc <= 0; sp <= 0; busy_flag <= 0; irq_done <= 0; led <= 0;
             arbiter_sel <= 1; fetch_flush <= 1; fetch_byte_req <= 0; alu_start <= 0;
-            dma_wr_en <= 0; dma_rd_req <= 0; rle_active <= 0; 
+            dma_wr_en <= 0; dma_rd_req <= 0; rle_active <= 0; error_flag <= 0;
             fsm_mem_req <= 0; fsm_mem_we <= 0; fsm_mem_wvalid <= 0; fsm_mem_len <= 0;
-            dma_buf_ptr <= 0; dma_cnt <= 0;
+            dma_buf_ptr <= 0; dma_cnt <= 0; dma_burst_target <= 0;
             pack_cnt <= 0; pack_reg <= 0;
         end else begin
             // Reset Pulses
@@ -241,232 +337,237 @@ module NAC_Processor_Top #(
             fetch_byte_req <= 0; fetch_flush <= 0; alu_start <= 0;
             dma_wr_en <= 0; dma_rd_req <= 0;
 
-            if (axi_error) state <= S_ERROR;
-            else case (state)
-                S_BOOT: begin
-                    arbiter_sel <= 1; busy <= 0;
-                    fsm_mem_addr <= CONTROL_BASE + `REG_CMD; fsm_mem_req <= 1; fsm_mem_len <= 0;
-                    if (mem_valid && mem_grant) begin
-                        if (mem_rdata == 1) begin state <= S_READ_CFG_PTRS; cfg_seq_cnt <= 0; busy <= 1; end
-                        else if (mem_rdata == 2) begin state <= S_IDLE; busy <= 1; end
-                    end
-                end
-
-                S_READ_CFG_PTRS: begin
-                    fsm_mem_addr <= CONTROL_BASE + `REG_REGISTRY + (cfg_seq_cnt * 4); fsm_mem_req <= 1;
-                    if (mem_valid) begin
-                        case (cfg_seq_cnt)
-                            0: ptr_registry <= mem_rdata; 1: ptr_code <= mem_rdata;
-                            2: ptr_weights <= mem_rdata; 3: ptr_input <= mem_rdata;
-                            4: ptr_output <= mem_rdata; 5: ptr_opmap <= mem_rdata; 6: ptr_varmap <= mem_rdata;
-                        endcase
-                        if (cfg_seq_cnt == 6) begin state <= S_UNPACK_OPMAP; lut_load_idx <= 0; word_unpack_cnt <= 0; end
-                        else cfg_seq_cnt <= cfg_seq_cnt + 1;
-                    end
-                end
-                S_UNPACK_OPMAP: begin
-                    if (word_unpack_cnt == 0) begin fsm_mem_addr <= ptr_opmap + lut_load_idx; fsm_mem_req <= 1; end
-                    if (mem_valid) begin
-                        opcode_lut[lut_load_idx] <= mem_rdata[7:0]; opcode_lut[lut_load_idx+1] <= mem_rdata[15:8];
-                        opcode_lut[lut_load_idx+2] <= mem_rdata[23:16]; opcode_lut[lut_load_idx+3] <= mem_rdata[31:24];
-                        lut_load_idx <= lut_load_idx + 4;
-                        if (lut_load_idx >= 252) begin state <= S_UNPACK_VARMAP; lut_load_idx <= 0; end
-                    end
-                end
-                S_UNPACK_VARMAP: begin
-                    if (word_unpack_cnt == 0) begin fsm_mem_addr <= ptr_varmap + lut_load_idx; fsm_mem_req <= 1; end
-                    if (mem_valid) begin
-                        variation_lut[lut_load_idx] <= mem_rdata[7:0]; variation_lut[lut_load_idx+1] <= mem_rdata[15:8];
-                        variation_lut[lut_load_idx+2] <= mem_rdata[23:16]; variation_lut[lut_load_idx+3] <= mem_rdata[31:24];
-                        lut_load_idx <= lut_load_idx + 4;
-                        if (lut_load_idx >= 252) begin state <= S_LOAD_REGISTRY; lut_load_idx <= 0; end
-                    end
-                end
-                S_LOAD_REGISTRY: begin
-                    fsm_mem_addr <= ptr_registry + (lut_load_idx * 4); fsm_mem_req <= 1;
-                    if (mem_valid) begin
-                        pattern_lut[lut_load_idx] <= mem_rdata; lut_load_idx <= lut_load_idx + 1;
-                        if (lut_load_idx == 255) begin state <= S_BOOT; led <= 4'b0001; end
-                    end
-                end
-
-                S_IDLE: begin
-                    pc <= ptr_code; fetch_flush <= 1; sp <= 0; rle_active <= 0;
-                    state <= S_FETCH_HEADER; hdr_byte_idx <= 0; arbiter_sel <= 0; led <= 4'b0010;
-                end
-
-                S_FETCH_HEADER: begin
-                    arbiter_sel <= 0; fetch_byte_req <= 1;
-                    if (fetch_byte_valid) begin
-                        case (hdr_byte_idx)
-                            0: raw_A <= fetch_byte_data; 1: raw_B <= fetch_byte_data;
-                            2: raw_C[15:8] <= fetch_byte_data; 3: raw_C[7:0] <= fetch_byte_data;
-                            4: raw_D_len <= fetch_byte_data;
-                        endcase
-                        pc <= pc + 1;
-                        if (hdr_byte_idx == 4) begin
-                            if (raw_D_len == 0) state <= S_TRANSLATE;
-                            else begin state <= S_FETCH_PAYLOAD; pay_byte_idx <= 0; end
-                        end else hdr_byte_idx <= hdr_byte_idx + 1;
-                    end
-                end
-
-                S_FETCH_PAYLOAD: begin
-                    fetch_byte_req <= 1;
-                    if (fetch_byte_valid) begin
-                        pc <= pc + 1;
-                        if (pay_byte_idx[0] == 0) temp_hi_byte <= fetch_byte_data;
-                        else raw_inputs[pay_byte_idx >> 1] <= {temp_hi_byte, fetch_byte_data};
-                        pay_byte_idx <= pay_byte_idx + 1;
-                        if (pay_byte_idx == (raw_D_len * 2) - 1) state <= S_TRANSLATE;
-                    end
-                end
-
-                S_TRANSLATE: begin
-                    reg [7:0] eff_A = rle_active ? rle_template_A : raw_A;
-                    reg [7:0] eff_B = rle_active ? rle_template_B : raw_B;
-                    if (eff_A < 10) state <= S_EXEC_DISPATCH;
-                    else begin
-                        reg [7:0] ctrl = opcode_lut[eff_A];
-                        hw_opcode <= ctrl[4:0]; alu_stream_en <= ctrl[5];
-                        reg [7:0] rout = variation_lut[eff_B];
-                        routed_src1_idx <= rout[3:0]; routed_src2_idx <= rout[7:4];
-                        state <= S_EXEC_DISPATCH;
-                    end
-                end
-
-                S_EXEC_DISPATCH: begin
-                    reg [7:0] eff_A = rle_active ? rle_template_A : raw_A;
-                    case (eff_A)
-                        `OP_PATTERN: begin
-                            call_stack[sp] <= pc; sp <= sp + 1; pc <= pattern_lut[raw_C[7:0]];
-                            fetch_flush <= 1; hdr_byte_idx <= 0; state <= S_FETCH_HEADER;
+            if (axi_error) begin
+                state <= S_ERROR;
+                error_flag <= 1;
+            end 
+            else begin
+                case (state)
+                    S_BOOT: begin
+                        arbiter_sel <= 1; busy_flag <= 0; led <= 4'b0001;
+                        // Wait for start command from AXI-Lite
+                        if (cmd_start) begin
+                            busy_flag <= 1; irq_done <= 0; error_flag <= 0;
+                            // Pointers are already valid on reg_ptr_* wires
+                            state <= S_UNPACK_OPMAP; lut_load_idx <= 0; word_unpack_cnt <= 0;
                         end
-                        `OP_RETURN: begin
-                            sp <= sp - 1; pc <= call_stack[sp-1]; fetch_flush <= 1;
-                            hdr_byte_idx <= 0; state <= S_FETCH_HEADER;
-                        end
-                        `OP_COPY: begin
-                            rle_active <= 1; rle_counter <= raw_C;
-                            rle_template_A <= raw_B; rle_template_B <= raw_inputs[0][7:0]; rle_template_C <= raw_inputs[1];
-                            state <= S_TRANSLATE;
-                        end
-                        `OP_DATA_INPUT: begin dma_cnt <= 0; arbiter_sel <= 1; pack_cnt <= 0; state <= S_DMA_INPUT_REQ; end
-                        `OP_OUTPUT: begin dma_cnt <= 0; arbiter_sel <= 1; dma_buf_ptr <= 0; state <= S_DMA_OUTPUT_FILL; end
-                        default: state <= S_PREP_MATH;
-                    endcase
-                end
+                    end
 
-                // --- DMA INPUT (BURST READ + PACKING) ---
-                S_DMA_INPUT_REQ: begin
-                    // Calc Remainder for Burst
-                    reg [15:0] rem_len;
-                    // If INT8 packing, we read 4x more words (unpacked) to get 1 internal word
-                    rem_len = (`VECTOR_LEN - dma_cnt) * (INT8_MODE ? 4 : 1);
+                    S_UNPACK_OPMAP: begin
+                        // Load Opcode LUT from DDR to distributed RAM
+                        if (word_unpack_cnt == 0) begin fsm_mem_addr <= reg_ptr_opmap + lut_load_idx; fsm_mem_req <= 1; end
+                        if (mem_valid) begin
+                            opcode_lut[lut_load_idx] <= mem_rdata[7:0]; opcode_lut[lut_load_idx+1] <= mem_rdata[15:8];
+                            opcode_lut[lut_load_idx+2] <= mem_rdata[23:16]; opcode_lut[lut_load_idx+3] <= mem_rdata[31:24];
+                            lut_load_idx <= lut_load_idx + 4;
+                            if (lut_load_idx >= 252) begin state <= S_UNPACK_VARMAP; lut_load_idx <= 0; end
+                        end
+                    end
                     
-                    if (rem_len > DMA_BURST_LEN) fsm_mem_len <= DMA_BURST_LEN - 1;
-                    else fsm_mem_len <= rem_len - 1;
+                    S_UNPACK_VARMAP: begin
+                        // Load Variation LUT
+                        if (word_unpack_cnt == 0) begin fsm_mem_addr <= reg_ptr_varmap + lut_load_idx; fsm_mem_req <= 1; end
+                        if (mem_valid) begin
+                            variation_lut[lut_load_idx] <= mem_rdata[7:0]; variation_lut[lut_load_idx+1] <= mem_rdata[15:8];
+                            variation_lut[lut_load_idx+2] <= mem_rdata[23:16]; variation_lut[lut_load_idx+3] <= mem_rdata[31:24];
+                            lut_load_idx <= lut_load_idx + 4;
+                            if (lut_load_idx >= 252) begin state <= S_LOAD_REGISTRY; lut_load_idx <= 0; end
+                        end
+                    end
                     
-                    fsm_mem_addr <= ptr_input + (dma_cnt * (INT8_MODE ? 16 : 4)); // Shift logic handles offset
-                    // Note: addr logic above simplified. Real ptr increment happens implicitly by burst.
-                    // Correct: We need a linear input pointer state var if bursts are split.
-                    // Assuming ptr_input + accumulated_bytes.
-                    // Let's use dma_cnt logic for address:
-                    // If packing: addr = ptr + (dma_cnt*4*4) + (pack_cnt*4) - tricky with bursts.
-                    // SIMPLIFICATION: Assume we just increment a raw pointer.
-                    
-                    fsm_mem_req <= 1; 
-                    state <= S_DMA_INPUT_WAIT;
-                end
+                    S_LOAD_REGISTRY: begin
+                        // Load Pattern Registry (Jump Table)
+                        fsm_mem_addr <= reg_ptr_registry + (lut_load_idx * 4); fsm_mem_req <= 1;
+                        if (mem_valid) begin
+                            pattern_lut[lut_load_idx] <= mem_rdata; lut_load_idx <= lut_load_idx + 1;
+                            if (lut_load_idx == 255) begin state <= S_IDLE; end
+                        end
+                    end
 
-                S_DMA_INPUT_WAIT: begin
-                    if (mem_valid) begin
-                        if (INT8_MODE) begin
-                            // Shift in LSB (Little Endian assumption)
-                            pack_reg <= {mem_rdata[7:0], pack_reg[23:8]}; 
-                            pack_cnt <= pack_cnt + 1;
-                            
-                            if (pack_cnt == 3) begin
-                                dma_wr_en <= 1;
-                                dma_wr_data_packed <= {mem_rdata[7:0], pack_reg};
-                                dma_cnt <= dma_cnt + 1;
-                                pack_cnt <= 0;
+                    S_IDLE: begin
+                        // Init Execution
+                        pc <= reg_ptr_code; fetch_flush <= 1; sp <= 0; rle_active <= 0;
+                        state <= S_FETCH_HEADER; hdr_byte_idx <= 0; arbiter_sel <= 0; led <= 4'b0010;
+                    end
+
+                    S_FETCH_HEADER: begin
+                        arbiter_sel <= 0; fetch_byte_req <= 1;
+                        if (fetch_byte_valid) begin
+                            case (hdr_byte_idx)
+                                0: raw_A <= fetch_byte_data; 1: raw_B <= fetch_byte_data;
+                                2: raw_C[15:8] <= fetch_byte_data; 3: raw_C[7:0] <= fetch_byte_data;
+                                4: raw_D_len <= fetch_byte_data;
+                            endcase
+                            pc <= pc + 1;
+                            if (hdr_byte_idx == 4) begin
+                                if (raw_D_len == 0) state <= S_TRANSLATE;
+                                else begin state <= S_FETCH_PAYLOAD; pay_byte_idx <= 0; end
+                            end else hdr_byte_idx <= hdr_byte_idx + 1;
+                        end
+                    end
+
+                    S_FETCH_PAYLOAD: begin
+                        fetch_byte_req <= 1;
+                        if (fetch_byte_valid) begin
+                            pc <= pc + 1;
+                            if (pay_byte_idx[0] == 0) temp_hi_byte <= fetch_byte_data;
+                            else raw_inputs[pay_byte_idx >> 1] <= {temp_hi_byte, fetch_byte_data};
+                            pay_byte_idx <= pay_byte_idx + 1;
+                            if (pay_byte_idx == (raw_D_len * 2) - 1) state <= S_TRANSLATE;
+                        end
+                    end
+
+                    S_TRANSLATE: begin
+                        reg [7:0] eff_A = rle_active ? rle_template_A : raw_A;
+                        reg [7:0] eff_B = rle_active ? rle_template_B : raw_B;
+                        if (eff_A < 10) state <= S_EXEC_DISPATCH; // System Command
+                        else begin
+                            reg [7:0] ctrl = opcode_lut[eff_A];
+                            hw_opcode <= ctrl[4:0];
+                            alu_stream_en <= ctrl[5];
+                            reg [7:0] rout = variation_lut[eff_B];
+                            routed_src1_idx <= rout[3:0];
+                            routed_src2_idx <= rout[7:4];
+                            state <= S_EXEC_DISPATCH;
+                        end
+                    end
+
+                    S_EXEC_DISPATCH: begin
+                        reg [7:0] eff_A = rle_active ? rle_template_A : raw_A;
+                        case (eff_A)
+                            `OP_PATTERN: begin
+                                call_stack[sp] <= pc; sp <= sp + 1; pc <= pattern_lut[raw_C[7:0]];
+                                fetch_flush <= 1; hdr_byte_idx <= 0; state <= S_FETCH_HEADER;
                             end
-                        end else begin
-                            dma_wr_en <= 1;
-                            dma_wr_data_packed <= mem_rdata;
-                            dma_cnt <= dma_cnt + 1;
+                            `OP_RETURN: begin
+                                sp <= sp - 1; pc <= call_stack[sp-1]; fetch_flush <= 1;
+                                hdr_byte_idx <= 0; state <= S_FETCH_HEADER;
+                            end
+                            `OP_COPY: begin
+                                rle_active <= 1; rle_counter <= raw_C;
+                                rle_template_A <= raw_B; rle_template_B <= raw_inputs[0][7:0]; rle_template_C <= raw_inputs[1];
+                                state <= S_TRANSLATE;
+                            end
+                            `OP_DATA_INPUT: begin dma_cnt <= 0; arbiter_sel <= 1; pack_cnt <= 0; state <= S_DMA_INPUT_REQ; end
+                            `OP_OUTPUT: begin 
+                                dma_cnt <= 0; arbiter_sel <= 1; 
+                                dma_buf_ptr <= 0; 
+                                state <= S_DMA_OUTPUT_FILL; 
+                            end
+                            default: state <= S_PREP_MATH;
+                        endcase
+                    end
+
+                    // --- DMA INPUT (BURST READ + PACKING) ---
+                    S_DMA_INPUT_REQ: begin
+                        // 1. Calculate how many words we still need to read
+                        reg [15:0] rem_len;
+                        rem_len = (`VECTOR_LEN - dma_cnt) * (INT8_MODE ? 4 : 1);
+                        
+                        // 2. Determine safe burst length (min of needed, max burst, and 4KB limit)
+                        if (rem_len > input_safe_burst) fsm_mem_len <= input_safe_burst - 1;
+                        else fsm_mem_len <= rem_len - 1;
+                        
+                        fsm_mem_addr <= calc_input_addr; 
+                        fsm_mem_req <= 1; 
+                        state <= S_DMA_INPUT_WAIT;
+                    end
+
+                    S_DMA_INPUT_WAIT: begin
+                        if (mem_valid) begin
+                            if (INT8_MODE) begin
+                                // Packing Logic: 4x 8-bit -> 1x 32-bit
+                                pack_reg <= {mem_rdata[7:0], pack_reg[23:8]}; 
+                                pack_cnt <= pack_cnt + 1;
+                                if (pack_cnt == 3) begin
+                                    dma_wr_en <= 1;
+                                    dma_wr_data_packed <= {mem_rdata[7:0], pack_reg};
+                                    dma_cnt <= dma_cnt + 1;
+                                    pack_cnt <= 0;
+                                end
+                            end else begin
+                                dma_wr_en <= 1;
+                                dma_wr_data_packed <= mem_rdata;
+                                dma_cnt <= dma_cnt + 1;
+                            end
+                        end
+                        
+                        // RACE CONDITION FIX:
+                        // Ensure transaction is fully closed before deciding next step
+                        if (!mem_req && !mem_valid && !mem_grant) begin 
+                             if (dma_cnt == `VECTOR_LEN) begin
+                                 hdr_byte_idx <= 0; state <= S_FETCH_HEADER;
+                             end else begin
+                                 // Need more data
+                                 state <= S_DMA_INPUT_REQ;
+                             end
                         end
                     end
-                    
-                    // Exit condition: Check if Vector Full
-                    if (dma_cnt == `VECTOR_LEN) begin
-                        hdr_byte_idx <= 0; state <= S_FETCH_HEADER;
-                    end else if (!mem_valid && mem_grant) begin
-                        // Wait for data...
-                    end else if (mem_valid && /* burst end check */ 0) begin
-                        // Re-trigger burst logic if needed (Simplified for single burst or stream)
-                        // Ideally: check axi_rlast inside adapter or count beats.
-                        // Assuming Adapter handles full burst flow. 
-                        // If burst finished but dma_cnt < VECTOR_LEN, loop to REQ.
-                    end
-                    // NOTE: This state logic needs 'burst done' signal from Adapter for robust multi-burst.
-                    // Added check:
-                    if (mem_valid && dma_cnt < `VECTOR_LEN && /* last beat */ 0) state <= S_DMA_INPUT_REQ;
-                end
 
-                // --- DMA OUTPUT (BURST WRITE) ---
-                S_DMA_OUTPUT_FILL: begin
-                    dma_rd_req <= 1; 
-                    if (dma_buf_ptr > 0) dma_buf[dma_buf_ptr - 1] <= dma_rd_data; 
+                    // --- DMA OUTPUT (BURST WRITE) ---
+                    S_DMA_OUTPUT_FILL: begin
+                        // On first entry (ptr=0), calculate how many words we can safely burst
+                        if (dma_buf_ptr == 0) begin
+                            dma_burst_target <= output_safe_burst;
+                        end
 
-                    if (dma_buf_ptr == DMA_BURST_LEN) begin
-                        fsm_mem_addr <= ptr_output + ((dma_cnt - DMA_BURST_LEN) * 4);
-                        fsm_mem_len <= DMA_BURST_LEN - 1; 
-                        fsm_mem_we <= 1; fsm_mem_req <= 1;
-                        dma_buf_ptr <= 0; state <= S_DMA_OUTPUT_FLUSH;
-                    end 
-                    else if (dma_cnt == `VECTOR_LEN) begin
-                        fsm_mem_addr <= ptr_output + ((dma_cnt - dma_buf_ptr) * 4);
-                        fsm_mem_len <= dma_buf_ptr - 1; 
-                        fsm_mem_we <= 1; fsm_mem_req <= 1;
-                        dma_buf_ptr <= 0; state <= S_DMA_OUTPUT_FLUSH;
-                    end
-                    else begin
-                        dma_buf_ptr <= dma_buf_ptr + 1; dma_cnt <= dma_cnt + 1;
-                    end
-                end
+                        dma_rd_req <= 1; 
+                        if (dma_buf_ptr > 0) dma_buf[dma_buf_ptr - 1] <= dma_rd_data; 
 
-                S_DMA_OUTPUT_FLUSH: begin
-                    if (mem_wready) begin
-                        fsm_mem_wdata <= dma_buf[dma_buf_ptr];
-                        fsm_mem_wvalid <= 1; dma_buf_ptr <= dma_buf_ptr + 1;
+                        // Stop filling if we hit the safe burst limit OR end of vector
+                        if (dma_buf_ptr == dma_burst_target) begin
+                            // Initiate Write
+                            fsm_mem_addr <= calc_output_addr;
+                            fsm_mem_len <= dma_burst_target - 1; 
+                            fsm_mem_we <= 1; fsm_mem_req <= 1;
+                            dma_buf_ptr <= 0; state <= S_DMA_OUTPUT_FLUSH;
+                        end 
+                        else if (dma_cnt == `VECTOR_LEN) begin
+                            // Partial burst at end of vector
+                            fsm_mem_addr <= calc_output_addr;
+                            fsm_mem_len <= dma_buf_ptr - 1; 
+                            fsm_mem_we <= 1; fsm_mem_req <= 1;
+                            dma_buf_ptr <= 0; state <= S_DMA_OUTPUT_FLUSH;
+                        end
+                        else begin
+                            dma_buf_ptr <= dma_buf_ptr + 1; dma_cnt <= dma_cnt + 1;
+                        end
                     end
-                    if (mem_grant) begin
-                        if (axi_error) state <= S_ERROR;
-                        else if (dma_cnt == `VECTOR_LEN) begin irq_done <= 1; state <= S_DONE; end
-                        else begin dma_buf_ptr <= 0; state <= S_DMA_OUTPUT_FILL; end
+
+                    S_DMA_OUTPUT_FLUSH: begin
+                        if (mem_wready) begin
+                            fsm_mem_wdata <= dma_buf[dma_buf_ptr];
+                            fsm_mem_wvalid <= 1; dma_buf_ptr <= dma_buf_ptr + 1;
+                        end
+                        if (mem_grant && !mem_wvalid) begin // Wait for write complete
+                            if (dma_cnt == `VECTOR_LEN) begin irq_done <= 1; state <= S_DONE; end
+                            else begin 
+                                // Buffer flushed, return to FILL to get next chunk
+                                dma_buf_ptr <= 0; 
+                                state <= S_DMA_OUTPUT_FILL; 
+                            end
+                        end
                     end
-                end
 
-                S_PREP_MATH: begin
-                    if (alu_stream_en) arbiter_sel <= 2;
-                    else arbiter_sel <= 0;
-                    alu_start <= 1; state <= S_RUN_MATH;
-                end
-
-                S_RUN_MATH: begin
-                    if (alu_done) begin
-                        if (rle_active) begin
-                            if (rle_counter == 1) begin rle_active <= 0; hdr_byte_idx <= 0; state <= S_FETCH_HEADER; end
-                            else begin rle_counter <= rle_counter - 1; state <= S_TRANSLATE; end
-                        end else begin hdr_byte_idx <= 0; state <= S_FETCH_HEADER; end
+                    S_PREP_MATH: begin
+                        if (alu_stream_en) arbiter_sel <= 2;
+                        else arbiter_sel <= 0;
+                        alu_start <= 1; state <= S_RUN_MATH;
                     end
-                end
 
-                S_DONE: begin led <= 4'b1111; irq_done <= 1; busy <= 0; state <= S_BOOT; end
-                S_ERROR: begin led <= 4'b1001; end
-            endcase
+                    S_RUN_MATH: begin
+                        if (alu_done) begin
+                            if (rle_active) begin
+                                if (rle_counter == 1) begin rle_active <= 0; hdr_byte_idx <= 0; state <= S_FETCH_HEADER; end
+                                else begin rle_counter <= rle_counter - 1; state <= S_TRANSLATE; end
+                            end else begin hdr_byte_idx <= 0; state <= S_FETCH_HEADER; end
+                        end
+                    end
+
+                    S_DONE: begin led <= 4'b1111; busy_flag <= 0; state <= S_BOOT; end
+                    S_ERROR: begin led <= 4'b1001; end
+                endcase
+            end
         end
     end
 endmodule
