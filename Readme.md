@@ -45,7 +45,7 @@
  #### Short-Term Goals
  -   [ ] Develop robust decomposers for a wide range of architectures (CNNs, RNNs, GNNs).
  -   [ ] Enhance the Pattern Miner to support graph-based and non-contiguous patterns (e.g., skip-connections).
- -   [X] Extend the NAC ISA to include control flow operations (`if`, `while`) for RNNs and dynamic models.
+ -   [X] ~~Extend the NAC ISA to include control flow operations (`if`, `while`) for RNNs and dynamic models.~~
  -   [ ] Execute the large-scale "Comparative Genomics" study on 90+ representative models to build the foundational Knowledge Base.
 
  #### Long-Term Vision
@@ -303,5 +303,6 @@
 ## License
 
 The source code of this project is licensed under the **GNU General Public License v3.0**. See the `LICENSE` file for details.
+
 
 The accompanying documentation, including this README and the project's White Paper, is licensed under the **Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License**.
