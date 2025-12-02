@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Feklin Dmitry (FeklinDN@gmail.com)
 #
 # ==============================================================================
-# Neural Architecture Code (NAC) v1.1 Specification
+# Neural Architecture Code (NAC) v1.2 Specification
 # ==============================================================================
 # The NAC format is designed for the compact, unified, and machine-readable
 # representation of neural network computation graphs. Each graph is a sequence
@@ -12,10 +12,11 @@
 # and an optional variable-length data block. The structure is determined by the
 # value of the first byte (`A`).
 #
-# There are three command types:
+# There are four command types:
 # 1. Fundamental Operation (standard `ABCD[]` command)
 # 2. Pattern Invocation (command with `<PATTERN_PREFIX>`)
 # 3. Copy Command (command with `<COPY_PREFIX>`)
+# 4. Control Flow Command (command with `<CONTROL_FLOW_PREFIX>`)
 #
 # 2. Byte `A`: Prefix and Operation ID (1 byte, Unsigned) 
 # Byte `A` defines the command type and/or serves as an index for a fundamental operation.
@@ -28,7 +29,8 @@
 #   - `5`: `<CONST_REF>` - A node representing a reference to a parameter, identified by its name ID (e.g., `get_attr` in torch.fx).
 #   - `6`: `<PATTERN_PREFIX>` - Command Prefix. Indicates this node is a high-level pattern (macro) invocation.
 #   - `7`: `<COPY_PREFIX>` - Command Prefix. Indicates this node is a compression command for repeating nodes.
-#   - `8-9`: `<RESERVED>` - Reserved for future command types (e.g., control flow).
+#   - `8`: `<CONTROL_FLOW_PREFIX>` - Command Prefix. Defines a structured control flow block (e.g., if/while).
+#   - `9`: `<RESERVED>` - Reserved for future command types.
 #   - `10-255`: Fundamental Operation ID - A direct index into the `registry.json["canonical_to_index"]` dictionary.
 #
 # 3. Command Types and Formats 
@@ -47,7 +49,7 @@
 #       - `C < 0`: An ID for a group of constants. The `group_id` is `-(C + 1)`. The group definition is in `registry.json["index_to_constant_group"]`.
 #     - `D[]` (variable): List of input dependencies.
 #       - `num_inputs` (1 byte): The number of inputs.
-#       - `input_id` (2 bytes, `unsigned`) x `num_inputs`: Absolute IDs of source nodes within the current graph.
+#       - `input_id` (2 bytes, `signed`) x `num_inputs`: Source node identifiers. Can be an absolute ID or a relative offset (see Section 5).
 #
 # 3.2. Command: Pattern Invocation (`A = 6`) 
 # This command executes an entire subgraph (a pattern) defined in the registry.
@@ -60,7 +62,7 @@
 #     - `E₁` (1 byte, 1st byte of the `C` field): The upper byte of the 2-byte pattern ID.
 #       - The full `pattern_id` is reassembled as `(E₁ << 8) | E₀`, allowing for 65,536 unique pattern IDs (0 to 65535).
 #     - `unused` (1 byte, 2nd byte of the `C` field): Reserved, should be `0`.
-#     - `D[]` (variable): List of arguments (inputs) passed to the pattern. The structure is identical to `D[]` for a fundamental operation.
+#     - `D[]` (variable): List of absolute IDs for arguments (inputs) passed to the pattern. The structure is identical to `D[]` for a fundamental operation.
 #
 # 3.3. Command: Copy (`A = 7`) 
 # This command is used to compress sequences of identical, input-less nodes
@@ -77,11 +79,56 @@
 #       - `input_1` (2 bytes, `signed`): The `B` component (Variation ID) of the template node.
 #       - `input_2` (2 bytes, `signed`): The `C` component (Constant ID) of the template node.
 #
+# 3.4. Command: Control Flow (`A = 8`)
+# Defines a structured control flow construct like `IF-ELSE` or `WHILE`. The logical
+# blocks (`then`, `else`, `loop_body`) must be laid out linearly in the NAC stream
+# immediately following this command node.
+#
+#   - Format: `A B C D[]`
+#   - Length: 5 bytes + `2 * num_inputs`
+#   - Fields:
+#     - `A` (1 byte): Always `8` (`<CONTROL_FLOW_PREFIX>`).
+#     - `B` (1 byte): Sub-opcode defining the control flow type.
+#       - `1`: `IF-ELSE`.
+#       - `2`: `WHILE`.
+#     - `C` (2 bytes, `signed`): Unused, should be `0`.
+#     - `D[]` (variable): Contains metadata describing the layout of the following blocks and their external dependencies. All IDs are absolute.
+#       - For `IF-ELSE (B=1)`:
+#         - `D[0]`: `len_then_block` (number of nodes in the `then` block).
+#         - `D[1]`: `len_else_block` (number of nodes in the `else` block).
+#         - `D[2]`: `condition_node_id` (absolute ID of the node whose boolean result is the condition).
+#         - `D[3...]`: Absolute IDs of external nodes required by the `then`/`else` blocks.
+#       - For `WHILE (B=2)`:
+#         - `D[0]`: `len_condition_graph` (number of nodes in the condition-evaluation subgraph).
+#         - `D[1]`: `len_loop_body_graph` (number of nodes in the loop body subgraph).
+#         - `D[2...]`: Absolute IDs of nodes providing the initial state for the loop variables.
+#
 # 4. Relation to `registry.json` 
 # The NAC format is not self-contained. It requires a corresponding `registry.json` file
 # for interpretation. The registry acts as a dictionary, mapping the integer IDs used
 # in the binary format to their full string definitions, constant values, parameter
 # names, and pattern definitions.
+#
+# 5. Addressing Model: Absolute vs. Relative
+# NAC uses a hybrid addressing model for node dependencies specified in the `D[]` component.
+# The type of addressing depends on the context (scope) of the link.
+#
+#   - 5.1. Global Scope (Absolute Addressing):
+#     - **When:** Links between nodes in the main graph, or links that cross the boundary
+#       into a logical block (e.g., inputs to a pattern or a control flow structure).
+#     - **Format:** A non-negative signed 2-byte integer (`0` to `32767`) representing the
+#       absolute index of the source node from the beginning of the graph.
+#
+#   - 5.2. Block Scope (Relative Addressing):
+#     - **When:** Links between nodes that are *inside* a self-contained logical block.
+#       This applies to nodes within a pattern definition or within the body of a
+#       control flow construct (`then`, `else`, `loop_body`, `condition_body`).
+#     - **Format:** A negative signed 2-byte integer (`-1`, `-2`, etc.) representing
+#       the offset from the *current* node's position.
+#     - **Example:** `D=[-1]` refers to the immediately preceding node within the same block.
+#     - **Benefit:** This makes logical blocks (patterns, loops) modular and relocatable. They can
+#       be moved within the graph without needing to recompute all internal dependency links.
+#
 # ==============================================================================
 
 import os
@@ -93,6 +140,7 @@ import torch
 import torch.nn as nn
 import torch.fx as fx
 import torch.export
+import operator
 from transformers import (
     AutoModelForSequenceClassification, AutoModelForMaskedLM, 
     AutoModelForTokenClassification, AutoModelForCausalLM, AutoConfig
@@ -397,9 +445,8 @@ class GraphRepresentation:
         # Step 3: Iterate through each input ID in the list.
         for input_id in D:
             # Step 4: Convert each ID to a 2-byte signed integer (big-endian) and append it.
-            # `signed=True` is critical because the COPY command uses this field to store
-            # template information, which can include negative values for constant group IDs.
-            # For regular node connections, the IDs will be positive and encode correctly.
+            # `signed=True` is critical for supporting relative addressing (negative offsets)
+            # and for the COPY command, which can store negative constant group IDs.
             self.binary_stream.extend(input_id.to_bytes(2, 'big', signed=True))
 
     def to_base64(self) -> str:
@@ -474,15 +521,15 @@ class OperationRegistry:
         meaning across all graphs (e.g., inputs, outputs, control codes).
         """
         special_tokens = {
-            0: "<NONE>",          # Represents an invalid or ignored node.
-            1: "<PAD>",           # Padding token, reserved for sequence processing.
-            2: "<DATA_INPUT>",    # An input placeholder for data (e.g., input_ids).
-            3: "<PARAM_INPUT>",   # An input placeholder for a parameter (less common now).
-            4: "<OUTPUT>",        # The final output node of a graph.
-            5: "<CONST_REF>",     # An operation that retrieves a parameter by its name/ID.
-            6: "<PATTERN_PREFIX>",# A prefix indicating the start of a pattern invocation.
-            7: "<COPY_PREFIX>",   # A prefix indicating a run-length encoded sequence.
-            8: "<RESERVED>",
+            0: "<NONE>",
+            1: "<PAD>",
+            2: "<DATA_INPUT>",
+            3: "<PARAM_INPUT>",
+            4: "<OUTPUT>",
+            5: "<CONST_REF>",
+            6: "<PATTERN_PREFIX>",
+            7: "<COPY_PREFIX>",
+            8: "<CONTROL_FLOW_PREFIX>",
             9: "<RESERVED>"
         }
         # Populate the canonical maps with these special tokens.
@@ -1516,7 +1563,7 @@ class Compressor:
                 binary_stream.append(len(D))
                 for input_id in D:
                     # Input IDs for patterns are absolute node indices and are always non-negative. it should be `signed=False`.
-                    binary_stream.extend(input_id.to_bytes(2, 'big', signed=False))
+                    binary_stream.extend(input_id.to_bytes(2, 'big', signed=True))
 
             elif A == copy_prefix_id:
                 # ENCODE A COPY NODE 
@@ -1549,7 +1596,7 @@ class Compressor:
                 binary_stream.append(len(D))
                 for input_id in D:
                     # Input IDs for standard nodes are absolute node indices, which are always non-negative. it should be `signed=False`.
-                    binary_stream.extend(input_id.to_bytes(2, 'big', signed=False))
+                    binary_stream.extend(input_id.to_bytes(2, 'big', signed=True))
 
         #  Return the final, immutable byte string.
         return bytes(binary_stream)
@@ -1626,7 +1673,7 @@ class Compressor:
             # It should read `signed=True` to be consistent with the encoding format.
             # However, for the limited use case within this class, `signed=False` (or just `big`) might have worked by chance.
             # For correctness, it should align with how 'D' is written.
-            D.append(int.from_bytes(token[ptr:ptr+2], 'big', signed=False)) # Assuming unsigned for this simple helper.
+            D.append(int.from_bytes(token[ptr:ptr+2], 'big', signed=True)) 
             ptr += 2
         return A, B, C, D
 
@@ -2317,95 +2364,92 @@ def run_reconstruction_test(db_path: str):
         # Loop as long as there are any macro-nodes left to expand in the graph.
         while any(node.get('A') in (pattern_prefix_id, copy_prefix_id) for node in nodes):
             print(f"  -> Expansion iteration, current graph size: {len(nodes)}")
-            new_nodes = []     # The list of nodes for the next, more expanded, iteration.
-            id_map = {}        # Maps node IDs from the *old* list to IDs in the *new* list.
+            
+            # PHASE 1: EXPANSION
+            # Expand all macros, but keep dependencies as old IDs in a temporary field.
+            expanded_nodes_pass1 = []
+            id_map = {}  # Maps old ID to one or more new IDs.
 
-            # Iterate through the current list of (potentially compressed) nodes.
             for old_id, node in enumerate(nodes):
                 node_A = node.get('A')
                 
                 if node_A == pattern_prefix_id:
-                    # EXPAND A PATTERN NODE 
-                    # Step P1: Retrieve the pattern's binary definition from the registry.
                     pattern_id = node['pattern_id']
                     pattern_b64 = registry.patterns.get(pattern_id)
                     if not pattern_b64: continue
                     
-                    # Step P2: Decode the pattern's binary into a list of its constituent nodes.
-                    # `is_pattern_definition=True` tells the decoder to read 'D' fields as relative offsets.
                     pattern_nodes = decoder.decode_raw(pattern_b64, is_pattern_definition=True)
-                    
-                    # `base_offset` is the starting index where the pattern's nodes will be inserted into `new_nodes`.
-                    base_offset = len(new_nodes)
-                    
-                    # Step P3: Map the pattern's internal inputs (negative D values) to the external
-                    # inputs provided to the PATTERN macro-node.
-                    # e.g., if the pattern needs input -1 and -2, map -1 to `node['D'][0]` and -2 to `node['D'][1]`.
+                    base_offset = len(expanded_nodes_pass1)
+
                     internal_to_external_input_map = {
                         rel_id: node['D'][i]
                         for i, rel_id in enumerate(sorted(list(set(d for pn in pattern_nodes for d in pn.get('D', []) if d < 0))))
                         if i < len(node['D'])
                     }
-                    
-                    # Step P4: Find which internal node provides the output for the entire pattern.
+
                     output_source_internal_id = -1
                     for pn in pattern_nodes:
                         if pn.get('A') == registry.canonical_to_index.get('<OUTPUT>'):
-                            if pn.get('D'): output_source_internal_id = pn['D'][0]; break
+                            if pn.get('D'):
+                                output_source_internal_id = pn['D'][0]
+                                break
                     
-                    # The `old_id` of the PATTERN macro-node now maps to the absolute ID of its internal output node.
                     if output_source_internal_id != -1:
+                        # Map old macro ID to the *relative* internal ID of its output node
                         id_map[old_id] = output_source_internal_id + base_offset
-                    else: # If the pattern has no output, it maps to nothing.
-                        id_map[old_id] = -1
 
-                    # Step P5: Add the pattern's internal nodes to the `new_nodes` list, re-wiring their inputs.
                     for internal_id, pn in enumerate(pattern_nodes):
-                        # Skip special nodes within the pattern definition (like <OUTPUT>).
                         if pn.get('A') in (registry.canonical_to_index.get(t) for t in ["<DATA_INPUT>", "<PARAM_INPUT>", "<OUTPUT>"]):
                             continue
                         
-                        new_D = []
+                        # Store old dependencies in a temp field
+                        old_deps = []
                         for d in pn.get('D', []):
-                            if d < 0: # This is an external input.
-                                if d in internal_to_external_input_map: new_D.append(internal_to_external_input_map[d])
-                            else: # This is an internal connection within the pattern.
-                                new_D.append(d + base_offset) # Convert relative ID to absolute ID.
-                        pn['D'] = new_D
-                        new_nodes.append(pn)
+                            if d < 0: # External input
+                                if d in internal_to_external_input_map:
+                                    old_deps.append(internal_to_external_input_map[d])
+                            else: # Internal connection (relative to pattern start)
+                                old_deps.append(d + base_offset) # This is an ID relative to the *new* list
+                        pn['D_old'] = old_deps
+                        pn.pop('D', None)
+                        expanded_nodes_pass1.append(pn)
 
                 elif node_A == copy_prefix_id:
-                    # EXPAND A COPY NODE 
                     count = node['count']
                     template = node['template']
+                    new_node_base_id = len(expanded_nodes_pass1)
                     
-                    # The `old_id` of the COPY macro-node now maps to a list of all the new node IDs it will create.
-                    new_node_base_id = len(new_nodes)
-                    id_map[old_id] = list(range(new_node_base_id, new_node_base_id + count))
-
-                    # Create `count` identical nodes using the stored template.
-                    for _ in range(count):
-                        new_nodes.append({
-                            'A': template['A'], 'B': template['B'], 'C': template['C'],
-                            'D': [] # The copied nodes are input-less by definition.
-                        })
+                    # For a COPY node, any node depending on it should probably only get the *first* instance.
+                    # This is a simplification but more robust than passing a list.
+                    id_map[old_id] = new_node_base_id
+                    
+                    for i in range(count):
+                        new_node = {'A': template['A'], 'B': template['B'], 'C': template['C'], 'D_old': []}
+                        expanded_nodes_pass1.append(new_node)
                 else:
-                    # This is a fundamental node, just copy it 
-                    id_map[old_id] = len(new_nodes)
-                    new_nodes.append(node)
+                    id_map[old_id] = len(expanded_nodes_pass1)
+                    node['D_old'] = node.get('D', [])
+                    node.pop('D', None)
+                    expanded_nodes_pass1.append(node)
 
-            # After expanding all nodes in one pass, re-wire all 'D' fields.
-            for node in new_nodes:
+            # PHASE 2: RE-WIRING
+            # Now that id_map is complete and all nodes are expanded, fix all dependencies.
+            for node in expanded_nodes_pass1:
                 new_D = []
-                for old_d in node.get('D', []):
-                    mapped = id_map.get(old_d)
-                    if mapped is not None and mapped != -1:
-                        if isinstance(mapped, list): new_D.extend(mapped) # An input might now come from multiple unrolled COPY nodes.
-                        else: new_D.append(mapped)
+                old_deps = node.pop('D_old', [])
+                for old_d in old_deps:
+                    # In this pass, old_d is either an old absolute ID or a new absolute ID (for intra-pattern links)
+                    mapped_id = id_map.get(old_d)
+                    if mapped_id is not None:
+                        new_D.append(mapped_id)
+                    else:
+                        # If not in map, it might be a new intra-pattern ID already
+                        if old_d < len(expanded_nodes_pass1):
+                           new_D.append(old_d)
+
                 node['D'] = sorted(list(set(new_D)))
             
-            # The newly expanded list becomes the list for the next iteration of the `while` loop.
-            nodes = new_nodes
+            nodes = expanded_nodes_pass1
         return nodes
 
     # Main test loop 
