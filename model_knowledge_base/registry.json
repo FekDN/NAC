@@ -8,68 +8,69 @@
     "<CONST_REF>": 5,
     "<PATTERN_PREFIX>": 6,
     "<COPY_PREFIX>": 7,
-    "<RESERVED>": 8,
+    "<CONTROL_FLOW_PREFIX>": 8,
+    "<RESERVED>": 9,
     "aten.slice.Tensor:node_args(1):kwargs()": 10,
-    "aten.embedding.default:node_args(2):kwargs()": 10,
-    "aten.add.Tensor:node_args(2):kwargs()": 11,
-    "aten.layer_norm.default:node_args(3):kwargs()": 12,
-    "aten.dropout.default:node_args(1):kwargs()": 13,
-    "aten.unsqueeze.default:node_args(1):kwargs()": 14,
-    "aten.expand.default:node_args(1):kwargs()": 15,
-    "aten._to_copy.default:node_args(1):kwargs('dtype',)": 16,
-    "aten.lift_fresh_copy.default:node_args(1):kwargs()": 17,
-    "aten.detach.default:node_args(1):kwargs()": 18,
-    "aten.sub.Tensor:node_args(2):kwargs()": 19,
-    "aten.masked_fill.Scalar:node_args(2):kwargs()": 20,
-    "aten.linear.default:node_args(3):kwargs()": 21,
-    "aten.view.default:node_args(1):kwargs()": 22,
-    "aten.transpose.int:node_args(1):kwargs()": 23,
-    "aten.scaled_dot_product_attention.default:node_args(4):kwargs()": 24,
-    "aten.gelu.default:node_args(1):kwargs()": 25,
-    "aten.select.int:node_args(1):kwargs()": 26,
-    "aten.tanh.default:node_args(1):kwargs()": 27,
-    "aten.ne.Scalar:node_args(1):kwargs()": 28,
-    "aten.cumsum.default:node_args(1):kwargs()": 29,
-    "aten.type_as.default:node_args(2):kwargs()": 30,
-    "aten.add.Tensor:node_args(1):kwargs()": 31,
-    "aten.mul.Tensor:node_args(2):kwargs()": 32,
-    "aten.eq.Scalar:node_args(1):kwargs()": 33,
-    "aten.sum.dim_IntList:node_args(1):kwargs()": 34,
-    "aten.div.Tensor:node_args(1):kwargs()": 35,
-    "aten.mul.Tensor:node_args(1):kwargs()": 36,
-    "aten.rsub.Scalar:node_args(1):kwargs()": 37,
-    "aten.div.Tensor:node_args(2):kwargs()": 38,
-    "aten.arange.default:node_args(0):kwargs('device', 'pin_memory')": 39,
-    "aten.outer.default:node_args(2):kwargs()": 40,
-    "aten.cat.default:node_args(1):kwargs()": 41,
-    "aten._to_copy.default:node_args(1):kwargs('device', 'dtype', 'layout')": 42,
-    "aten.cos.default:node_args(1):kwargs()": 43,
-    "aten.sin.default:node_args(1):kwargs()": 44,
-    "aten.split.Tensor:node_args(1):kwargs()": 45,
-    "<built-in function getitem>:node_args(1):kwargs()": 46,
-    "aten.neg.default:node_args(1):kwargs()": 47,
-    "aten.cat.default:node_args(2):kwargs()": 48,
-    "aten.scaled_dot_product_attention.default:node_args(4):kwargs('scale',)": 49,
-    "aten.erf.default:node_args(1):kwargs()": 50,
-    "aten.linear.default:node_args(2):kwargs()": 51,
-    "aten.matmul.default:node_args(2):kwargs()": 52,
-    "aten.softmax.int:node_args(1):kwargs()": 53,
-    "aten.permute.default:node_args(1):kwargs()": 54,
-    "aten.clone.default:node_args(1):kwargs('memory_format',)": 55,
-    "aten.arange.start:node_args(0):kwargs('device', 'pin_memory')": 56,
-    "aten.full.default:node_args(0):kwargs('device', 'dtype', 'pin_memory')": 57,
-    "aten.triu.default:node_args(1):kwargs()": 58,
-    "aten.gt.Tensor:node_args(2):kwargs()": 59,
-    "aten.clone.default:node_args(1):kwargs()": 60,
-    "aten.copy.default:node_args(2):kwargs()": 61,
-    "aten.slice_scatter.default:node_args(2):kwargs()": 62,
-    "aten.where.self:node_args(3):kwargs()": 63,
-    "aten.pow.Tensor_Scalar:node_args(1):kwargs()": 64,
-    "aten.conv2d.default:node_args(2):kwargs()": 65,
-    "aten._native_batch_norm_legit_no_training.default:node_args(5):kwargs()": 66,
-    "aten.relu.default:node_args(1):kwargs()": 67,
-    "aten.max_pool2d.default:node_args(1):kwargs()": 68,
-    "aten.adaptive_avg_pool2d.default:node_args(1):kwargs()": 69
+    "aten.embedding.default:node_args(2):kwargs()": 11,
+    "aten.add.Tensor:node_args(2):kwargs()": 12,
+    "aten.layer_norm.default:node_args(3):kwargs()": 13,
+    "aten.dropout.default:node_args(1):kwargs()": 14,
+    "aten.unsqueeze.default:node_args(1):kwargs()": 15,
+    "aten.expand.default:node_args(1):kwargs()": 16,
+    "aten._to_copy.default:node_args(1):kwargs('dtype',)": 17,
+    "aten.lift_fresh_copy.default:node_args(1):kwargs()": 18,
+    "aten.detach.default:node_args(1):kwargs()": 19,
+    "aten.sub.Tensor:node_args(2):kwargs()": 20,
+    "aten.masked_fill.Scalar:node_args(2):kwargs()": 21,
+    "aten.linear.default:node_args(3):kwargs()": 22,
+    "aten.view.default:node_args(1):kwargs()": 23,
+    "aten.transpose.int:node_args(1):kwargs()": 24,
+    "aten.scaled_dot_product_attention.default:node_args(4):kwargs()": 25,
+    "aten.gelu.default:node_args(1):kwargs()": 26,
+    "aten.select.int:node_args(1):kwargs()": 27,
+    "aten.tanh.default:node_args(1):kwargs()": 28,
+    "aten.ne.Scalar:node_args(1):kwargs()": 29,
+    "aten.cumsum.default:node_args(1):kwargs()": 30,
+    "aten.type_as.default:node_args(2):kwargs()": 31,
+    "aten.add.Tensor:node_args(1):kwargs()": 32,
+    "aten.mul.Tensor:node_args(2):kwargs()": 33,
+    "aten.eq.Scalar:node_args(1):kwargs()": 34,
+    "aten.sum.dim_IntList:node_args(1):kwargs()": 35,
+    "aten.div.Tensor:node_args(1):kwargs()": 36,
+    "aten.mul.Tensor:node_args(1):kwargs()": 37,
+    "aten.rsub.Scalar:node_args(1):kwargs()": 38,
+    "aten.div.Tensor:node_args(2):kwargs()": 39,
+    "aten.arange.default:node_args(0):kwargs('device', 'pin_memory')": 40,
+    "aten.outer.default:node_args(2):kwargs()": 41,
+    "aten.cat.default:node_args(1):kwargs()": 42,
+    "aten._to_copy.default:node_args(1):kwargs('device', 'dtype', 'layout')": 43,
+    "aten.cos.default:node_args(1):kwargs()": 44,
+    "aten.sin.default:node_args(1):kwargs()": 45,
+    "aten.split.Tensor:node_args(1):kwargs()": 46,
+    "<built-in function getitem>:node_args(1):kwargs()": 47,
+    "aten.neg.default:node_args(1):kwargs()": 48,
+    "aten.cat.default:node_args(2):kwargs()": 49,
+    "aten.scaled_dot_product_attention.default:node_args(4):kwargs('scale',)": 50,
+    "aten.erf.default:node_args(1):kwargs()": 51,
+    "aten.linear.default:node_args(2):kwargs()": 52,
+    "aten.matmul.default:node_args(2):kwargs()": 53,
+    "aten.softmax.int:node_args(1):kwargs()": 54,
+    "aten.permute.default:node_args(1):kwargs()": 55,
+    "aten.clone.default:node_args(1):kwargs('memory_format',)": 56,
+    "aten.arange.start:node_args(0):kwargs('device', 'pin_memory')": 57,
+    "aten.full.default:node_args(0):kwargs('device', 'dtype', 'pin_memory')": 58,
+    "aten.triu.default:node_args(1):kwargs()": 59,
+    "aten.gt.Tensor:node_args(2):kwargs()": 60,
+    "aten.clone.default:node_args(1):kwargs()": 61,
+    "aten.copy.default:node_args(2):kwargs()": 62,
+    "aten.slice_scatter.default:node_args(2):kwargs()": 63,
+    "aten.where.self:node_args(3):kwargs()": 64,
+    "aten.pow.Tensor_Scalar:node_args(1):kwargs()": 65,
+    "aten.conv2d.default:node_args(2):kwargs()": 66,
+    "aten._native_batch_norm_legit_no_training.default:node_args(5):kwargs()": 67,
+    "aten.relu.default:node_args(1):kwargs()": 68,
+    "aten.max_pool2d.default:node_args(1):kwargs()": 69,
+    "aten.adaptive_avg_pool2d.default:node_args(1):kwargs()": 70
   },
   "index_to_canonical": {
     "0": "<NONE>",
@@ -80,67 +81,69 @@
     "5": "<CONST_REF>",
     "6": "<PATTERN_PREFIX>",
     "7": "<COPY_PREFIX>",
-    "8": "<RESERVED>",
-    "10": "aten.embedding.default:node_args(2):kwargs()",
-    "11": "aten.add.Tensor:node_args(2):kwargs()",
-    "12": "aten.layer_norm.default:node_args(3):kwargs()",
-    "13": "aten.dropout.default:node_args(1):kwargs()",
-    "14": "aten.unsqueeze.default:node_args(1):kwargs()",
-    "15": "aten.expand.default:node_args(1):kwargs()",
-    "16": "aten._to_copy.default:node_args(1):kwargs('dtype',)",
-    "17": "aten.lift_fresh_copy.default:node_args(1):kwargs()",
-    "18": "aten.detach.default:node_args(1):kwargs()",
-    "19": "aten.sub.Tensor:node_args(2):kwargs()",
-    "20": "aten.masked_fill.Scalar:node_args(2):kwargs()",
-    "21": "aten.linear.default:node_args(3):kwargs()",
-    "22": "aten.view.default:node_args(1):kwargs()",
-    "23": "aten.transpose.int:node_args(1):kwargs()",
-    "24": "aten.scaled_dot_product_attention.default:node_args(4):kwargs()",
-    "25": "aten.gelu.default:node_args(1):kwargs()",
-    "26": "aten.select.int:node_args(1):kwargs()",
-    "27": "aten.tanh.default:node_args(1):kwargs()",
-    "28": "aten.ne.Scalar:node_args(1):kwargs()",
-    "29": "aten.cumsum.default:node_args(1):kwargs()",
-    "30": "aten.type_as.default:node_args(2):kwargs()",
-    "31": "aten.add.Tensor:node_args(1):kwargs()",
-    "32": "aten.mul.Tensor:node_args(2):kwargs()",
-    "33": "aten.eq.Scalar:node_args(1):kwargs()",
-    "34": "aten.sum.dim_IntList:node_args(1):kwargs()",
-    "35": "aten.div.Tensor:node_args(1):kwargs()",
-    "36": "aten.mul.Tensor:node_args(1):kwargs()",
-    "37": "aten.rsub.Scalar:node_args(1):kwargs()",
-    "38": "aten.div.Tensor:node_args(2):kwargs()",
-    "39": "aten.arange.default:node_args(0):kwargs('device', 'pin_memory')",
-    "40": "aten.outer.default:node_args(2):kwargs()",
-    "41": "aten.cat.default:node_args(1):kwargs()",
-    "42": "aten._to_copy.default:node_args(1):kwargs('device', 'dtype', 'layout')",
-    "43": "aten.cos.default:node_args(1):kwargs()",
-    "44": "aten.sin.default:node_args(1):kwargs()",
-    "45": "aten.split.Tensor:node_args(1):kwargs()",
-    "46": "<built-in function getitem>:node_args(1):kwargs()",
-    "47": "aten.neg.default:node_args(1):kwargs()",
-    "48": "aten.cat.default:node_args(2):kwargs()",
-    "49": "aten.scaled_dot_product_attention.default:node_args(4):kwargs('scale',)",
-    "50": "aten.erf.default:node_args(1):kwargs()",
-    "51": "aten.linear.default:node_args(2):kwargs()",
-    "52": "aten.matmul.default:node_args(2):kwargs()",
-    "53": "aten.softmax.int:node_args(1):kwargs()",
-    "54": "aten.permute.default:node_args(1):kwargs()",
-    "55": "aten.clone.default:node_args(1):kwargs('memory_format',)",
-    "56": "aten.arange.start:node_args(0):kwargs('device', 'pin_memory')",
-    "57": "aten.full.default:node_args(0):kwargs('device', 'dtype', 'pin_memory')",
-    "58": "aten.triu.default:node_args(1):kwargs()",
-    "59": "aten.gt.Tensor:node_args(2):kwargs()",
-    "60": "aten.clone.default:node_args(1):kwargs()",
-    "61": "aten.copy.default:node_args(2):kwargs()",
-    "62": "aten.slice_scatter.default:node_args(2):kwargs()",
-    "63": "aten.where.self:node_args(3):kwargs()",
-    "64": "aten.pow.Tensor_Scalar:node_args(1):kwargs()",
-    "65": "aten.conv2d.default:node_args(2):kwargs()",
-    "66": "aten._native_batch_norm_legit_no_training.default:node_args(5):kwargs()",
-    "67": "aten.relu.default:node_args(1):kwargs()",
-    "68": "aten.max_pool2d.default:node_args(1):kwargs()",
-    "69": "aten.adaptive_avg_pool2d.default:node_args(1):kwargs()"
+    "8": "<CONTROL_FLOW_PREFIX>",
+    "9": "<RESERVED>",
+    "10": "aten.slice.Tensor:node_args(1):kwargs()",
+    "11": "aten.embedding.default:node_args(2):kwargs()",
+    "12": "aten.add.Tensor:node_args(2):kwargs()",
+    "13": "aten.layer_norm.default:node_args(3):kwargs()",
+    "14": "aten.dropout.default:node_args(1):kwargs()",
+    "15": "aten.unsqueeze.default:node_args(1):kwargs()",
+    "16": "aten.expand.default:node_args(1):kwargs()",
+    "17": "aten._to_copy.default:node_args(1):kwargs('dtype',)",
+    "18": "aten.lift_fresh_copy.default:node_args(1):kwargs()",
+    "19": "aten.detach.default:node_args(1):kwargs()",
+    "20": "aten.sub.Tensor:node_args(2):kwargs()",
+    "21": "aten.masked_fill.Scalar:node_args(2):kwargs()",
+    "22": "aten.linear.default:node_args(3):kwargs()",
+    "23": "aten.view.default:node_args(1):kwargs()",
+    "24": "aten.transpose.int:node_args(1):kwargs()",
+    "25": "aten.scaled_dot_product_attention.default:node_args(4):kwargs()",
+    "26": "aten.gelu.default:node_args(1):kwargs()",
+    "27": "aten.select.int:node_args(1):kwargs()",
+    "28": "aten.tanh.default:node_args(1):kwargs()",
+    "29": "aten.ne.Scalar:node_args(1):kwargs()",
+    "30": "aten.cumsum.default:node_args(1):kwargs()",
+    "31": "aten.type_as.default:node_args(2):kwargs()",
+    "32": "aten.add.Tensor:node_args(1):kwargs()",
+    "33": "aten.mul.Tensor:node_args(2):kwargs()",
+    "34": "aten.eq.Scalar:node_args(1):kwargs()",
+    "35": "aten.sum.dim_IntList:node_args(1):kwargs()",
+    "36": "aten.div.Tensor:node_args(1):kwargs()",
+    "37": "aten.mul.Tensor:node_args(1):kwargs()",
+    "38": "aten.rsub.Scalar:node_args(1):kwargs()",
+    "39": "aten.div.Tensor:node_args(2):kwargs()",
+    "40": "aten.arange.default:node_args(0):kwargs('device', 'pin_memory')",
+    "41": "aten.outer.default:node_args(2):kwargs()",
+    "42": "aten.cat.default:node_args(1):kwargs()",
+    "43": "aten._to_copy.default:node_args(1):kwargs('device', 'dtype', 'layout')",
+    "44": "aten.cos.default:node_args(1):kwargs()",
+    "45": "aten.sin.default:node_args(1):kwargs()",
+    "46": "aten.split.Tensor:node_args(1):kwargs()",
+    "47": "<built-in function getitem>:node_args(1):kwargs()",
+    "48": "aten.neg.default:node_args(1):kwargs()",
+    "49": "aten.cat.default:node_args(2):kwargs()",
+    "50": "aten.scaled_dot_product_attention.default:node_args(4):kwargs('scale',)",
+    "51": "aten.erf.default:node_args(1):kwargs()",
+    "52": "aten.linear.default:node_args(2):kwargs()",
+    "53": "aten.matmul.default:node_args(2):kwargs()",
+    "54": "aten.softmax.int:node_args(1):kwargs()",
+    "55": "aten.permute.default:node_args(1):kwargs()",
+    "56": "aten.clone.default:node_args(1):kwargs('memory_format',)",
+    "57": "aten.arange.start:node_args(0):kwargs('device', 'pin_memory')",
+    "58": "aten.full.default:node_args(0):kwargs('device', 'dtype', 'pin_memory')",
+    "59": "aten.triu.default:node_args(1):kwargs()",
+    "60": "aten.gt.Tensor:node_args(2):kwargs()",
+    "61": "aten.clone.default:node_args(1):kwargs()",
+    "62": "aten.copy.default:node_args(2):kwargs()",
+    "63": "aten.slice_scatter.default:node_args(2):kwargs()",
+    "64": "aten.where.self:node_args(3):kwargs()",
+    "65": "aten.pow.Tensor_Scalar:node_args(1):kwargs()",
+    "66": "aten.conv2d.default:node_args(2):kwargs()",
+    "67": "aten._native_batch_norm_legit_no_training.default:node_args(5):kwargs()",
+    "68": "aten.relu.default:node_args(1):kwargs()",
+    "69": "aten.max_pool2d.default:node_args(1):kwargs()",
+    "70": "aten.adaptive_avg_pool2d.default:node_args(1):kwargs()"
   },
   "variation_to_index": {
     "in0": 10,
@@ -2874,23 +2877,23 @@
     "1154": "b_getattr_getattr_l__fn_____7_____1___bn2_num_batches_tracked"
   },
   "patterns": {
-    "10": "KQEAIAH//yoK/+sB//8rCgAAAf//DgoACgH//w4KAAwB//8KCv/qAf//Cgr/8QH//ywKAAAB//oOCgAKAf//DgoADAH//woK/+oB//8KCv/xAf//Cgr/9QH/+goK/+kB//8KCv/xAf//Cgr/9QH//AoK/+kB//8KCv/xAf//IAsAAAL/6v/8LQr/6AH/6S4KAAoB//8uCgAMAf/+LwoAAAH//zABACAC//3//yALAAAC//n//wsLAAAC//n//xAKABQB//8KCv/1Af/rCgr/6QH//woK//EB//8KCv/1Af/tCgr/6QH//woK//EB//8gDgAAAv/X//wtCv/oAf/WLgoACgH//y4KAAwB//4vCgAAAf//MAEAIAL//f//IAsAAAL/+f//",
-    "11": "BwIABAIAAQAACgr/9QH/+goK//QB//8KCwAKAv80//oKCwAAAv8z//oLCwAAAv/+//8KCwAAAv8x//wLCwAAAv/+//8MDP/zA/8v/zD//w0K//IB//8KCv/1Af/1DgoADAH//w4KABEB//8KCv/xAf//DwoAEwH//xAKABQB//8RCgAAAf/sEgoAAAH//xMLAAAC//3//xAKABUB//8UCwAWAv/+//8VDAAAA/8k/yX/9BYKABcB//8XCv/wAf//FQwAAAP/I/8k//EWCgAXAf//Fwr/8AH//xUMAAAD/yL/I//uFgoAFwH//xcK//AB//8YDQAABP/2//n//P//Fwr/8AH//xYKABgB//8VDAAAA/8e/x///w0K//IB//8LDgAAAv/m//8MDP/zA/8d/x7//xUMAAAD/x7/H///GQoAAAH//xUMAAAD/x7/H///",
-    "12": "DQr/8gH//wsLAAAC//v//wwM//MD/x3/Hv//FQwAAAP/Hv8f//8WCgAXAf//Fwr/8AH//xUMAAAD/x3/Hv/8FgoAFwH//xcK//AB//8VDAAAA/8c/x3/+RYKABcB//8XCv/wAf//GA0AAAT/4P/5//z//xcK//AB//8WCgAYAf//FQwAAAP/GP8Z//8NCv/yAf//CwsAAAL/8f//DAz/8wP/F/8Y//8VDAAAA/8Y/xn//xkKAAAB//8VDAAAA/8Y/xn//w0K//IB//8LCwAAAv/7//8MDP/zA/8X/xj//xUMAAAD/xj/Gf//FgoAFwH//xcK//AB//8VDAAAA/8X/xj//BYKABcB//8XCv/wAf//FQwAAAP/Fv8X//kWCgAXAf//Fwr/8AH//xgNAAAE/8r/+f/8//8XCv/wAf//FgoAGAH//xUMAAAD/xL/E///DQr/8gH//wsLAAAC//H//w==",
-    "13": "DAz/8wP/Ef8S//8VDAAAA/8S/xP//xkKAAAB//8VDAAAA/8S/xP//w0K//IB//8LCwAAAv/7//8MDP/zA/8R/xL//xUMAAAD/xL/E///FgoAFwH//xcK//AB//8VDAAAA/8R/xL//BYKABcB//8XCv/wAf//FQwAAAP/EP8R//kWCgAXAf//Fwr/8AH//xgNAAAE/7T/+f/8//8XCv/wAf//FgoAGAH//xUMAAAD/wz/Df//DQr/8gH//wsLAAAC//H//wwM//MD/wv/DP//FQwAAAP/DP8N//8ZCgAAAf//FQwAAAP/DP8N//8NCv/yAf//CwsAAAL/+///DAz/8wP/C/8M//8VDAAAA/8M/w3//xYKABcB//8XCv/wAf//FQwAAAP/C/8M//wWCgAXAf//Fwr/8AH//xUMAAAD/wr/C//5FgoAFwH//xcK//AB//8YDQAABP+e//n//P//Fwr/8AH//w==",
-    "14": "FgoAGAH//xUMAAAD/wb/B///DQr/8gH//wsLAAAC//H//wwM//MD/wX/Bv//FQwAAAP/Bv8H//8ZCgAAAf//FQwAAAP/Bv8H//8NCv/yAf//CwsAAAL/+///DAz/8wP/Bf8G//8VDAAAA/8G/wf//xYKABcB//8XCv/wAf//FQwAAAP/Bf8G//wWCgAXAf//Fwr/8AH//xUMAAAD/wT/Bf/5FgoAFwH//xcK//AB//8YDQAABP+I//n//P//Fwr/8AH//xYKABgB//8VDAAAA/8A/wH//w0K//IB//8LCwAAAv/x//8MDP/zA/7//wD//xUMAAAD/wD/Af//GQoAAAH//xUMAAAD/wD/Af//DQr/8gH//wsLAAAC//v//wwM//MD/v//AP//FQwAAAP/AP8B//8WCgAXAf//Fwr/8AH//xUMAAAD/v//AP/8FgoAFwH//xcK//AB//8VDAAAA/7+/v//+Q==",
-    "15": "FgoAFwH//xcK//AB//8YDQAABP9y//n//P//Fwr/8AH//xYKABgB//8VDAAAA/76/vv//w0K//IB//8LCwAAAv/x//8MDP/zA/75/vr//xUMAAAD/vr++///GQoAAAH//xUMAAAD/vr++///DQr/8gH//wsLAAAC//v//wwM//MD/vn++v//FQwAAAP++v77//8WCgAXAf//Fwr/8AH//xUMAAAD/vn++v/8FgoAFwH//xcK//AB//8VDAAAA/74/vn/+RYKABcB//8XCv/wAf//GA0AAAT/XP/5//z//xcK//AB//8WCgAYAf//FQwAAAP+9P71//8NCv/yAf//CwsAAAL/8f//DAz/8wP+8/70//8VDAAAA/70/vX//xkKAAAB//8VDAAAA/70/vX//w0K//IB//8LCwAAAv/7//8MDP/zA/7z/vT//xUMAAAD/vT+9f//FgoAFwH//xcK//AB//8=",
-    "16": "FQwAAAP+8/70//wWCgAXAf//Fwr/8AH//xUMAAAD/vL+8//5FgoAFwH//xcK//AB//8YDQAABP9G//n//P//Fwr/8AH//xYKABgB//8VDAAAA/7u/u///w0K//IB//8LCwAAAv/x//8MDP/zA/7t/u7//xUMAAAD/u7+7///GQoAAAH//xUMAAAD/u7+7///DQr/8gH//wsLAAAC//v//wwM//MD/u3+7v//FQwAAAP+7v7v//8WCgAXAf//Fwr/8AH//xUMAAAD/u3+7v/8FgoAFwH//xcK//AB//8VDAAAA/7s/u3/+RYKABcB//8XCv/wAf//GA0AAAT/MP/5//z//xcK//AB//8WCgAYAf//FQwAAAP+6P7p//8NCv/yAf//CwsAAAL/8f//DAz/8wP+5/7o//8VDAAAA/7o/un//xkKAAAB//8VDAAAA/7o/un//w0K//IB//8LCwAAAv/7//8=",
-    "17": "DAz/8wP+5/7o//8VDAAAA/7o/un//xYKABcB//8XCv/wAf//FQwAAAP+5/7o//wWCgAXAf//Fwr/8AH//xUMAAAD/ub+5//5FgoAFwH//xcK//AB//8YDQAABP8a//n//P//Fwr/8AH//xYKABgB//8VDAAAA/7i/uP//w0K//IB//8LCwAAAv/x//8MDP/zA/7h/uL//xUMAAAD/uL+4///GQoAAAH//xUMAAAD/uL+4///DQr/8gH//wsLAAAC//v//wwM//MD/uH+4v//FQwAAAP+4v7j//8WCgAXAf//Fwr/8AH//xUMAAAD/uH+4v/8FgoAFwH//xcK//AB//8VDAAAA/7g/uH/+RYKABcB//8XCv/wAf//GA0AAAT/BP/5//z//xcK//AB//8WCgAYAf//FQwAAAP+3P7d//8NCv/yAf//CwsAAAL/8f//DAz/8wP+2/7c//8VDAAAA/7c/t3//w==",
-    "18": "FgoANwH//TYKADAB//8WCgA3Af/8NgoAMAH//xYKADcB//s2CgAwAf//EAoAFAH/+xAKABQB//wXCv/lAf//NAsAAAL//f//",
-    "19": "Cgr/6QH//woK/+oB//8LDgAAAv/8//81CgAgAf//EAoAFAH//w0K/+cB//80CwAAAv/t//82CgAwAf//NwoAMQH//xYKABgB//8="
+    "10": "KgEAIAH//ysK/+sB//8sCgAAAf//DwoACgH//w8KAAwB//8KCv/qAf//Cgr/8QH//y0KAAAB//oPCgAKAf//DwoADAH//woK/+oB//8KCv/xAf//Cgr/9QH/+goK/+kB//8KCv/xAf//Cgr/9QH//AoK/+kB//8KCv/xAf//IQsAAAL/6v/8Lgr/6AH/6S8KAAoB//8vCgAMAf/+MAoAAAH//zEBACAC//3//yELAAAC//n//wwLAAAC//n//xEKABQB//8KCv/1Af/rCgr/6QH//woK//EB//8KCv/1Af/tCgr/6QH//woK//EB//8hDgAAAv/X//wuCv/oAf/WLwoACgH//y8KAAwB//4wCgAAAf//MQEAIAL//f//IQsAAAL/+f//",
+    "11": "BwIABAIAAQAACgr/9QH/+goK//QB//8LCwAKAv80//oLCwAAAv8z//oMCwAAAv/+//8LCwAAAv8x//wMCwAAAv/+//8NDP/zA/8v/zD//w4K//IB//8KCv/1Af/1DwoADAH//w8KABEB//8KCv/xAf//EAoAEwH//xEKABQB//8SCgAAAf/sEwoAAAH//xQLAAAC//3//xEKABUB//8VCwAWAv/+//8WDAAAA/8k/yX/9BcKABcB//8YCv/wAf//FgwAAAP/I/8k//EXCgAXAf//GAr/8AH//xYMAAAD/yL/I//uFwoAFwH//xgK//AB//8ZDQAABP/2//n//P//GAr/8AH//xcKABgB//8WDAAAA/8e/x///w4K//IB//8MDgAAAv/m//8NDP/zA/8d/x7//xYMAAAD/x7/H///GgoAAAH//xYMAAAD/x7/H///",
+    "12": "Dgr/8gH//wwLAAAC//v//w0M//MD/x3/Hv//FgwAAAP/Hv8f//8XCgAXAf//GAr/8AH//xYMAAAD/x3/Hv/8FwoAFwH//xgK//AB//8WDAAAA/8c/x3/+RcKABcB//8YCv/wAf//GQ0AAAT/4P/5//z//xgK//AB//8XCgAYAf//FgwAAAP/GP8Z//8OCv/yAf//DAsAAAL/8f//DQz/8wP/F/8Y//8WDAAAA/8Y/xn//xoKAAAB//8WDAAAA/8Y/xn//w4K//IB//8MCwAAAv/7//8NDP/zA/8X/xj//xYMAAAD/xj/Gf//FwoAFwH//xgK//AB//8WDAAAA/8X/xj//BcKABcB//8YCv/wAf//FgwAAAP/Fv8X//kXCgAXAf//GAr/8AH//xkNAAAE/8r/+f/8//8YCv/wAf//FwoAGAH//xYMAAAD/xL/E///Dgr/8gH//wwLAAAC//H//w==",
+    "13": "DQz/8wP/Ef8S//8WDAAAA/8S/xP//xoKAAAB//8WDAAAA/8S/xP//w4K//IB//8MCwAAAv/7//8NDP/zA/8R/xL//xYMAAAD/xL/E///FwoAFwH//xgK//AB//8WDAAAA/8R/xL//BcKABcB//8YCv/wAf//FgwAAAP/EP8R//kXCgAXAf//GAr/8AH//xkNAAAE/7T/+f/8//8YCv/wAf//FwoAGAH//xYMAAAD/wz/Df//Dgr/8gH//wwLAAAC//H//w0M//MD/wv/DP//FgwAAAP/DP8N//8aCgAAAf//FgwAAAP/DP8N//8OCv/yAf//DAsAAAL/+///DQz/8wP/C/8M//8WDAAAA/8M/w3//xcKABcB//8YCv/wAf//FgwAAAP/C/8M//wXCgAXAf//GAr/8AH//xYMAAAD/wr/C//5FwoAFwH//xgK//AB//8ZDQAABP+e//n//P//GAr/8AH//w==",
+    "14": "FwoAGAH//xYMAAAD/wb/B///Dgr/8gH//wwLAAAC//H//w0M//MD/wX/Bv//FgwAAAP/Bv8H//8aCgAAAf//FgwAAAP/Bv8H//8OCv/yAf//DAsAAAL/+///DQz/8wP/Bf8G//8WDAAAA/8G/wf//xcKABcB//8YCv/wAf//FgwAAAP/Bf8G//wXCgAXAf//GAr/8AH//xYMAAAD/wT/Bf/5FwoAFwH//xgK//AB//8ZDQAABP+I//n//P//GAr/8AH//xcKABgB//8WDAAAA/8A/wH//w4K//IB//8MCwAAAv/x//8NDP/zA/7//wD//xYMAAAD/wD/Af//GgoAAAH//xYMAAAD/wD/Af//Dgr/8gH//wwLAAAC//v//w0M//MD/v//AP//FgwAAAP/AP8B//8XCgAXAf//GAr/8AH//xYMAAAD/v//AP/8FwoAFwH//xgK//AB//8WDAAAA/7+/v//+Q==",
+    "15": "FwoAFwH//xgK//AB//8ZDQAABP9y//n//P//GAr/8AH//xcKABgB//8WDAAAA/76/vv//w4K//IB//8MCwAAAv/x//8NDP/zA/75/vr//xYMAAAD/vr++///GgoAAAH//xYMAAAD/vr++///Dgr/8gH//wwLAAAC//v//w0M//MD/vn++v//FgwAAAP++v77//8XCgAXAf//GAr/8AH//xYMAAAD/vn++v/8FwoAFwH//xgK//AB//8WDAAAA/74/vn/+RcKABcB//8YCv/wAf//GQ0AAAT/XP/5//z//xgK//AB//8XCgAYAf//FgwAAAP+9P71//8OCv/yAf//DAsAAAL/8f//DQz/8wP+8/70//8WDAAAA/70/vX//xoKAAAB//8WDAAAA/70/vX//w4K//IB//8MCwAAAv/7//8NDP/zA/7z/vT//xYMAAAD/vT+9f//FwoAFwH//xgK//AB//8=",
+    "16": "FgwAAAP+8/70//wXCgAXAf//GAr/8AH//xYMAAAD/vL+8//5FwoAFwH//xgK//AB//8ZDQAABP9G//n//P//GAr/8AH//xcKABgB//8WDAAAA/7u/u///w4K//IB//8MCwAAAv/x//8NDP/zA/7t/u7//xYMAAAD/u7+7///GgoAAAH//xYMAAAD/u7+7///Dgr/8gH//wwLAAAC//v//w0M//MD/u3+7v//FgwAAAP+7v7v//8XCgAXAf//GAr/8AH//xYMAAAD/u3+7v/8FwoAFwH//xgK//AB//8WDAAAA/7s/u3/+RcKABcB//8YCv/wAf//GQ0AAAT/MP/5//z//xgK//AB//8XCgAYAf//FgwAAAP+6P7p//8OCv/yAf//DAsAAAL/8f//DQz/8wP+5/7o//8WDAAAA/7o/un//xoKAAAB//8WDAAAA/7o/un//w4K//IB//8MCwAAAv/7//8=",
+    "17": "DQz/8wP+5/7o//8WDAAAA/7o/un//xcKABcB//8YCv/wAf//FgwAAAP+5/7o//wXCgAXAf//GAr/8AH//xYMAAAD/ub+5//5FwoAFwH//xgK//AB//8ZDQAABP8a//n//P//GAr/8AH//xcKABgB//8WDAAAA/7i/uP//w4K//IB//8MCwAAAv/x//8NDP/zA/7h/uL//xYMAAAD/uL+4///GgoAAAH//xYMAAAD/uL+4///Dgr/8gH//wwLAAAC//v//w0M//MD/uH+4v//FgwAAAP+4v7j//8XCgAXAf//GAr/8AH//xYMAAAD/uH+4v/8FwoAFwH//xgK//AB//8WDAAAA/7g/uH/+RcKABcB//8YCv/wAf//GQ0AAAT/BP/5//z//xgK//AB//8XCgAYAf//FgwAAAP+3P7d//8OCv/yAf//DAsAAAL/8f//DQz/8wP+2/7c//8WDAAAA/7c/t3//w==",
+    "18": "FwoANwH//TcKADAB//8XCgA3Af/8NwoAMAH//xcKADcB//s3CgAwAf//EQoAFAH/+xEKABQB//wYCv/lAf//NQsAAAL//f//",
+    "19": "Cgr/6QH//woK/+oB//8MDgAAAv/8//82CgAgAf//EQoAFAH//w4K/+cB//81CwAAAv/t//83CgAwAf//OAoAMQH//xcKABgB//8="
   },
   "rules": {
     "transition_rules": {
       "After 'aten.expand.default:node_args(1):kwargs()' -> 'aten._to_copy.default:node_args(1):kwargs('dtype',)' with connection 'in0=SOURCE'": {
         "probability": "0.92",
         "count": 11,
-        "b64_repr": "DwoAEwAQCgAUAQAA",
+        "b64_repr": "EAoAEwARCgAUAQAA",
         "exceptions": [
           "-> 'aten.clone.default:node_args(1):kwargs()' with conn 'in0=SOURCE' (1 times)"
         ]
@@ -2898,47 +2901,47 @@
       "After 'aten.lift_fresh_copy.default:node_args(1):kwargs()' -> 'aten.detach.default:node_args(1):kwargs()' with connection 'in0=SOURCE'": {
         "probability": "1.00",
         "count": 23,
-        "b64_repr": "EQoAAAASCgAAAQAA"
+        "b64_repr": "EgoAAAATCgAAAQAA"
       },
       "After 'aten.scaled_dot_product_attention.default:node_args(4):kwargs()' -> 'aten.transpose.int:node_args(1):kwargs()' with connection 'in0=SOURCE'": {
         "probability": "1.00",
         "count": 91,
-        "b64_repr": "GA0AAAAXCv/wAQAA"
+        "b64_repr": "GQ0AAAAYCv/wAQAA"
       },
       "After 'aten.outer.default:node_args(2):kwargs()' -> '<PATTERN ID=10>' with connection 'in0=rel_-8,in1=rel_-4,in2=SOURCE'": {
         "probability": "1.00",
         "count": 30,
-        "b64_repr": "KAsAAAAGCgAAAQAA"
+        "b64_repr": "KQsAAAAGCgAAAQAA"
       },
       "After 'aten.scaled_dot_product_attention.default:node_args(4):kwargs('scale',)' -> 'aten.transpose.int:node_args(1):kwargs()' with connection 'in0=SOURCE'": {
         "probability": "1.00",
         "count": 30,
-        "b64_repr": "MQ0ADAAXCv/wAQAA"
+        "b64_repr": "Mg0ADAAYCv/wAQAA"
       },
       "After 'aten.erf.default:node_args(1):kwargs()' -> 'aten.add.Tensor:node_args(1):kwargs()' with connection 'in0=SOURCE'": {
         "probability": "1.00",
         "count": 30,
-        "b64_repr": "MgoAAAAfCgAMAQAA"
+        "b64_repr": "MwoAAAAgCgAMAQAA"
       },
       "After 'aten.softmax.int:node_args(1):kwargs()' -> 'aten.dropout.default:node_args(1):kwargs()' with connection 'in0=SOURCE'": {
         "probability": "1.00",
         "count": 24,
-        "b64_repr": "NQoAIAANCv/yAQAA"
+        "b64_repr": "NgoAIAAOCv/yAQAA"
       },
       "After 'aten.permute.default:node_args(1):kwargs()' -> 'aten.clone.default:node_args(1):kwargs('memory_format',)' with connection 'in0=SOURCE'": {
         "probability": "1.00",
         "count": 24,
-        "b64_repr": "NgoAMAA3CgAxAQAA"
+        "b64_repr": "NwoAMAA4CgAxAQAA"
       },
       "After 'aten.clone.default:node_args(1):kwargs('memory_format',)' -> 'aten.view.default:node_args(1):kwargs()' with connection 'in0=SOURCE'": {
         "probability": "1.00",
         "count": 24,
-        "b64_repr": "NwoAMQAWCgAyAQAA"
+        "b64_repr": "OAoAMQAXCgAyAQAA"
       },
-      "After 'aten.slice_scatter.default:node_args(2):kwargs()' -> 'aten.embedding.default:node_args(2):kwargs()' with connection 'in0=SOURCE'": {
+      "After 'aten.slice_scatter.default:node_args(2):kwargs()' -> 'aten.slice.Tensor:node_args(1):kwargs()' with connection 'in0=SOURCE'": {
         "probability": "0.86",
         "count": 12,
-        "b64_repr": "Pgv/3wAKCv/1AQAA",
+        "b64_repr": "Pwv/3wAKCv/1AQAA",
         "exceptions": [
           "-> 'aten.slice_scatter.default:node_args(2):kwargs()' with conn 'in0=rel_-3,in1=SOURCE' (1 times)",
           "-> 'aten.slice_scatter.default:node_args(2):kwargs()' with conn 'in0=rel_-23,in1=SOURCE' (1 times)"
@@ -2947,21 +2950,21 @@
       "After 'aten.where.self:node_args(3):kwargs()' -> '<PATTERN ID=19>' with connection 'in0=rel_-9,in1=SOURCE,in2=rel_-1'": {
         "probability": "1.00",
         "count": 12,
-        "b64_repr": "PwwAAAAGEwAAAQAA"
+        "b64_repr": "QAwAAAAGEwAAAQAA"
       },
       "After 'aten.pow.Tensor_Scalar:node_args(1):kwargs()' -> 'aten.mul.Tensor:node_args(1):kwargs()' with connection 'in0=SOURCE'": {
         "probability": "1.00",
         "count": 12,
-        "b64_repr": "QAoAEgAkCgA4AQAA"
+        "b64_repr": "QQoAEgAlCgA4AQAA"
       },
       "After 'aten._native_batch_norm_legit_no_training.default:node_args(5):kwargs()' -> '<built-in function getitem>:node_args(1):kwargs()' with connection 'in0=SOURCE'": {
         "probability": "1.00",
         "count": 20,
-        "b64_repr": "Qg//2wAuCgAKAQAA"
+        "b64_repr": "Qw//2wAvCgAKAQAA"
       }
     },
     "composition_rules": {
-      "Composition: Op='aten.embedding.default:node_args(2):kwargs()', Var=10, Const='g[10]'": {
+      "Composition: Op='aten.slice.Tensor:node_args(1):kwargs()', Var=10, Const='g[10]'": {
         "count": 88
       },
       "Composition: Op='aten.embedding.default:node_args(2):kwargs()', Var=11, Const='None'": {
@@ -3030,10 +3033,10 @@
       "Composition: Op='aten.outer.default:node_args(2):kwargs()', Var=11, Const='None'": {
         "count": 30
       },
-      "Composition: Op='aten.embedding.default:node_args(2):kwargs()', Var=10, Const='g[22]'": {
+      "Composition: Op='aten.slice.Tensor:node_args(1):kwargs()', Var=10, Const='g[22]'": {
         "count": 48
       },
-      "Composition: Op='aten.embedding.default:node_args(2):kwargs()', Var=10, Const='g[21]'": {
+      "Composition: Op='aten.slice.Tensor:node_args(1):kwargs()', Var=10, Const='g[21]'": {
         "count": 34
       },
       "Composition: Op='aten.scaled_dot_product_attention.default:node_args(4):kwargs('scale',)', Var=13, Const='c[12]'": {
@@ -3113,7 +3116,7 @@
       "Node '<PATTERN ID=10>' is formed by inputs from ['aten.mul.Tensor:node_args(1):kwargs()' (at rel -4), 'aten.outer.default:node_args(2):kwargs()' (at rel -1), 'aten.transpose.int:node_args(1):kwargs()' (at rel -8)]": {
         "count": 30
       },
-      "Node 'aten.scaled_dot_product_attention.default:node_args(4):kwargs('scale',)' is formed by inputs from ['<PATTERN ID=10>' (at rel -6), 'aten._to_copy.default:node_args(1):kwargs('dtype',)' (at rel -4), 'aten.embedding.default:node_args(2):kwargs()' (at rel -1), 'aten.transpose.int:node_args(1):kwargs()' (at rel -11)]": {
+      "Node 'aten.scaled_dot_product_attention.default:node_args(4):kwargs('scale',)' is formed by inputs from ['<PATTERN ID=10>' (at rel -6), 'aten._to_copy.default:node_args(1):kwargs('dtype',)' (at rel -4), 'aten.slice.Tensor:node_args(1):kwargs()' (at rel -1), 'aten.transpose.int:node_args(1):kwargs()' (at rel -11)]": {
         "count": 30
       },
       "Node 'aten.mul.Tensor:node_args(2):kwargs()' is formed by inputs from ['aten.add.Tensor:node_args(1):kwargs()' (at rel -1), 'aten.mul.Tensor:node_args(1):kwargs()' (at rel -4)]": {
@@ -3140,10 +3143,10 @@
       "Node '<PATTERN ID=18>' is formed by inputs from ['aten.linear.default:node_args(2):kwargs()' (at rel -3), 'aten.linear.default:node_args(2):kwargs()' (at rel -2), 'aten.linear.default:node_args(2):kwargs()' (at rel -1)]": {
         "count": 12
       },
-      "Node 'aten.where.self:node_args(3):kwargs()' is formed by inputs from ['<PATTERN ID=18>' (at rel -7), 'aten.detach.default:node_args(1):kwargs()' (at rel -1), 'aten.embedding.default:node_args(2):kwargs()' (at rel -3)]": {
+      "Node 'aten.where.self:node_args(3):kwargs()' is formed by inputs from ['<PATTERN ID=18>' (at rel -7), 'aten.detach.default:node_args(1):kwargs()' (at rel -1), 'aten.slice.Tensor:node_args(1):kwargs()' (at rel -3)]": {
         "count": 12
       },
-      "Node '<PATTERN ID=19>' is formed by inputs from ['<PATTERN ID=18>' (at rel -9), 'aten.embedding.default:node_args(2):kwargs()' (at rel -1), 'aten.where.self:node_args(3):kwargs()' (at rel -2)]": {
+      "Node '<PATTERN ID=19>' is formed by inputs from ['<PATTERN ID=18>' (at rel -9), 'aten.slice.Tensor:node_args(1):kwargs()' (at rel -1), 'aten.where.self:node_args(3):kwargs()' (at rel -2)]": {
         "count": 12
       },
       "Node 'aten.add.Tensor:node_args(2):kwargs()' is formed by inputs from ['aten.linear.default:node_args(3):kwargs()' (at rel -4), 'aten.mul.Tensor:node_args(1):kwargs()' (at rel -1)]": {
