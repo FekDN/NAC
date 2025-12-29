@@ -501,7 +501,7 @@ This is a key part of the runtime's logic at each iteration. For the current ins
 
 ---
 
-## Copyright (c) 2025 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
+### Copyright (c) 2025 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 ---
 
@@ -511,4 +511,5 @@ The source code of this project is licensed under the **GNU General Public Licen
 
 
 The accompanying documentation, including this README and the project's White Paper, is licensed under the **Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License**.
+
 
