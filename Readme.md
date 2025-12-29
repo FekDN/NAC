@@ -27,6 +27,10 @@
 
 ---
 
+ ## Instructions for use in the '/test/' directory
+
+---
+
  ## Neural Architecture Code (NAC) v1.5 Specification
 
  The NAC format is designed for the compact, unified, and machine-readable
@@ -61,7 +65,7 @@ The NAC standard is built on three fundamental principles:
 *   **Canonization:** Instead of supporting hundreds of operations from deep learning frameworks, NAC reduces them to a small, orthogonal, and stable set of canonical instructions. This significantly simplifies the development and verification of the runtime (especially hardware) and makes the standard resilient to changes in upstream libraries.
 *   **Hardware Orientation:** The entire design, from the simple, sequential ABCD instruction structure to the static nature of the graph, is aimed at direct and efficient implementation in digital logic. The absence of dynamic elements, such as data-dependent control flow (in the current version), makes the graph easily parallelizable and pipelineable at the hardware level.
 
-### 1.4. Versioning (Current Version: 1)
+### 1.4. Versioning (Current Version: 1.5)
 
 The current version of the standard is **NAC v1**. The version is explicitly stated in the header of the `.nac` file, which ensures backward compatibility and allows for future extensions. Any changes to the header structure, instruction format, or the semantics of system operations will require an increment of the standard's version.
 
@@ -511,5 +515,6 @@ The source code of this project is licensed under the **GNU General Public Licen
 
 
 The accompanying documentation, including this README and the project's White Paper, is licensed under the **Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License**.
+
 
 
