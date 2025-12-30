@@ -329,7 +329,7 @@ class GraphConstantFolder:
         for name in list(self.graph_module._buffers.keys()):
             if name not in used_attrs:
                 del self.graph_module._buffers[name]
-        print("[Folder] Cleaning completed.")
+        print("[Folder] Prune completed.")
 
     def _fuse_inverse_ops(self):
         """
@@ -440,8 +440,76 @@ class GraphConstantFolder:
         if fused_count > 0:
             print(f"[Folder] Fuse Inverse Ops: {fused_count} pair(s) of mutually inverse operations removed.")
 
+    def _optimize_memory_locality(self):
+        """
+        Restructures the graph for "late materialization" of weights.
+        Finds all nodes that load parameters/buffers (placeholder or get_attr),
+        and moves each of them just before its first use.
+        """
+        print("[Folder] Memory locality optimization (late weight materialization)...")
+        
+        # Step 1: Analysis - Create a movement plan.
+        # Map: user node -> list of attributes it uses first.
+        user_to_attrs_map = {}
+        
+        node_list = list(self.graph.nodes)
+        
+        # Collect all nodes that represent data loading (parameters, buffers).
+        # In exported_program it is a 'placeholder' with a specific type...
+        param_buffer_names = {
+            spec.arg.name
+            for spec in self.signature.input_specs
+            if spec.kind in (InputKind.PARAMETER, InputKind.BUFFER)
+        }
+        
+        # ...as well as 'get_attr', which may have been created in previous convolution steps.
+        nodes_to_consider = [
+            n for n in node_list 
+            if (n.op == 'placeholder' and n.target in param_buffer_names) or n.op == 'get_attr'
+        ]
+
+        if not nodes_to_consider:
+            print("[Folder] No parameter load/buffers nodes found to move.")
+            return
+
+        for attr_node in nodes_to_consider:
+            if not attr_node.users:
+                continue
+
+            try:
+                # Find the very first user in topological order
+                first_user = min(attr_node.users, key=node_list.index)
+                
+                if first_user not in user_to_attrs_map:
+                    user_to_attrs_map[first_user] = []
+                user_to_attrs_map[first_user].append(attr_node)
+            except ValueError:
+                print(f"Could not find first user for '{attr_node.name}'. Skipping.")
+
+        # Step 2: Mutation - Performing the moves.
+        moved_count = 0
+
+        # Iterate through the users in the order they appear in the graph to maintain stability.
+        for user_node in node_list:
+            if user_node in user_to_attrs_map:
+                attrs_to_move = user_to_attrs_map[user_node]
+                # Sort attributes by their initial position for determinism
+                attrs_to_move.sort(key=lambda n: node_list.index(n))
+                for attr_node in attrs_to_move:
+                    # A node can only be moved if all its users come after or are the same as the current user_node.
+                    # This prevents the node from being moved before other branches have used it.
+                    # But in our case we are moving to the FIRST user, so it is safe.
+                    user_node.prepend(attr_node)
+                    moved_count += 1
+        if moved_count > 0:
+            print(f"[Folder] Locality optimized: {moved_count} weight loading nodes were moved.")
+        else:
+            print("[Folder] Locality analysis is complete. No node relocation is required.")
+        # Сheck the correctness of the graph after modifications
+        self.graph.lint()
+
     # Main fold
-    def fold(self):
+    def fold(self, optimize_memory_locality: bool = False):
         print("[Folder] Beginning of the convolution of constants...")
 
         # --- STEP 1: init ---
@@ -514,6 +582,11 @@ class GraphConstantFolder:
         self._fuse_inverse_ops()
         # --- STEP 7: Removing operations that do nothing
         self._prune_identity_ops()
+
+        # --- STEP 7.5: Memory locality optimization ---
+        if optimize_memory_locality:
+            self._optimize_memory_locality()
+
         # --- STEP 8: replace folded ---
         print("[Folder] Replacing computed nodes...")
 

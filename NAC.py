@@ -592,7 +592,7 @@ def _get_d_model(model: torch.nn.Module) -> int:
     print("Warning: Could not automatically determine d_model. Defaulting to 0.")
     return 0
 
-def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tuple, d_model: Optional[int] = None, quantization_method: str = 'none', dynamic_shapes=None, store_weights_internally=True, io_counts=(0,0), tokenizer_repo=None, optimize = True, tokenizer_input: str = 'none'):
+def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tuple, d_model: Optional[int] = None, quantization_method: str = 'none', dynamic_shapes=None, store_weights_internally=True, io_counts=(0,0), tokenizer_repo=None, optimize = True, tokenizer_input: str = 'none', optimize_memory_locality: bool = True):
     print("\n" + "="*20 + f" ARTIFACT GENERATION ({model_name}) " + "="*20)
     result_manager = ResultManager()
 
@@ -658,7 +658,7 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
                 spec.loader.exec_module(optimizer_module)
                 GraphConstantFolder = optimizer_module.GraphConstantFolder
                 folder = GraphConstantFolder(exported_program, canonical_op_map=ModelProcessor.CANONICAL_OP_MAP)
-                folder.fold()
+                folder.fold(optimize_memory_locality=optimize_memory_locality)
             except Exception as e:
                 print(f"!!!!! ERROR while executing graph optimization: {e}\nContinuing without optimization...")
         else:
