@@ -125,7 +125,7 @@ The header has a fixed length and contains essential metadata about the model an
 *   **Type:** `uint16`
 *   **Description:** The key dimension of the model, typically corresponding to the embedding size or hidden state size in transformers. A value of `0` indicates that it is not defined.
 
-#### 2.2.5. Section Offset Table (72 bytes + 4 bytes padding)
+### 2.2.5. Section Offset Table (76 bytes)
 *   **Offset:** `12`
 *   **Length:** 72 bytes (9 offsets of 8 bytes each)
 *   **Type:** `uint64[]`
@@ -232,21 +232,23 @@ The metadata sections (`CMAP`, `PERM`, `CNST`) provide the runtime with all the 
 ### 4.1. `CMAP` Section (Canonical Map)
 
 #### 4.1.1. Purpose
-The `CMAP` section contains the mapping from numerical operation identifiers (`A` from the ABCD instruction) to their canonical string names. This allows the binary format to be compact by using 1-byte IDs instead of full string names in every instruction, while still maintaining readability and debuggability.
+The `CMAP` section contains the mapping from numerical operation identifiers (`A` from the ABCD instruction) to their canonical string names. This section is **optional** and is only present if the model uses operations that are not part of the standard, hardware-accelerated NAC set. Standard operations (e.g., `nac.add`, `nac.matmul`) have fixed, predefined IDs and are not recorded here. This allows the runtime to know the core instruction set without reading the file, making hardware implementation simpler.
 
 #### 4.1.2. Record Format
 The section consists of a sequence of records, each having the following structure:
 
-*   **Operation ID (2 bytes, `uint16`):** The unique numerical identifier for the operation, used in the `A` field of an instruction.
+*   **Operation ID (2 bytes, `uint16`):** The unique numerical identifier for the custom operation, used in the `A` field of an instruction.
 *   **Name Length (1 byte, `uint8`):** The length of the subsequent operation name string in bytes. The maximum name length is 255 bytes.
-*   **Operation Name (variable length, UTF-8):** The canonical name of the operation, e.g., `nac.add` or `aten.layer_norm.default`.
+*   **Operation Name (variable length, UTF-8):** The canonical name of the operation, e.g., `aten.special_op.default`.
 
-**Example:** The record for `nac.add` with ID=16 would look like this in binary: `0x10 0x00` (ID=16), `0x07` (length=7), `0x6E 0x61 0x63 0x2E 0x61 0x64 0x64` ("nac.add").
+**Example:** A custom operation `custom.op` with ID=201 would look like this: `0xC9 0x00` (ID=201), `0x0A` (length=10), `0x63 0x75 0x73 ...` ("custom.op").
 
 #### 4.1.3. Role of `CANONICAL_OP_MAP` in Formation
-The `CMAP` section is generated during the compilation stage (`NAC.py`) based on the `CANONICAL_OP_MAP` dictionary. This dictionary performs semantic normalization:
-1.  **Aliasing:** Many different operations from PyTorch ATen (e.g., `aten.add.Tensor`, `add`) are reduced to a single canonical name (`nac.add`).
-2.  **Generalization:** More complex operations (e.g., `aten.masked_fill`) are converted into their more general counterparts (`nac.where`).
+The compiler (`NAC.py`) uses an intelligent canonization mechanism.
+1.  **Normalization:** It cleans up PyTorch operation names (e.g., `aten.add_.Tensor` becomes `add`).
+2.  **Direct Mapping:** It tries to map the cleaned name to a standard NAC operation (e.g., `add` -> `nac.add`).
+3.  **Alias Mapping (`CANONICAL_OP_MAP`):** For operations with non-obvious names (`mm` -> `nac.matmul`) or those requiring argument reordering (`rsub`), it uses the `CANONICAL_OP_MAP` dictionary.
+4.  **Custom Operation:** If an operation cannot be mapped to a standard one, its original, full name is preserved, assigned a high-level ID (e.g., >=201), and this mapping is recorded in the `CMAP` section.
 
 Thanks to this process, the dictionary of canonical operations (and consequently, the `CMAP` section) remains small and stable, which simplifies the runtime and makes the 256-ID limit for operations more than sufficient.
 
@@ -288,16 +290,27 @@ Each character in the signature string represents one argument and defines its t
 ### 4.3. `CNST` Section (Constants)
 
 #### 4.3.1. Purpose
-The `CNST` section serves as a centralized storage for all constant values used in the computation graph. Instructions refer to these values via IDs from the `C` field.
+The `CNST` section serves as a centralized storage for all constant scalar and list values used in the computation graph. Instructions refer to these values via IDs from the `C` field.
 
 #### 4.3.2. Record Format
-Records in `CNST` have the following structure:
+Records in `CNST` have a purely binary structure for efficient hardware parsing, avoiding the need for a JSON parser.
 
 *   **Constant ID (2 bytes, `uint16`):** The unique numerical identifier for the constant.
-*   **String Length (1 byte, `uint8`):** The length of the subsequent JSON string in bytes (maximum 255).
-*   **JSON String (variable length, UTF-8):** The value of the constant, serialized into JSON format. Using JSON allows for a flexible representation of various data types: numbers (`123`, `1.5e-5`), strings (`"hello"`), booleans (`true`), lists (`[1, 2, 3]`), and `null`.
+*   **Type Code (1 byte, `uint8`):** A code indicating the data type of the constant.
+    *   `0`: `null`
+    *   `1`: `bool`
+    *   `2`: `int64`
+    *   `3`: `float64`
+    *   `4`: `string`
+    *   `5`: `list[int32]`
+    *   `6`: `list[float32]`
+*   **Length (2 bytes, `uint16`):** The interpretation depends on the `Type Code`.
+    *   For types `2, 3, 4`: length in **bytes** of the following data.
+    *   For types `5, 6`: number of **elements** in the list.
+    *   For types `0, 1`: length is fixed and can be ignored (e.g., 0 or 1).
+*   **Value (variable length, binary):** The constant's value, encoded directly in binary format (e.g., an 8-byte little-endian integer for `int64`, or a sequence of 4-byte little-endian floats for `list[float32]`).
 
-**Example:** The record for the constant `1.0` with ID=50 might look like: `0x32 0x00` (ID=50), `0x03` (length=3), `0x31 0x2E 0x30` ("1.0").
+**Example:** The record for the constant `[1, 2]` with ID=50 would look like: `0x32 0x00` (ID=50), `0x05` (type=list_int), `0x02 0x00` (length=2 elements), `0x01 0x00 0x00 0x00` (1), `0x02 0x00 0x00 0x00` (2).
 
 
 ## 5. Data and Resource Sections (DATA, RSRC, PROC)
@@ -322,26 +335,18 @@ Similar to parameters, this part maps the index of an `<INPUT>` instruction of t
     *   **Name Length (2 bytes, `uint16`):** The length of the input name.
     *   **Name (variable length, UTF-8):** The input's name, e.g., `input_ids`.
 
-#### 5.1.3. Internal Weight Storage Format
+### 5.1.3. Internal Weight Storage Format
 This data block is present in the `DATA` section **only if** the internal weight storage flag is set in the file's header.
-*   **Format:** The block begins with a 4-byte integer (`uint32`) indicating the number of tensors stored in the file, followed by a sequence of tensor records.
+*   **Format:** The block begins with a 4-byte integer (`uint32`) indicating the number of tensors stored, followed by a sequence of tensor records.
 *   **Tensor Record Structure:**
     *   **Parameter ID (2 bytes, `uint16`):** The ID that links this tensor to its name from section 5.1.1.
-    *   **Number of Meta Properties (1 byte, `uint8`):** The number of key-value pairs in the metadata block.
-    *   **Metadata Length (4 bytes, `uint32`):** The total length of the metadata block in bytes.
-    *   **Data Length (8 bytes, `uint64`):** The length of the tensor's binary data in bytes.
-    *   **Metadata (variable length):** A block containing additional information about the tensor.
-    *   **Data (variable length):** The raw binary data of the tensor.
-
-*   **Metadata Format (Key-Value):**
-    The metadata block consists of a sequence of `(key, value)` records without a general header. Each record has the structure:
-    *   **Key Length (1 byte, `uint8`):** The length of the key string.
-    *   **Key (UTF-8):** The key string (e.g., `shape`, `dtype`, `quant_type`).
-    *   **Value Length (2 bytes, `uint16`):** The length of the JSON value string.
-    *   **Value (UTF-8):** The JSON-serialized value string.
+    *   **Metadata Length (4 bytes, `uint32`):** The total length of the metadata JSON block in bytes.
+    *   **Data Length (8 bytes, `uint64`):** The length of the tensor's raw binary data in bytes.
+    *   **Metadata (variable length, UTF-8):** A single block of text containing all metadata for the tensor, serialized into a compact JSON string. This includes `shape`, `dtype`, and any quantization information.
+    *   **Data (variable length):** The raw, contiguous binary data of the tensor, with no additional formatting.
 
 *   **Data Type Encoding (DType Enum):**
-    In the metadata, the `dtype` key uses a numerical enumeration to encode the tensor's data type:
+    Inside the metadata JSON string, the `dtype` key uses a numerical enumeration to encode the tensor's data type:
     *   `0`: `float32`
     *   `1`: `float64`
     *   `2`: `float16`
@@ -461,12 +466,13 @@ Before computations begin, the runtime performs a one-time setup:
 
 1.  **Read Header:** The 88-byte header is read to extract the version, quantization information, input/output counts, and, most importantly, the offsets to all sections.
 2.  **Load Metadata into Memory:**
-    *   **`CMAP` Section:** The `(ID, Name)` records are loaded into a dictionary (hash table) named `id_to_canonical` for fast mapping of operation IDs to their names.
+    *   **Standard Operations:** The runtime initializes its list of known operations with a predefined set of standard NAC instructions (e.g., `nac.add`, `nac.pass`).
+    *   **`CMAP` Section:** If present, the `(ID, Name)` records for **custom** operations are read and added to the runtime's operation dictionary `id_to_canonical`.
     *   **`PERM` Section:** The `(ID, Signature String)` records are loaded into the `permutations` dictionary.
-    *   **`CNST` Section:** The `(ID, JSON String)` records are loaded into the `constants` dictionary, where the JSON string is deserialized into the appropriate Python data type (number, list, etc.).
+    *   **`CNST` Section:** The binary records are read, and based on the type code, the values are deserialized into native data types (integers, floats, lists) and stored in the `constants` dictionary.
 3.  **Load Parameters:**
     *   **External Weights:** If the weight storage flag in the header is cleared, the runtime looks for a corresponding `.safetensors` file. It reads the `(ID -> Name)` mapping from the `DATA` section and loads the tensors from the `.safetensors` file into the `parameters` dictionary by their names.
-    *   **Internal Weights:** If the flag is set, the runtime reads the tensor block from the `DATA` section. For each tensor, it reads and deserializes the metadata (including `shape` and `dtype`), then reads the binary data and constructs a tensor (e.g., a `numpy.ndarray`) from it.
+    *   **Internal Weights:** If the flag is set, the runtime reads the tensor block from the `DATA` section. For each tensor, it reads the metadata length, reads the JSON metadata block and deserializes it. Then, it reads the raw binary data of the specified length and constructs a tensor (e.g., a `numpy.ndarray`) from it using the `shape` and `dtype` from the metadata.
 4.  **Dequantize Parameters (If Necessary):** Immediately after loading, if the tensor's metadata or the file header specifies a quantization method (e.g., `INT8_CHANNEL`), the runtime applies the reverse operation (dequantization), converting the weights to the standard `float32` format. This is done once at load time to simplify subsequent computations.
 5.  **Initialize States:** The runtime initializes storage for states (e.g., KV-cache) if the graph contains any `<INPUT>` instructions with type `B=2`.
 
