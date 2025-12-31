@@ -9,6 +9,13 @@ from typing import List, Optional, Tuple, Dict, Any, Union
 import torch
 import traceback
 
+try:
+    from NAC_kernels import NAC_OPS
+except ImportError:
+    print("Warning: NAC_kernels.py not found. Standard NAC operations will not be recognized.")
+    NAC_OPS = {}
+
+
 class Reconstructor:
     """Reconstructs pseudo-code from a single, self-contained NAC file."""
     def __init__(self):
@@ -25,19 +32,31 @@ class Reconstructor:
         self.d_model: int = 0
         self.param_id_to_name: Dict[int, str] = {}
         self.input_node_idx_to_name: Dict[int, str] = {}
-        
+
         self._numpy_dtype_map = {
             torch.float32: np.float32, torch.float64: np.float64, torch.float16: np.float16,
+            torch.bfloat16: np.float32, # np doesn't have bfloat16, convert to float32 for reading
             torch.int32: np.int32, torch.int64: np.int64, torch.int16: np.int16,
             torch.int8: np.int8, torch.uint8: np.uint8, torch.bool: np.bool_
         }
-        
+
         self.CODE_TO_CATEGORY: Dict[str, str] = {
             'Q': 'offset', 'K': 'offset', 'V': 'offset', 'M': 'offset',
             'B': 'offset', 'W': 'offset', 'T': 'offset', 'P': 'offset',
             'S': 'const', 'A': 'const', 'f': 'const', 'i': 'const',
             'b': 'const', 's': 'const', 'c': 'const',
         }
+
+        # --- Initializing special and standard operations ---
+        self.id_to_canonical = {
+            2: "<INPUT>",
+            3: "<OUTPUT>",
+            6: "<CONTROL_FLOW>",
+            7: "<CONVERGENCE>",
+        }
+        # Loading standard operations from NAC_kernels.py
+        self.id_to_canonical.update(NAC_OPS)
+
 
     def _map_enum_to_dtype(self, enum: int) -> Optional[torch.dtype]:
         return {
@@ -74,29 +93,40 @@ class Reconstructor:
             num_inputs, num_outputs, _ = struct.unpack('<HHB', f.read(5))
             self.io_counts = (num_inputs, num_outputs)
             
-            # --- НАЧАЛО ИСПРАВЛЕНИЯ: Читаем новый 80-байтный заголовок ---
             offsets_header_format = '<H9Q6x'
             header_bytes = f.read(struct.calcsize(offsets_header_format))
             self.d_model, *offsets = struct.unpack(offsets_header_format, header_bytes)
             
             ops_off, cmap_off, cnst_off, perm_off, data_off, \
-            proc_off, meta_off, reserved1_off, reserved2_off = offsets
-            # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+            proc_off, meta_off, rsrc_off, reserved2_off = offsets
             
             print(f"NAC v{version}, d_model: {self.d_model}, Quant: '{self.quantization_method}', IO: {self.io_counts}, Weights: {'Internal' if self.weights_stored_internally else 'External'}")
 
             # --- CMAP (ID-Length-Value) ---
-            f.seek(cmap_off); f.read(4)
-            for _ in range(struct.unpack('<I', f.read(4))[0]):
+            f.seek(cmap_off); f.read(4) 
+            num_custom_ops = struct.unpack('<I', f.read(4))[0]
+            for _ in range(num_custom_ops):
                 op_id, name_len = struct.unpack('<HB', f.read(3))
-                self.id_to_canonical[op_id] = f.read(name_len).decode('utf-8')
+                op_name = f.read(name_len).decode('utf-8')
+                if op_id not in self.id_to_canonical:
+                    self.id_to_canonical[op_id] = op_name
+                else:
+                    print(f"Warning: CMAP contains standard op ID {op_id} ('{op_name}'). Ignoring, using predefined '{self.id_to_canonical[op_id]}'.")
 
             # --- CNST (ID-Length-Value) ---
             f.seek(cnst_off); f.read(4)
-            for _ in range(struct.unpack('<I', f.read(4))[0]):
-                const_id, val_len = struct.unpack('<HB', f.read(3))
-                const_val_str = f.read(val_len).decode('utf-8')
-                self.constants[const_id] = json.loads(const_val_str)
+            num_consts = struct.unpack('<I', f.read(4))[0]
+            for _ in range(num_consts):
+                const_id, type_code, length = struct.unpack('<HBH', f.read(5))
+                val = None
+                if type_code == 0: val = None
+                elif type_code == 1: val = struct.unpack('<?', f.read(length))[0]
+                elif type_code == 2: val = struct.unpack('<q', f.read(length))[0]
+                elif type_code == 3: val = struct.unpack('<d', f.read(length))[0]
+                elif type_code == 4: val = f.read(length).decode('utf-8')
+                elif type_code == 5: val = list(struct.unpack(f'<{length}i', f.read(length * 4))) if length > 0 else []
+                elif type_code == 6: val = list(struct.unpack(f'<{length}f', f.read(length * 4))) if length > 0 else []
+                self.constants[const_id] = val
 
             # --- PERM (ID-Length-Value) ---
             f.seek(perm_off); f.read(4)
@@ -134,27 +164,34 @@ class Reconstructor:
             if self.weights_stored_internally:
                 param_count = struct.unpack('<I', f.read(4))[0]
                 for _ in range(param_count):
-                    p_id, num_props, meta_len, data_len = struct.unpack('<HBIQ', f.read(15))
+                    # [ID: u16][meta_len: u32][data_len: u64]
+                    p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14))
+                    
+                    # Read the entire metadata block and parse it as JSON.
                     meta_bytes = f.read(meta_len)
-                    metadata, meta_offset = {}, 0
-                    for _ in range(num_props):
-                        key_len = meta_bytes[meta_offset]; meta_offset += 1
-                        key = meta_bytes[meta_offset:meta_offset+key_len].decode('utf-8'); meta_offset += key_len
-                        val_len = struct.unpack('<H', meta_bytes[meta_offset:meta_offset+2])[0]; meta_offset += 2
-                        val_str = meta_bytes[meta_offset:meta_offset+val_len].decode('utf-8'); meta_offset += val_len
-                        metadata[key] = json.loads(val_str)
+                    metadata = json.loads(meta_bytes.decode('utf-8'))
+
+                    # Skip the tensor data, we don't need it for code reconstruction
                     raw_data = f.read(data_len)
-                    torch_dtype = self._map_enum_to_dtype(metadata['dtype'])
-                    shape = metadata['shape']
-                    if (np_dtype := self._numpy_dtype_map.get(torch_dtype)):
-                        arr = np.frombuffer(raw_data, dtype=np_dtype).reshape(shape).copy()
-                        tensor = torch.from_numpy(arr)
-                        del metadata['shape'], metadata['dtype']
-                        self.loaded_param_data[p_id] = (tensor, metadata) if metadata else tensor
+                    
+                    torch_dtype = self._map_enum_to_dtype(metadata.get('dtype'))
+                    shape = metadata.get('shape')
+                    if torch_dtype and shape:
+                        if (np_dtype := self._numpy_dtype_map.get(torch_dtype)):
+                            # We don't create a tensor, we just store its metadata for output.
+                            tensor_info = {'shape': shape, 'dtype': str(torch_dtype)}
+                            # Deleting already used keys
+                            if 'shape' in metadata: del metadata['shape']
+                            if 'dtype' in metadata: del metadata['dtype']
+                            
+                            # Save the dummy tensor and the remaining metadata
+                            dummy_tensor = torch.empty(0) # Plug
+                            self.loaded_param_data[p_id] = (dummy_tensor, {**tensor_info, **metadata})
             else:
                 print("External weights are not loaded, but parameter names are mapped.")
 
         print(f"Successfully loaded {len(self.parsed_nodes)} ops and metadata for {len(self.loaded_param_data)} tensors.")
+
 
     def reconstruct_from_nac_file(self, nac_path: str) -> str:
         try:
@@ -228,7 +265,8 @@ class Reconstructor:
                             offset = next(d_iter)
                             final_args.append(self.global_var_map.get(i + offset, f"v{i+offset}_<ERR>"))
                         elif category == 'const':
-                            next(d_iter)
+                            # d_iter should still be advanced even if its value is not used for consts
+                            next(d_iter, None) # Use None as the default value to avoid StopIteration
                             const_id = next(c_iter)
                             final_args.append(repr(self.constants.get(const_id, f"<CONST_ERR_{const_id}>")))
                 args_str = ", ".join(final_args)
@@ -251,7 +289,7 @@ def reconstruct_from_file(nac_filepath: str):
     if pseudo_code:
         print("\n--- Reconstructed Pseudo-code ---")
         print(f"File: {os.path.abspath(nac_filepath)}")
-        print(f"Model Dimension (d_model): {reconstructor.d_model}") # <--- Добавлен вывод d_model
+        print(f"Model Dimension (d_model): {reconstructor.d_model}")
         print(f"Quantization Method: {reconstructor.quantization_method}")
         print("-" * 30)
         print(pseudo_code)

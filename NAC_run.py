@@ -8,11 +8,12 @@ import numpy as np
 from typing import List, Dict, Any, Tuple, Callable, Optional, Union
 from safetensors.numpy import load_file
 import time
+import json
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import warnings
 warnings.simplefilter("ignore", FutureWarning)
 
-from NAC_kernels import NacKernelBase, softmax
+from NAC_kernels import NacKernelBase, softmax, NAC_OPS
 from TISA_tokenizer import TISAVM
 
 class NacRuntime(NacKernelBase):
@@ -57,28 +58,16 @@ class NacRuntime(NacKernelBase):
             if perm:
                 num_consts_in_perm = sum(1 for p in perm if self.CODE_TO_CATEGORY.get(p) == 'const')
                 if num_consts_in_perm > 0:
-                    num_consts_from_c, = struct.unpack('<h', f.read(2))
-                    C = [num_consts_from_c] + list(struct.unpack(f'<{num_consts_from_c}h', f.read(num_consts_from_c * 2)))
+                    try:
+                        num_consts_from_c, = struct.unpack('<h', f.read(2))
+                        if num_consts_from_c > 0:
+                           C = [num_consts_from_c] + list(struct.unpack(f'<{num_consts_from_c}h', f.read(num_consts_from_c * 2)))
+                    except struct.error:
+                        # Handle case where C is expected but file ends
+                        pass
                 nD = len(perm)
                 if nD > 0: D = list(struct.unpack(f'<{nD}h', f.read(nD * 2)))
         return {'A': A, 'B': B, 'C': C, 'D': D}
-
-    def _parse_const_value(self, s: str) -> Any:
-        s = s.strip()
-        if s == 'null': return None
-        if s == 'true': return True
-        if s == 'false': return False
-        if s.startswith('"') and s.endswith('"'): return s[1:-1]
-        if s.startswith('[') and s.endswith(']'):
-            # A simple parser for lists of numbers
-            content = s[1:-1].strip()
-            if not content: return []
-            return [self._parse_const_value(item) for item in content.split(',')]
-        try: return int(s)
-        except ValueError:
-            try: return float(s)
-            except ValueError:
-                return s
 
     def encode(self, text: str) -> List[int]:
         if not self.tokenizer: raise RuntimeError("Tokenizer not available.")
@@ -95,7 +84,16 @@ class NacRuntime(NacKernelBase):
 
     def _load_nac_file(self, nac_path: str):
         print(f"Loading NAC file (Robust Binary Format): {nac_path}")
-        self.id_to_canonical, self.constants, self.permutations, self.parameters = {}, {}, {}, {}
+        
+        self.id_to_canonical = {
+            2: "<INPUT>",
+            3: "<OUTPUT>",
+            6: "<CONTROL_FLOW>",
+            7: "<CONVERGENCE>",
+        }
+        self.id_to_canonical.update(NAC_OPS)
+        
+        self.constants, self.permutations, self.parameters = {}, {}, {}
         self.operations, self.param_id_to_name, self.input_node_idx_to_name = [], {}, {}
         self.d_model = 0 
         self.tokenizer = None
@@ -124,13 +122,41 @@ class NacRuntime(NacKernelBase):
                 f.seek(cmap_off); f.read(4)
                 for _ in range(struct.unpack('<I', f.read(4))[0]):
                     op_id, name_len = struct.unpack('<HB', f.read(3))
-                    self.id_to_canonical[op_id] = f.read(name_len).decode('utf-8')
+                    op_name = f.read(name_len).decode('utf-8')
+                    if op_id not in self.id_to_canonical:
+                        self.id_to_canonical[op_id] = op_name
+                    else:
+                        print(f"Warning: CMAP tried to override standard op ID {op_id} ('{op_name}'). Sticking with predefined '{self.id_to_canonical[op_id]}'.")
 
             if cnst_off > 0:
-                f.seek(cnst_off); f.read(4)
-                for _ in range(struct.unpack('<I', f.read(4))[0]):
-                    const_id, val_len = struct.unpack('<HB', f.read(3))
-                    self.constants[const_id] = self._parse_const_value(f.read(val_len).decode('utf-8'))
+                f.seek(cnst_off); f.read(4) # Go to CNST and skip the tag
+                num_consts = struct.unpack('<I', f.read(4))[0]
+                for _ in range(num_consts):
+                    const_id, type_code, length = struct.unpack('<HBH', f.read(5))
+                    
+                    val = None
+                    if type_code == 0: # null
+                        val = None
+                    elif type_code == 1: # bool
+                        val = struct.unpack('<?', f.read(length))[0]
+                    elif type_code == 2: # int
+                        val = struct.unpack('<q', f.read(length))[0]
+                    elif type_code == 3: # float
+                        val = struct.unpack('<d', f.read(length))[0]
+                    elif type_code == 4: # string
+                        val = f.read(length).decode('utf-8')
+                    elif type_code == 5: # list_int
+                        if length > 0:
+                            val = list(struct.unpack(f'<{length}i', f.read(length * 4)))
+                        else:
+                            val = []
+                    elif type_code == 6: # list_float
+                        if length > 0:
+                            val = list(struct.unpack(f'<{length}f', f.read(length * 4)))
+                        else:
+                            val = []
+                    
+                    self.constants[const_id] = val
 
             if perm_off > 0:
                 f.seek(perm_off); f.read(4)
@@ -151,19 +177,28 @@ class NacRuntime(NacKernelBase):
                     i_idx, name_len = struct.unpack('<HH', f.read(4))
                     self.input_node_idx_to_name[i_idx] = f.read(name_len).decode('utf-8')
                 if self.weights_stored_internally:
-                    numpy_dtype_map = {0:np.float32, 1:np.float64, 2:np.float16, 3:np.byte, 4:np.int32, 5:np.int64, 6:np.int16, 7:np.int8, 8:np.uint8, 9:np.bool_}
-                    for _ in range(struct.unpack('<I', f.read(4))[0]):
-                        p_id, num_props, meta_len, data_len = struct.unpack('<HBIQ', f.read(15))
-                        meta_bytes = f.read(meta_len)
-                        meta, meta_offset = {}, 0
-                        for _ in range(num_props):
-                            key_len = meta_bytes[meta_offset]; meta_offset += 1
-                            key = meta_bytes[meta_offset:meta_offset+key_len].decode('utf-8'); meta_offset += key_len
-                            val_len = struct.unpack('<H', meta_bytes[meta_offset:meta_offset+2])[0]; meta_offset += 2
-                            val_str = meta_bytes[meta_offset:meta_offset+val_len].decode('utf-8'); meta_offset += val_len
-                            meta[key] = self._parse_const_value(val_str)
-                        arr = np.frombuffer(f.read(data_len), dtype=numpy_dtype_map.get(meta['dtype'])).reshape(meta['shape']).copy()
-                        self.parameters[p_id] = self._dequantize(arr, meta)
+                    current_pos = f.tell()
+                    f.seek(0, 2)
+                    end_pos = f.tell()
+                    f.seek(current_pos)
+                    if current_pos < end_pos:
+                        numpy_dtype_map = {0:np.float32, 1:np.float64, 2:np.float16, 3:np.byte, 4:np.int32, 5:np.int64, 6:np.int16, 7:np.int8, 8:np.uint8, 9:np.bool_}
+                        
+                        num_tensors = struct.unpack('<I', f.read(4))[0]
+                        for _ in range(num_tensors):
+                            p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14))
+                            meta_bytes = f.read(meta_len)
+                            meta = json.loads(meta_bytes.decode('utf-8'))
+                            data_bytes = f.read(data_len)
+                            dtype_id = meta.get('dtype')
+                            dtype = numpy_dtype_map.get(dtype_id) if dtype_id is not None else np.float32
+                            
+                            if dtype == np.byte and meta.get('true_dtype') == 'bfloat16':
+                                arr = np.frombuffer(data_bytes, dtype=np.uint16).view(np.float32)
+                            else:
+                                arr = np.frombuffer(data_bytes, dtype=dtype).reshape(meta['shape']).copy()
+                            
+                            self.parameters[p_id] = self._dequantize(arr, meta)
                 else:
                     safetensors_path = os.path.splitext(nac_path)[0] + '.safetensors'
                     if not os.path.exists(safetensors_path): raise FileNotFoundError(f"External weights file not found: {safetensors_path}")
@@ -195,7 +230,6 @@ class NacRuntime(NacKernelBase):
 
             # --- 4. Initializing TISAVM (if there is a manifest) ---
             if proc_off > 0:
-                import json 
                 f.seek(proc_off)
                 if f.read(4) != b'PROC': raise IOError("PROC section marker mismatch.")
                 manifest_bytes = f.read(struct.unpack('<I', f.read(4))[0])

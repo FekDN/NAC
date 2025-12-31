@@ -23,6 +23,7 @@ import warnings
 warnings.simplefilter("ignore", FutureWarning)
 
 from TISA_tokenizer import TISACompiler
+from NAC_kernels import NAC_OPS, NAC_OPS_REVERSED, CUSTOM_OP_ID_START
 
 class NoIndent:
     def __init__(self, value): self.value = value
@@ -52,17 +53,20 @@ class ResultManager:
     def save_registry(self, op_string_to_id: Dict[str, int], const_to_id: Dict[Any, int], perm_tuple_to_id: Dict[Tuple[str, ...], int]):
         """Save FULL GLOBAL maps in registry.json."""
         try:
-            canonical_map = {str(v): k for k, v in op_string_to_id.items()}
+            sorted_op_items = sorted(op_string_to_id.items(), key=lambda item: item[1])
+            canonical_map = {str(op_id): op_name for op_name, op_id in sorted_op_items}
             
+            sorted_const_items = sorted(const_to_id.items(), key=lambda item: item[1])
             constants_map = {}
-            for const, const_id in const_to_id.items():
+            for const, const_id in sorted_const_items:
                 value_to_store = list(const) if isinstance(const, tuple) else const
                 if isinstance(value_to_store, list):
                     constants_map[str(const_id)] = NoIndent(value_to_store)
                 else:
                     constants_map[str(const_id)] = value_to_store
             
-            permutations_map = {str(v): "".join(k) for k, v in perm_tuple_to_id.items()}
+            sorted_perm_items = sorted(perm_tuple_to_id.items(), key=lambda item: item[1])
+            permutations_map = {str(perm_id): "".join(perm_tuple) for perm_tuple, perm_id in sorted_perm_items}
             
             registry_data = {'canonical': canonical_map, 'constants': constants_map, 'permutations': permutations_map}
             with open(os.path.join(self.output_path, 'registry.json'), 'w', encoding='utf-8') as f:
@@ -98,20 +102,67 @@ class ResultManager:
                     if D: f.write(struct.pack(f'<{len(D)}h', *D))
                 
                 offsets['cmap'] = f.tell(); f.write(b'CMAP')
-                cmap = {int(k): v for k, v in used_mappings['canonical'].items()}
-                f.write(struct.pack('<I', len(cmap)))
-                for op_id, op_name in cmap.items():
+                # CMAP records only user operations (ID >= CUSTOM_OP_ID_START)
+                custom_cmap = {int(k): v for k, v in used_mappings['canonical'].items() if int(k) >= CUSTOM_OP_ID_START}
+                f.write(struct.pack('<I', len(custom_cmap)))
+                for op_id, op_name in custom_cmap.items():
                     name_bytes = op_name.encode('utf-8')
                     if len(name_bytes) > 255: raise ValueError(f"Op name too long: {op_name}")
                     f.write(struct.pack('<HB', op_id, len(name_bytes))); f.write(name_bytes)
                 
-                offsets['cnst'] = f.tell(); f.write(b'CNST')
+                # --- CNST (Constants) ---
+                offsets['cnst'] = f.tell()
+                f.write(b'CNST')
+                
                 constants = used_mappings['constants']
                 f.write(struct.pack('<I', len(constants)))
+                
                 for const_id_str, const_val in constants.items():
-                    val_bytes = json.dumps(const_val, separators=(',', ':')).encode('utf-8')
-                    if len(val_bytes) > 255: raise ValueError("Constant string repr too long.")
-                    f.write(struct.pack('<HB', int(const_id_str), len(val_bytes))); f.write(val_bytes)
+                    const_id = int(const_id_str)
+                    type_code = 0
+                    length = 0
+                    value_bytes = b''
+                    
+                    if const_val is None:
+                        type_code = 0 # null
+                    elif isinstance(const_val, bool):
+                        type_code = 1 # bool
+                        length = 1
+                        value_bytes = struct.pack('<?', const_val)
+                    elif isinstance(const_val, int):
+                        type_code = 2 # int
+                        value_bytes = struct.pack('<q', const_val) # 64-bit signed int
+                        length = len(value_bytes)
+                    elif isinstance(const_val, float):
+                        type_code = 3 # float
+                        value_bytes = struct.pack('<d', const_val) # 64-bit double
+                        length = len(value_bytes)
+                    elif isinstance(const_val, str):
+                        type_code = 4 # string
+                        value_bytes = const_val.encode('utf-8')
+                        length = len(value_bytes)
+                    elif isinstance(const_val, list):
+                        if not const_val:
+                            type_code = 5 # list_int (empty)
+                            length = 0
+                        elif all(isinstance(x, int) for x in const_val):
+                            type_code = 5 # list_int
+                            length = len(const_val)
+                            value_bytes = struct.pack(f'<{length}i', *const_val) # 32-bit signed int
+                        elif all(isinstance(x, (int, float)) for x in const_val):
+                            type_code = 6 # list_float
+                            length = len(const_val)
+                            value_bytes = struct.pack(f'<{length}f', *map(float, const_val)) # 32-bit float
+                        else:
+                             raise TypeError(f"Unsupported list content for binary serialization: {const_val}")
+                    else:
+                        raise TypeError(f"Unsupported constant type for binary serialization: {type(const_val)}")
+
+                    # Writing [ID: u16] [Type: u8] [Length: u16] [Value: bytes]
+                    # For strings/int/float, length is bytes; for lists, it is the number of elements.
+                    f.write(struct.pack('<HBH', const_id, type_code, length))
+                    if value_bytes:
+                        f.write(value_bytes)
                 
                 offsets['perm'] = f.tell(); f.write(b'PERM')
                 perm_map = {int(k): v for k,v in used_mappings['permutations'].items()}
@@ -141,17 +192,15 @@ class ResultManager:
                         tensor, meta = (data_tuple, {}) if isinstance(data_tuple, torch.Tensor) else data_tuple
                         meta['shape'] = list(tensor.shape)
                         meta['dtype'] = self._map_dtype_to_enum(tensor.dtype)
-                        meta_chunks = []
-                        for key, value in meta.items():
-                            key_bytes = key.encode('utf-8')
-                            val_bytes = json.dumps(value, separators=(',', ':')).encode('utf-8')
-                            meta_chunks.append(struct.pack('<B', len(key_bytes)))
-                            meta_chunks.append(key_bytes)
-                            meta_chunks.append(struct.pack('<H', len(val_bytes)))
-                            meta_chunks.append(val_bytes)
-                        meta_binary = b''.join(meta_chunks)
+                        
+                        # Encode metadata into JSON and then into bytes
+                        # It's a compromise between binary purity and flexibility.
+                        meta_binary = json.dumps(meta, separators=(',', ':')).encode('utf-8')
+                        
                         data_bytes = tensor.numpy(force=True).tobytes()
-                        f.write(struct.pack('<HBIQ', p_id, len(meta), len(meta_binary), len(data_bytes)))
+                        # Tensor recording format:
+                        # [ID: u16][meta_len: u32][data_len: u64][meta_bytes][data_bytes]
+                        f.write(struct.pack('<HIQ', p_id, len(meta_binary), len(data_bytes)))
                         f.write(meta_binary)
                         f.write(data_bytes)
                 else:
@@ -174,18 +223,18 @@ class ResultManager:
                     f.write(tokenizer_manifest)
 
                 # --- RSRC Section ---
-                # Use one of the reserved slots for RSRC (here rsrc_offset)
                 if tokenizer_resources and store_weights_internally:
                     offsets['rsrc'] = f.tell()
                     f.write(b'RSRC')
-                    f.write(struct.pack('<I', len(tokenizer_resources)))
+                    num_files = len(tokenizer_resources)
+                    f.write(struct.pack('<I', num_files))
                     for filename, content in tokenizer_resources.items():
                         name_bytes = filename.encode('utf-8')
                         f.write(struct.pack('<H', len(name_bytes)))
                         f.write(name_bytes)
                         f.write(struct.pack('<I', len(content)))
                         f.write(content)
-                    print(f"Saved {len(tokenizer_resources)} resource files internally.")
+                    print(f"Saved {num_files} resource files internally.")
 
                 f.seek(10)
                 
@@ -210,48 +259,21 @@ class ResultManager:
 class ModelProcessor:
     const_to_id: Dict[Any, int] = {}
 
-    # Format: "original.name.op": ("new.nac.name", (optional_argument_index_reorder))
+    # Format: "original.name.op"->"name": ("nac.name", (optional_argument_index_reorder))
     # The permutation (1, 0) for op(a, b) means that the canonical call is op(b, a).
     CANONICAL_OP_MAP: Dict[str, Tuple[str, Optional[Tuple[int, ...]]]] = {
-        # Operation aliases -> nac.pass
-        "aten.detach.default": ("nac.pass", None),
-        "aten.dropout.default": ("nac.pass", None),
-        "pass_through": ("nac.pass", None),
-        
-        # Addition aliases -> nac.add
-        "aten.add.Tensor": ("nac.add", None),
-        "add": ("nac.add", None),
-
-        # Пsubtraction aliases + nac.sub operation -> nac.sub
-        "aten.sub.Tensor": ("nac.sub", None),
-        "aten.rsub.Scalar": ("nac.sub", (1, 0)),  # rsub(a, b) -> b - a -> sub(b, a)
-
-        "aten.gt.Tensor": ("nac.gt", None),
-        "aten.gt.Scalar": ("nac.gt", None),
-
-        "aten.neg.default": ("nac.neg", None),
-        "neg": ("nac.neg", None),
-
-        # Operation aliases where -> nac.where
-        "aten.where.self": ("nac.where", None),
-        # masked_fill(self, mask, value) -> where(mask, value, self)
-        "aten.masked_fill.Scalar": ("nac.where", (1, 2, 0)), 
-
-        # Operation aliases clone -> nac.clone
-        "aten.lift_fresh_copy.default": ("nac.clone", None),
-        "aten.clone.default": ("nac.clone", None),
-
-        # Operation aliases view -> nac.view
-        "aten._unsafe_view.default": ("nac.view", None),
-        "aten.view.default": ("nac.view", None),
-        
-        # Operation aliases less_equal -> nac.le
-        "aten.le.Scalar": ("nac.le", None),
-        "aten.le.Tensor": ("nac.le", None),
-
-        # Operation aliases arange -> nac.arange
-        "aten.arange.start": ("nac.arange", None),
-        "aten.arange.default": ("nac.arange", None),
+        "detach": ("nac.pass", None),
+        "dropout": ("nac.pass", None),
+        "lift_fresh_copy": ("nac.clone", None),
+        "true_divide": ("nac.div", None),
+        "mm": ("nac.matmul", None),
+        "bmm": ("nac.matmul", None),
+        "index_select": ("nac.gather", None),
+        "flatten": ("nac.view", None),
+        "unsqueeze": ("nac.view", None),
+        "squeeze": ("nac.view", None),
+        "rsub": ("nac.sub", (1, 0)),
+        "masked_fill": ("nac.where", (1, 2, 0)),
     }
     
     # Mappings for semantic argument codes.
@@ -287,6 +309,8 @@ class ModelProcessor:
         self.param_nodes: Set[fx.Node] = set()
         self.lifted_const_nodes: Dict[fx.Node, Any] = {}
         self.io_counts = (0, 0)
+        self.op_string_to_id = NAC_OPS_REVERSED.copy()
+        self._initialize_special_ops()
 
         # Initializing global maps (done once)
         if not ModelProcessor.const_to_id:
@@ -295,23 +319,33 @@ class ModelProcessor:
         # Loading the registry
         if existing_registry:
             self._load_from_registry(existing_registry)
-        
-        # Initializing special operations (after boot, to avoid overwriting the ID)
-        self._initialize_special_ops()
 
     def _initialize_special_ops(self):
         special_ops = {2:"<INPUT>", 3:"<OUTPUT>", 6:"<CONTROL_FLOW>", 7:"<CONVERGENCE>"}
         for id_val, name in special_ops.items():
+            # Сheck that special IDs do not conflict with standard ones.
+            if id_val >= 10 and id_val in NAC_OPS:
+                raise ValueError(f"Special OP ID {id_val} for '{name}' conflicts with standard NAC_OPS. Please re-assign.")
             self.op_string_to_id[name] = id_val
 
     def _load_from_registry(self, registry: Dict):
         """
-        Loads data from the registry ONLY into global ID maps.
-        Does not touch local instance variables (`self.*_constants`, etc.).
+        Loads data from the registry.
+        Fixed IDs cannot be overridden. 
+        Only user-defined operations are loaded.
         """
+        loaded_custom_ops = 0
         if 'canonical' in registry:
             for id_str, op_name in registry['canonical'].items():
-                self.op_string_to_id[op_name] = int(id_str)
+                op_id = int(id_str)
+                # Load only custom operations, avoiding the standard range
+                if op_id >= CUSTOM_OP_ID_START:
+                    # Сheck for conflicts with those already loaded (including those from NAC_OPS)
+                    if op_name in self.op_string_to_id and self.op_string_to_id[op_name] != op_id:
+                         print(f"Warning: Registry tried to remap op '{op_name}' to {op_id}, but it's already {self.op_string_to_id[op_name]}. Keeping existing.")
+                         continue
+                    self.op_string_to_id[op_name] = op_id
+                    loaded_custom_ops += 1
         if 'constants' in registry:
             for id_str, const_val in registry['constants'].items():
                 hashable_const = self._get_hashable_const(const_val)
@@ -319,7 +353,7 @@ class ModelProcessor:
         if 'permutations' in registry:
             for id_str, p_val_str in registry['permutations'].items():
                  self.perm_tuple_to_id[tuple(p_val_str)] = int(id_str)
-        print(f"Loaded {len(self.op_string_to_id)} ops, {len(ModelProcessor.const_to_id)} consts, {len(self.perm_tuple_to_id)} perms from existing registry.")
+        print(f"Loaded {len(self.op_string_to_id)} total ops ({loaded_custom_ops} custom), {len(ModelProcessor.const_to_id)} consts, {len(self.perm_tuple_to_id)} perms from existing registry.")
 
     def _get_hashable_const(self, const: Any) -> Any:
         if isinstance(const, (fx.Node, torch.SymInt)): return None
@@ -338,18 +372,44 @@ class ModelProcessor:
         return str(target).replace('::', '.') if isinstance(target, torch._ops.OpOverload) else getattr(target, '__name__', str(target))
 
     def _get_canonical_signature(self, node: fx.Node) -> str:
-        """Gets the canonical name of the operation using the alias map."""
+        """
+        Gets the canonical name of the nac.* operation.
+        1. Clears the original operation name (removes prefixes, suffixes).
+        2. Looks up the cleaned name in CANONICAL_OP_MAP (for aliases and permutations).
+        3. If not found, attempts to match it directly with an operation from NAC_OPS.
+        4. If nothing matches, returns the FULL ORIGINAL name for registration as a custom operation in CMAP.
+        """
         if node.op == 'placeholder': return "<INPUT>"
         if node.op == 'output': return "<OUTPUT>"
-        if node.op == 'call_function':
-            raw_sig = self._get_raw_signature(node)
-            if "aten.sym_size" in raw_sig: return "aten.sym_size.int"
+        if node.op != 'call_function': return "<NONE>"
+
+        raw_sig = self._get_raw_signature(node)
+        if not raw_sig: return "<NONE>"
+        
+        # Special case for skipping dynamic forms that are not operations
+        if "aten.sym_size" in raw_sig:
+            return raw_sig
+
+        # Step 1: Clear the operation name for searching
+        # Remove the prefix 'aten.'
+        search_sig = raw_sig.replace("aten.", "")
+        # Removing standard suffixes
+        search_sig = re.sub(r'\.(default|Tensor|Scalar|int|dim|dim_IntList|using_ints|start|self)$', '', search_sig)
+        # Remove underscores at the beginning/end (for _unsafe_view, add_, relu_, _softmax)
+        search_sig = search_sig.strip('_')
+
+        # Step 2: Search CANONICAL_OP_MAP (for special cases)
+        if search_sig in self.CANONICAL_OP_MAP:
+            return self.CANONICAL_OP_MAP[search_sig][0]
+        
+        # Step 3: Direct mapping to NAC_OPS
+        potential_nac_name = f"nac.{search_sig}"
+        if potential_nac_name in NAC_OPS_REVERSED:
+            return potential_nac_name
             
-            if raw_sig in self.CANONICAL_OP_MAP:
-                return self.CANONICAL_OP_MAP[raw_sig][0] 
-            
-            return raw_sig 
-        return "<NONE>"
+        # Step 4: If the operation isn't found in the standard ones, return its
+        # FULL name so it's registered as a user operation in CMAP.
+        return raw_sig
 
     def _get_argument_details(self, node: fx.Node) -> List[Tuple[str, Any, Optional[fx.Node]]]:
         details = []
@@ -412,19 +472,24 @@ class ModelProcessor:
         return details
 
     def _get_canonical_argument_details(self, node: fx.Node) -> List[Tuple[str, Any, Optional[fx.Node]]]:
-        """Gets the argument details and applies permutation to them, if defined."""
-        raw_sig = self._get_raw_signature(node)
+        """Gets the argument details and applies a permutation to them, if defined.."""
         arg_details = self._get_argument_details(node) 
 
-        if raw_sig in self.CANONICAL_OP_MAP:
-            _, permutation = self.CANONICAL_OP_MAP[raw_sig]
-            if permutation:
-                try:
-                    return [arg_details[i] for i in permutation]
-                except IndexError:
-                    print(f"Warning: Could not apply permutation {permutation} for op '{raw_sig}'. Arg count mismatch. Using original order.")
+        raw_sig = self._get_raw_signature(node)
+        if raw_sig:
+            search_sig = raw_sig.replace("aten.", "")
+            search_sig = re.sub(r'\.(default|Tensor|Scalar|int|dim|dim_IntList|using_ints|start|self)$', '', search_sig)
+            search_sig = search_sig.strip('_')
+            
+            if search_sig in self.CANONICAL_OP_MAP:
+                _, permutation = self.CANONICAL_OP_MAP[search_sig]
+                if permutation:
+                    try:
+                        return [arg_details[i] for i in permutation]
+                    except IndexError:
+                        print(f"Warning: Could not apply permutation {permutation} for op '{raw_sig}'. Arg count mismatch. Using original order.")
         
-        return arg_details 
+        return arg_details
 
     def _process_graph(self, graph: fx.Graph) -> List[Dict]:
         nodes = []
@@ -512,9 +577,11 @@ class ModelProcessor:
         
         for i, node in enumerate(main_graph.nodes): self.global_node_map[node] = i
         
+        # Collection of all unique canonical operations, constants, and permutations
         for node in main_graph.nodes:
             sig = self._get_canonical_signature(node)
-            self.canonical_operations.add(sig)
+            if sig != "<NONE>":
+                self.canonical_operations.add(sig)
             
             if node.op in ['call_function', 'output']:
                 arg_details = self._get_canonical_argument_details(node)
@@ -526,14 +593,31 @@ class ModelProcessor:
                 for const in consts:
                     self.unique_constants.add(const)
 
-        next_id = max([9] + [v for v in self.op_string_to_id.values()]) + 1
-        for op in sorted(list(self.canonical_operations - set(self.op_string_to_id.keys()))):
-            self.op_string_to_id[op] = next_id; next_id += 1
+        new_ops = sorted(list(self.canonical_operations - set(self.op_string_to_id.keys())))
+        if new_ops:
+            print(f"Found {len(new_ops)} new custom operations: {new_ops}")
+            # Find the maximum ID among all existing operations (standard and custom)
+            max_current_id = 0
+            if self.op_string_to_id:
+                max_current_id = max(v for v in self.op_string_to_id.values() if v < 256) # Ignore possible future ranges
+
+            # Start with CUSTOM_OP_ID_START or with the next one after the maximum, if it is greater
+            next_custom_id = max(CUSTOM_OP_ID_START, max_current_id + 1)
+            
+            for op in new_ops:
+                # In NAC format 'A' is 1 byte (0-255), so check the upper limit
+                if next_custom_id > 255:
+                    raise ValueError(f"Ran out of available operation IDs (0-255). Cannot register new op: {op}")
+                self.op_string_to_id[op] = next_custom_id
+                print(f"  - Registered '{op}' with custom ID {next_custom_id}")
+                next_custom_id += 1
         
+        # Assigning IDs to new constants
         next_id = max([0] + list(ModelProcessor.const_to_id.values())) + 1
         for const in sorted([c for c in self.unique_constants if c not in ModelProcessor.const_to_id], key=lambda x: str(x)):
             ModelProcessor.const_to_id[const] = next_id; next_id += 1
         
+        # Assigning IDs to new permutations
         next_id = max([0] + list(self.perm_tuple_to_id.values())) + 1
         for perm in sorted([p for p in self.unique_permutations if p not in self.perm_tuple_to_id]):
             self.perm_tuple_to_id[perm] = next_id; next_id += 1
@@ -593,13 +677,13 @@ def _get_d_model(model: torch.nn.Module) -> int:
     return 0
 
 def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tuple, d_model: Optional[int] = None, quantization_method: str = 'none', dynamic_shapes=None, store_weights_internally=True, io_counts=(0,0), tokenizer_repo=None, optimize = True, tokenizer_input: str = 'none', optimize_memory_locality: bool = True):
-    print("\n" + "="*20 + f" ARTIFACT GENERATION ({model_name}) " + "="*20)
+    print("\n" + "="*20 + f" GENERATION ({model_name}) " + "="*20)
     result_manager = ResultManager()
 
     tokenizer_resources = {} # Final resources for RSRC entry
     
     if tokenizer_repo:
-        print(f"Extracting tokenizer resources from '{tokenizer_repo}'...")
+        print(f"Retrieving tokenizer resources from '{tokenizer_repo}'...")
         try:
             from transformers import AutoTokenizer
             hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo)
@@ -609,7 +693,7 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
             tokenizer_resources['vm_vocab.json'] = json.dumps(vocab, ensure_ascii=False).encode('utf-8')
             print("  - Extracted vocab.")
 
-            # 2. Trying to download merges.txt (for BPE tokenizers)
+            # 2. Attempting to download merges.txt (for BPE tokenizers)
             try:
                 merges_path = hf_hub_download(repo_id=tokenizer_repo, filename="merges.txt")
                 with open(merges_path, 'rb') as f:
@@ -618,7 +702,7 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
             except Exception:
                 pass
 
-            # 3. Trying to download spiece.model (for SentencePiece)
+            # 3. Attempting to download spiece.model (for SentencePiece)
             try:
                 spiece_path = hf_hub_download(repo_id=tokenizer_repo, filename="spiece.model")
                 with open(spiece_path, 'rb') as f:
@@ -627,23 +711,23 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
             except Exception:
                  pass
 
-            print(f"Extracted {len(tokenizer_resources)} essential resource files.")
+            print(f"Extracted {len(tokenizer_resources)} core resource files.")
 
-            # If we store resources externally, save them to disk
+            # If store resources externally, we save them to disk
             if not store_weights_internally:
                 tokenizer_dir = os.path.join(result_manager.output_path, f"{model_name}-tokenizer")
                 os.makedirs(tokenizer_dir, exist_ok=True)
                 for filename, content in tokenizer_resources.items():
                     with open(os.path.join(tokenizer_dir, filename), 'wb') as f:
                         f.write(content)
-                print(f"Tokenizer resources saved externally to {tokenizer_dir}")
-                tokenizer_resources = {} # Clear it so as not to write to RSRC
+                print(f"Tokenizer resources are stored externally in {tokenizer_dir}")
+                tokenizer_resources = {} # Clean it so as not to write to RSRC
 
         except Exception as e:
-            print(f"!!!!! WARNING: Could not extract tokenizer resources for '{tokenizer_repo}'. Error: {e}")
+            print(f"!!!!! WARNING: Failed to fetch tokenizer resources for '{tokenizer_repo}'. Error: {e}")
             traceback.print_exc()
 
-    print("Exporting a model to FX graph...")
+    print("Exporting a model to FX graphics...")
     exported_program = torch.export.export(model.eval(), args=dummy_args, dynamic_shapes=dynamic_shapes)
 
     if optimize:
@@ -670,12 +754,12 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
         try:
             with open(registry_filepath, 'r', encoding='utf-8') as f: existing_registry_data = json.load(f)
             print(f"Successfully loaded existing registry from {registry_filepath}")
-        except Exception as e: print(f"Could not parse existing registry: {e}")
+        except Exception as e: print(f"Failed to read existing registry: {e}")
 
     # --- (TISA Manifest) ---
     tokenizer_manifest_bytes = None
     if tokenizer_repo:
-        print(f"\n--- Compiling Tokenizer from '{tokenizer_repo}' ---")
+        print(f"\n--- Compiling the tokenizer from '{tokenizer_repo}' ---")
         try:
             from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo)
@@ -684,9 +768,9 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
             else:
                 probe_text = tokenizer_input
             tokenizer_manifest_bytes = TISACompiler.compile_and_calibrate(tokenizer, probe_text)
-            print(f"Tokenizer compiled successfully into a {len(tokenizer_manifest_bytes)}-byte TISA manifest.")
+            print(f"The tokenizer was successfully compiled into a {len(tokenizer_manifest_bytes)}-byte TISA manifest.")
         except Exception as e:
-            print(f"!!!!! WARNING: Could not compile tokenizer for '{tokenizer_repo}'. Error: {e}")
+            print(f"!!!!! WARNING: Failed to compile tokenizer for '{tokenizer_repo}'. Error: {e}")
             traceback.print_exc()
 
     processor = ModelProcessor(existing_registry=existing_registry_data)
@@ -707,7 +791,7 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
     final_d_model = 0
     if d_model is not None and isinstance(d_model, int):
         final_d_model = d_model
-        print(f"Using manually provided d_model: {final_d_model}")
+        print(f"Uses manually specified d_model: {final_d_model}")
     else:
         final_d_model = _get_d_model(model)
 

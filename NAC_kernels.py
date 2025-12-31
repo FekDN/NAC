@@ -4,6 +4,25 @@ import numpy as np
 import math
 from typing import Any
 
+NAC_OPS = {
+    10: "nac.pass",
+    11: "nac.add",
+    12: "nac.sub",
+    13: "nac.gt",
+    14: "nac.neg",
+    15: "nac.where",
+    16: "nac.clone",
+    17: "nac.view",
+    18: "nac.le",
+    19: "nac.arange",
+    20: "nac.gather",
+    21: "nac.matmul"
+}
+
+NAC_OPS_REVERSED = {v: k for k, v in NAC_OPS.items()}
+_max_standard_op_id = max(NAC_OPS.keys()) if NAC_OPS else 9
+CUSTOM_OP_ID_START = _max_standard_op_id + 1
+
 def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     m = np.max(x, axis=axis, keepdims=True)
     e = np.exp(x - m)
@@ -434,66 +453,9 @@ class NacKernelBase:
         axes[dim0], axes[dim1] = axes[dim1], axes[dim0]
         return np.transpose(tensor, axes=axes)
 
-    def op_aten_permute_default(self, tensor, *dims):
-        """
-        Correctly handles two call styles and adds protection against "lost" batch measurements.
-        """
-        if len(dims) == 1 and isinstance(dims[0], (list, tuple)):
-            final_dims = list(dims[0])
-        else:
-            final_dims = list(dims)
-            
-        final_dims = [int(d) for d in final_dims]
-        
-        # If the number of dimensions does not match but differs by 1,
-        # this is most likely a lost batch dimension.
-        if len(final_dims) != tensor.ndim and len(final_dims) == tensor.ndim + 1:
-            # Add the missing dimension to the beginning (batch_size=1)
-            tensor_reshaped = np.expand_dims(tensor, axis=0)
-            
-            # Let's check again
-            if len(final_dims) == tensor_reshaped.ndim:
-                # If everything now matches, work with the modified tensor
-                return np.transpose(tensor_reshaped, axes=final_dims)
-
-        # original check
-        if len(final_dims) != tensor.ndim:
-            raise RuntimeError(
-                f"aten.permute: invalid dims length. "
-                f"Tensor has {tensor.ndim} dimensions (shape: {tensor.shape}), "
-                f"but received {len(final_dims)} permutation dims: {final_dims}"
-            )
-            
-        return np.transpose(tensor, axes=final_dims)
-
     def op_aten_unsqueeze_default(self, x, dim):
         dim = dim if dim >= 0 else x.ndim + dim + 1  # support for negative dim
         return np.expand_dims(x, dim)
-
-    def op_aten_matmul_default(self, a, b):
-        a = np.asarray(a)
-        b = np.asarray(b)
-
-        # If one of the operands is empty, matmul is not possible, but we can return an empty array of the correct shape.
-        if a.size == 0 or b.size == 0:
-            # Result format: (...batch_dimensions, rows_A, columns_B)
-            # Batch sizes must be compatible. Simply take batch A.
-            output_shape = list(a.shape[:-2]) + [a.shape[-2], b.shape[-1]]
-            
-            # If one of the "internal" dimensions is 0,
-            # one of the "external" ones will also be 0.
-            # For example, (N, 0) @ (0, M) -> (N, M), but the result is empty.
-            # if (N, K) @ (K, 0) -> (N, 0).
-            # need to make sure that the resulting form is correct.
-            if a.shape[-1] == 0 or b.shape[-2] == 0:
-                 # If the internal dimensions do not match, but one of them is 0,
-                 # then the resulting form will also contain 0
-                 pass # The form is already correct
-
-            # Return an empty array of the desired shape.
-            return np.zeros(tuple(output_shape), dtype=np.result_type(a, b))
-
-        return np.matmul(a, b)
 
     def op_aten_softmax_int(self, tensor, dim):
         dim = int(dim)
@@ -798,6 +760,62 @@ class NacKernelBase:
                 out[:, :, i, j] = np.mean(x[:, :, i * stride[0]:i * stride[0] + ks[0], j * stride[1]:j * stride[1] + ks[1]], axis=(2, 3))
         return out
 
+    def op_aten_permute_default(self, tensor, *dims):
+        """
+        Correctly handles two call styles and adds protection against "lost" batch measurements.
+        """
+        if len(dims) == 1 and isinstance(dims[0], (list, tuple)):
+            final_dims = list(dims[0])
+        else:
+            final_dims = list(dims)
+            
+        final_dims = [int(d) for d in final_dims]
+        
+        # If the number of dimensions does not match but differs by 1,
+        # this is most likely a lost batch dimension.
+        if len(final_dims) != tensor.ndim and len(final_dims) == tensor.ndim + 1:
+            # Add the missing dimension to the beginning (batch_size=1)
+            tensor_reshaped = np.expand_dims(tensor, axis=0)
+            
+            # Let's check again
+            if len(final_dims) == tensor_reshaped.ndim:
+                # If everything now matches, work with the modified tensor
+                return np.transpose(tensor_reshaped, axes=final_dims)
+
+        # original check
+        if len(final_dims) != tensor.ndim:
+            raise RuntimeError(
+                f"aten.permute: invalid dims length. "
+                f"Tensor has {tensor.ndim} dimensions (shape: {tensor.shape}), "
+                f"but received {len(final_dims)} permutation dims: {final_dims}"
+            )
+            
+        return np.transpose(tensor, axes=final_dims)
+
+    def op_nac_matmul(self, a, b):
+        a = np.asarray(a)
+        b = np.asarray(b)
+
+        # If one of the operands is empty, matmul is not possible, but we can return an empty array of the correct shape.
+        if a.size == 0 or b.size == 0:
+            # Result format: (...batch_dimensions, rows_A, columns_B)
+            # Batch sizes must be compatible. Simply take batch A.
+            output_shape = list(a.shape[:-2]) + [a.shape[-2], b.shape[-1]]
+            
+            # If one of the "internal" dimensions is 0,
+            # one of the "external" ones will also be 0.
+            # For example, (N, 0) @ (0, M) -> (N, M), but the result is empty.
+            # if (N, K) @ (K, 0) -> (N, 0).
+            # need to make sure that the resulting form is correct.
+            if a.shape[-1] == 0 or b.shape[-2] == 0:
+                 # If the internal dimensions do not match, but one of them is 0,
+                 # then the resulting form will also contain 0
+                 pass # The form is already correct
+
+            # Return an empty array of the desired shape.
+            return np.zeros(tuple(output_shape), dtype=np.result_type(a, b))
+
+        return np.matmul(a, b)
 
     def op_nac_neg(self, x):
         return np.negative(x)

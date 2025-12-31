@@ -5,7 +5,17 @@ import os
 import struct
 import json
 
-from TISA_tokenizer import disassemble_TISA_manifest
+try:
+    from TISA_tokenizer import disassemble_TISA_manifest
+except ImportError:
+    def disassemble_TISA_manifest(manifest_bytes):
+        return {"error": "TISA_tokenizer library not found, cannot disassemble manifest."}
+
+try:
+    from NAC_kernels import NAC_OPS
+except ImportError:
+    print("Warning: NAC_kernels.py not found. Standard NAC operations will not be recognized.")
+    NAC_OPS = {}
 
 def inspect_nac_file(filepath: str):
     """
@@ -17,6 +27,14 @@ def inspect_nac_file(filepath: str):
         return
 
     print(f"\n" + "="*20 + f" INSPECTING: {os.path.basename(filepath)} " + "="*20)
+
+    base_ops = {
+        2: "<INPUT>",
+        3: "<OUTPUT>",
+        6: "<CONTROL_FLOW>",
+        7: "<CONVERGENCE>",
+    }
+    base_ops.update(NAC_OPS)
 
     with open(filepath, 'rb') as f:
         # --- 1. Read and Display Full Header ---
@@ -48,7 +66,6 @@ def inspect_nac_file(filepath: str):
         offsets_header_format = '<H9Q6x'
         header_bytes = f.read(struct.calcsize(offsets_header_format))
         
-        # Unpacking d_model and 9 offsets
         d_model, *offsets = struct.unpack(offsets_header_format, header_bytes)
         
         ops_offset, cmap_offset, cnst_offset, perm_offset, data_offset, \
@@ -67,24 +84,29 @@ def inspect_nac_file(filepath: str):
         print(f"  - META Section:     Starts at byte {meta_offset} (Reserved)")
 
         # --- 2. Read Operations Map (CMAP) ---
-        print("\n--- Operations (CMAP) ---")
+        print("\n--- Custom Operations (CMAP) ---")
+        # Read CMAP and expand basic vocabulary
+        custom_ops = {}
         if cmap_offset > 0:
             f.seek(cmap_offset)
             if f.read(4) != b'CMAP': print("Error: CMAP tag mismatch."); return
             
             num_ops = struct.unpack('<I', f.read(4))[0]
-            print(f"Found {num_ops} operation mappings in this file:")
+            print(f"Found {num_ops} custom operation mappings in this file:")
             
-            ops_list = []
             for _ in range(num_ops):
                 op_id, name_len = struct.unpack('<HB', f.read(3))
                 op_name = f.read(name_len).decode('utf-8')
-                ops_list.append((op_id, op_name))
+                custom_ops[op_id] = op_name
             
-            for op_id, op_name in sorted(ops_list):
+            for op_id, op_name in sorted(custom_ops.items()):
                  print(f"  ID {op_id:<4}: {op_name}")
         else:
-            print("No CMAP section found (offset is 0).")
+            print("No CMAP section found (offset is 0). This file uses only standard operations.")
+        
+        # Connecting standard and custom operations for a complete view
+        all_ops = base_ops.copy()
+        all_ops.update(custom_ops)
 
         # --- 3. Read Constants Map (CNST) ---
         print("\n--- Constants (CNST) ---")
@@ -97,20 +119,19 @@ def inspect_nac_file(filepath: str):
             
             consts_list = []
             for _ in range(num_consts):
-                const_id, val_len = struct.unpack('<HB', f.read(3))
-                const_val_str = f.read(val_len).decode('utf-8')
-                try:
-                    const_val = json.loads(const_val_str)
-                    consts_list.append((const_id, const_val, const_val_str))
-                except json.JSONDecodeError:
-                    consts_list.append((const_id, const_val_str, None))
+                const_id, type_code, length = struct.unpack('<HBH', f.read(5))
+                val = None
+                if type_code == 0: val = None
+                elif type_code == 1: val = struct.unpack('<?', f.read(length))[0]
+                elif type_code == 2: val = struct.unpack('<q', f.read(length))[0]
+                elif type_code == 3: val = struct.unpack('<d', f.read(length))[0]
+                elif type_code == 4: val = f.read(length).decode('utf-8')
+                elif type_code == 5: val = list(struct.unpack(f'<{length}i', f.read(length * 4))) if length > 0 else []
+                elif type_code == 6: val = list(struct.unpack(f'<{length}f', f.read(length * 4))) if length > 0 else []
+                consts_list.append((const_id, val))
             
-            for const_id, const_val, raw_str in sorted(consts_list):
-                display_val = repr(const_val)
-                if raw_str and repr(raw_str) != display_val and len(display_val) < 80:
-                     print(f"  ID {const_id:<4}: {display_val}")
-                else:
-                     print(f"  ID {const_id:<4}: {display_val}")
+            for const_id, const_val in sorted(consts_list):
+                 print(f"  ID {const_id:<4}: {repr(const_val)}")
         else:
             print("No CNST section found (offset is 0).")
 
@@ -154,10 +175,10 @@ def inspect_nac_file(filepath: str):
                 print(f"  Param ID {p_id:<4}: '{p_name}'")
 
             # Input Names
-            num_inputs = struct.unpack('<I', f.read(4))[0]
-            print(f"\nFound {num_inputs} input name mappings:")
+            num_inputs_map = struct.unpack('<I', f.read(4))[0]
+            print(f"\nFound {num_inputs_map} input name mappings:")
             input_names_list = []
-            for _ in range(num_inputs):
+            for _ in range(num_inputs_map):
                 i_idx, name_len = struct.unpack('<HH', f.read(4))
                 i_name = f.read(name_len).decode('utf-8')
                 input_names_list.append((i_idx, i_name))
@@ -166,30 +187,33 @@ def inspect_nac_file(filepath: str):
             
             # Internal Weights Info
             if weights_stored_internally:
-                num_tensors = struct.unpack('<I', f.read(4))[0]
-                print(f"\nFound {num_tensors} internally stored tensors:")
-                
-                dtype_map = {0:'f32', 1:'f64', 2:'f16', 3:'bf16', 4:'i32', 5:'i64', 6:'i16', 7:'i8', 8:'u8', 9:'bool'}
-
-                for _ in range(num_tensors):
-                    p_id, num_props, meta_len, data_len = struct.unpack('<HBIQ', f.read(15))
-                    meta_bytes = f.read(meta_len)
-                    f.seek(data_len, 1) # Skip tensor data
-
-                    meta, meta_offset = {}, 0
-                    for _ in range(num_props):
-                        key_len = meta_bytes[meta_offset]; meta_offset += 1
-                        key = meta_bytes[meta_offset:meta_offset+key_len].decode('utf-8'); meta_offset += key_len
-                        val_len = struct.unpack('<H', meta_bytes[meta_offset:meta_offset+2])[0]; meta_offset += 2
-                        val_str = meta_bytes[meta_offset:meta_offset+val_len].decode('utf-8'); meta_offset += val_len
-                        meta[key] = json.loads(val_str)
+                # Checking if there is more data to read
+                pos = f.tell()
+                f.seek(0, 2)
+                end = f.tell()
+                f.seek(pos)
+                if pos < end:
+                    num_tensors = struct.unpack('<I', f.read(4))[0]
+                    print(f"\nFound {num_tensors} internally stored tensors:")
                     
-                    shape = meta.get('shape', '[UNKNOWN]')
-                    dtype_id = meta.get('dtype', -1)
-                    dtype_str = dtype_map.get(dtype_id, 'UNK')
-                    
-                    param_name = f"'{param_names.get(p_id, 'N/A')}'"
-                    print(f"  - Tensor ID {p_id:<3} ({param_name:<20}): Shape={str(shape):<20} DType={dtype_str:<5} Size={data_len} bytes")
+                    dtype_map = {0:'f32', 1:'f64', 2:'f16', 3:'bf16', 4:'i32', 5:'i64', 6:'i16', 7:'i8', 8:'u8', 9:'bool'}
+
+                    for _ in range(num_tensors):
+                        p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14))
+                        
+                        meta_bytes = f.read(meta_len)
+                        meta = json.loads(meta_bytes.decode('utf-8'))
+                        
+                        f.seek(data_len, 1) # Skip the tensor data
+                        
+                        shape = meta.get('shape', '[UNKNOWN]')
+                        dtype_id = meta.get('dtype', -1)
+                        dtype_str = dtype_map.get(dtype_id, 'UNK')
+                        
+                        param_name = f"'{param_names.get(p_id, 'N/A')}'"
+                        print(f"  - Tensor ID {p_id:<3} ({param_name:<20}): Shape={str(shape):<20} DType={dtype_str:<5} Size={data_len} bytes")
+                else:
+                    print("\nNo internally stored tensor data found.")
         else:
             print("No DATA section found (offset is 0).")
 
