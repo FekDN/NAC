@@ -264,15 +264,14 @@ class ModelProcessor:
     CANONICAL_OP_MAP: Dict[str, Tuple[str, Optional[Tuple[int, ...]]]] = {
         "detach": ("nac.pass", None),
         "dropout": ("nac.pass", None),
+        "pass_through": ("nac.pass", None),
         "lift_fresh_copy": ("nac.clone", None),
         "true_divide": ("nac.div", None),
         "mm": ("nac.matmul", None),
         "bmm": ("nac.matmul", None),
-        "index_select": ("nac.gather", None),
-        "flatten": ("nac.view", None),
-        "unsqueeze": ("nac.view", None),
+        "unsafe_view": ("nac.view", None),
         "squeeze": ("nac.view", None),
-        "rsub": ("nac.sub", (1, 0)),
+        "rsub": ("nac.sub", (1, 0)),  # rsub(a, b) -> b - a -> sub(b, a)
         "masked_fill": ("nac.where", (1, 2, 0)),
     }
     
@@ -808,4 +807,5 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
         quant_method=quantization_method,
         store_weights_internally=store_weights_internally, 
         io_counts=processor.io_counts
+
     )
