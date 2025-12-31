@@ -14,9 +14,7 @@ NAC_OPS = {
     16: "nac.clone",
     17: "nac.view",
     18: "nac.le",
-    19: "nac.arange",
-    20: "nac.gather",
-    21: "nac.matmul"
+    19: "nac.arange"
 }
 
 NAC_OPS_REVERSED = {v: k for k, v in NAC_OPS.items()}
@@ -792,7 +790,7 @@ class NacKernelBase:
             
         return np.transpose(tensor, axes=final_dims)
 
-    def op_nac_matmul(self, a, b):
+    def op_aten_matmul_default(self, a, b):
         a = np.asarray(a)
         b = np.asarray(b)
 

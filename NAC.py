@@ -267,8 +267,6 @@ class ModelProcessor:
         "pass_through": ("nac.pass", None),
         "lift_fresh_copy": ("nac.clone", None),
         "true_divide": ("nac.div", None),
-        "mm": ("nac.matmul", None),
-        "bmm": ("nac.matmul", None),
         "unsafe_view": ("nac.view", None),
         "squeeze": ("nac.view", None),
         "rsub": ("nac.sub", (1, 0)),  # rsub(a, b) -> b - a -> sub(b, a)
@@ -608,7 +606,6 @@ class ModelProcessor:
                 if next_custom_id > 255:
                     raise ValueError(f"Ran out of available operation IDs (0-255). Cannot register new op: {op}")
                 self.op_string_to_id[op] = next_custom_id
-                print(f"  - Registered '{op}' with custom ID {next_custom_id}")
                 next_custom_id += 1
         
         # Assigning IDs to new constants
@@ -807,5 +804,4 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
         quant_method=quantization_method,
         store_weights_internally=store_weights_internally, 
         io_counts=processor.io_counts
-
     )

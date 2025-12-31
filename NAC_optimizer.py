@@ -508,31 +508,6 @@ class GraphConstantFolder:
         # Сheck the correctness of the graph after modifications
         self.graph.lint()
 
-    def _eliminate_dead_code(self):
-        """
-        Removes all nodes whose results are not used to calculate the graph's output.
-        """
-        
-        # Iterating in reverse order is important to first remove
-        # "children", which may be the only users of the "parents".
-        nodes_to_erase = []
-        for node in reversed(self.graph.nodes):
-            # The output node cannot be deleted
-            if node.op == 'output':
-                continue
-
-            # If a node has no users, it is a candidate for deletion.
-            if len(node.users) == 0:
-                nodes_to_erase.append(node)
-        
-        if not nodes_to_erase:
-            return
-
-        for node in nodes_to_erase:
-             self.graph.erase_node(node)
-        
-        print(f"[Folder] Dead Code Elimination: удалено {len(nodes_to_erase)} неиспользуемых узлов.")
-
     # Main fold
     def fold(self, optimize_memory_locality: bool = False):
         print("[Folder] Beginning of the convolution of constants...")
@@ -637,9 +612,6 @@ class GraphConstantFolder:
 
         # --- STEP 9: prune ---
         self._prune_unused_parameters()
-
-        # --- STEP 10: eliminate ---
-        self._eliminate_dead_code()
 
         self.graph.lint()
         self.graph_module.recompile()
