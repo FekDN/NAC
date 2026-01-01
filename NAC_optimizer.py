@@ -7,7 +7,7 @@ import operator
 import numpy as np
 from torch.export.exported_program import ExportedProgram
 from torch.export.graph_signature import InputKind, ExportGraphSignature
-from typing import Dict, Any, Set, Tuple 
+from typing import Dict, Any, Set, Tuple, List
 import re
 
 from NAC_kernels import NacKernelBase
@@ -70,6 +70,7 @@ class GraphConstantFolder:
         self.computed_constants: Dict[str, Any] = {}
         self.folded_constant_counter = 0
         self.user_input_names: Set[str] = set()
+        self.generated_memory_map = []
 
     # Utils
     def _gather_args(self, node: fx.Node):
@@ -508,6 +509,136 @@ class GraphConstantFolder:
         # Сheck the correctness of the graph after modifications
         self.graph.lint()
 
+    def _generate_memory_map(self) -> List[Dict]:
+        """
+        Generates a memory management map (MMAP) based on just-in-time logic:
+        Preload for a group of weights is scheduled several clock cycles before they are used,
+        minimizing the time data is in memory.
+        """
+        print("[Folder] Generating a Memory Management Map (MMAP)...")
+        node_list = list(self.graph.nodes)
+        node_to_idx = {node: i for i, node in enumerate(node_list)}
+
+        # --- Step 1: Gathering information about the graph ---
+        weight_nodes_info = {
+            i: node for i, node in enumerate(node_list)
+            if node.op == 'placeholder' and any(
+                spec.arg.name == node.target and spec.kind in (InputKind.PARAMETER, InputKind.BUFFER)
+                for spec in self.signature.input_specs
+            )
+        }
+
+        usage_info = {
+            i: {
+                'node': node,
+                'users': [node_to_idx[u] for u in node.users if u in node_to_idx],
+                'is_output_tensor': False
+            } for i, node in enumerate(node_list)
+        }
+        
+        last_use_map = {}
+        for i, node in enumerate(node_list):
+            for input_node in node.all_input_nodes:
+                if input_node in node_to_idx:
+                    last_use_map[node_to_idx[input_node]] = max(last_use_map.get(node_to_idx[input_node], -1), i)
+        
+        output_node = next(n for n in reversed(node_list) if n.op == 'output')
+        for input_node in output_node.all_input_nodes:
+            if input_node in node_to_idx:
+                usage_info[node_to_idx[input_node]]['is_output_tensor'] = True
+
+        # --- Step 2: Look-back PRELOAD Planning ---
+        memory_map_dict: Dict[int, List[Dict]] = {i: [] for i in range(len(node_list))}
+        preloaded_weight_indices = set()
+        
+        i = 0
+        while i < len(node_list):
+            # We are looking only for those weights that have not yet been planned
+            if i in weight_nodes_info and i not in preloaded_weight_indices:
+                # 1. Grouping consecutive weights
+                current_group = [i]
+                j = i + 1
+                while j in weight_nodes_info and j == current_group[-1] + 1:
+                    current_group.append(j)
+                    j += 1
+                
+                # 2. We are looking for a loading slot, moving backwards
+                first_op_in_group = i
+                desired_distance = 3
+                lookback_limit = 12 # Limiting the search depth
+                
+                best_tick = first_op_in_group - 1
+                clean_ticks_found = 0
+                
+                for offset in range(1, lookback_limit + 1):
+                    current_tick = first_op_in_group - offset
+                    if current_tick < 0: break
+
+                    # If the clock cycle is occupied by another PRELOAD, we stop
+                    if any(cmd['action'] == 'PRELOAD' for cmd in memory_map_dict.get(current_tick, [])):
+                        break
+                    
+                    best_tick = current_tick
+                    
+                    # If the clock cycle is not skipped (i.e. it is not another load_param), we consider it "clean"
+                    if current_tick not in weight_nodes_info:
+                        clean_ticks_found += 1
+                    
+                    # If we find enough "clean" cycles, we place PRELOAD and exit
+                    if clean_ticks_found >= desired_distance:
+                        break
+
+                best_tick = max(0, best_tick)
+
+                # 3. We are posting a PRELOAD for the entire group
+                for weight_id in current_group:
+                    memory_map_dict[best_tick].append({'action': 'PRELOAD', 'target_id': weight_id})
+                    preloaded_weight_indices.add(weight_id)
+
+                # Skipping over the processed group
+                i += len(current_group)
+            else:
+                i += 1
+
+        # --- Step 3: Generate FORWARD, SAVE_RESULT, and FREE ---
+        resources_in_memory = preloaded_weight_indices.copy()
+        for i, info in usage_info.items():
+            if i in preloaded_weight_indices or info['node'].op == 'placeholder': continue
+
+            can_forward = False
+            if len(info['users']) == 1 and not info['is_output_tensor']:
+                user_idx = info['users'][0]
+                if all(j in preloaded_weight_indices for j in range(i + 1, user_idx)):
+                    can_forward = True
+                    memory_map_dict[i].append({'action': 'FORWARD', 'target_id': user_idx})
+
+            if not can_forward and len(info['users']) > 0:
+                memory_map_dict[i].append({'action': 'SAVE_RESULT', 'target_id': i})
+                resources_in_memory.add(i)
+
+        for resource_id in resources_in_memory:
+            if resource_id in last_use_map and not usage_info.get(resource_id, {}).get('is_output_tensor', False):
+                free_tick = last_use_map[resource_id] + 1
+                memory_map_dict[free_tick].append({'action': 'FREE', 'target_id': resource_id})
+
+        # --- Step 4: Final cleaning and formatting ---
+        memory_map = []
+        action_priority = {'FORWARD': 0, 'FREE': 1, 'SAVE_RESULT': 2, 'PRELOAD': 3}
+        for instr_id in sorted(memory_map_dict.keys()):
+            if instr_id in preloaded_weight_indices: continue
+            
+            commands = memory_map_dict.get(instr_id, [])
+            if not commands: continue
+            
+            unique_commands = list({(cmd['action'], cmd['target_id']): cmd for cmd in commands}.values())
+            unique_commands.sort(key=lambda cmd: (action_priority.get(cmd['action'], 99), cmd['target_id']))
+            
+            if unique_commands:
+                memory_map.append({'instr_id': instr_id, 'commands': unique_commands})
+        
+        print(f"[Folder] Generated {len(memory_map)} entries for MMAP. Skipped {len(preloaded_weight_indices)} weight loading cycles.")
+        return memory_map
+
     # Main fold
     def fold(self, optimize_memory_locality: bool = False):
         print("[Folder] Beginning of the convolution of constants...")
@@ -615,5 +746,10 @@ class GraphConstantFolder:
 
         self.graph.lint()
         self.graph_module.recompile()
+
+        # --- Генерация MMAP на основе финального графа ---
+        memory_map = self._generate_memory_map()
+        # Сохраняем карту в объекте, чтобы ее можно было забрать снаружи
+        self.generated_memory_map = memory_map
 
         print("[Folder] Cleaning are complete.")

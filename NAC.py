@@ -77,7 +77,7 @@ class ResultManager:
     def _map_dtype_to_enum(self, dtype):
         return {torch.float32:0, torch.float64:1, torch.float16:2, torch.bfloat16:3, torch.int32:4, torch.int64:5, torch.int16:6, torch.int8:7, torch.uint8:8, torch.bool:9}.get(dtype, 255)
 
-    def save_model_nac(self, model_name, used_mappings, nodes, param_data, param_id_to_name, input_node_idx_to_name, d_model=0, tokenizer_manifest=None, tokenizer_resources=None, quant_method='none', store_weights_internally=True, io_counts=(0,0)):
+    def save_model_nac(self, model_name, used_mappings, nodes, param_data, param_id_to_name, input_node_idx_to_name, d_model=0, tokenizer_manifest=None, tokenizer_resources=None, quant_method='none', store_weights_internally=True, io_counts=(0,0), memory_map=None):
         filepath = os.path.join(self.output_path, f"{model_name}.nac")
         try:
             with open(filepath, 'wb') as f:
@@ -92,17 +92,36 @@ class ResultManager:
                 offsets_header_format = '<H9Q6x' 
                 f.write(b'\0' * struct.calcsize(offsets_header_format)) 
                 
-                # --- OPS, CMAP, CNST, PERM, DATA ---
-                offsets = {'ops': f.tell()}
-                f.write(b'OPS ' + struct.pack('<I', len(nodes)))
+                offsets = {}
+
+                # 1. MMAP Section (Memory Map)
+                offsets['mmap'] = f.tell()
+                f.write(b'MMAP')
+                memory_map = memory_map or []
+                f.write(struct.pack('<I', len(memory_map)))
+                action_codes = {'SAVE_RESULT': 10, 'FREE': 20, 'FORWARD': 30, 'PRELOAD': 40}
+                for record in memory_map:
+                    instr_id = record['instr_id']
+                    commands = record['commands']
+                    f.write(struct.pack('<HB', instr_id, len(commands)))
+                    for cmd in commands:
+                        action_type_code = action_codes[cmd['action']]
+                        target_id = cmd['target_id']
+                        f.write(struct.pack('<BH', action_type_code, target_id))
+
+                # 2. OPS Section
+                offsets['ops'] = f.tell()
+                f.write(b'OPS ')
+                f.write(struct.pack('<I', len(nodes)))
                 for node in nodes:
                     A, B, C, D = node['A'], node['B'], node['C'], node['D']
                     f.write(struct.pack('<BB', A, B))
                     if C: f.write(struct.pack(f'<{len(C)}h', *C))
                     if D: f.write(struct.pack(f'<{len(D)}h', *D))
                 
-                offsets['cmap'] = f.tell(); f.write(b'CMAP')
-                # CMAP records only user operations (ID >= CUSTOM_OP_ID_START)
+                # 3. CMAP Section
+                offsets['cmap'] = f.tell()
+                f.write(b'CMAP')
                 custom_cmap = {int(k): v for k, v in used_mappings['canonical'].items() if int(k) >= CUSTOM_OP_ID_START}
                 f.write(struct.pack('<I', len(custom_cmap)))
                 for op_id, op_name in custom_cmap.items():
@@ -110,61 +129,37 @@ class ResultManager:
                     if len(name_bytes) > 255: raise ValueError(f"Op name too long: {op_name}")
                     f.write(struct.pack('<HB', op_id, len(name_bytes))); f.write(name_bytes)
                 
-                # --- CNST (Constants) ---
+                # 4. CNST Section (Constants)
                 offsets['cnst'] = f.tell()
                 f.write(b'CNST')
-                
                 constants = used_mappings['constants']
                 f.write(struct.pack('<I', len(constants)))
-                
                 for const_id_str, const_val in constants.items():
                     const_id = int(const_id_str)
-                    type_code = 0
-                    length = 0
-                    value_bytes = b''
-                    
-                    if const_val is None:
-                        type_code = 0 # null
+                    type_code, length, value_bytes = 0, 0, b''
+                    if const_val is None: type_code = 0
                     elif isinstance(const_val, bool):
-                        type_code = 1 # bool
-                        length = 1
-                        value_bytes = struct.pack('<?', const_val)
+                        type_code, length, value_bytes = 1, 1, struct.pack('<?', const_val)
                     elif isinstance(const_val, int):
-                        type_code = 2 # int
-                        value_bytes = struct.pack('<q', const_val) # 64-bit signed int
-                        length = len(value_bytes)
+                        type_code, value_bytes = 2, struct.pack('<q', const_val); length = len(value_bytes)
                     elif isinstance(const_val, float):
-                        type_code = 3 # float
-                        value_bytes = struct.pack('<d', const_val) # 64-bit double
-                        length = len(value_bytes)
+                        type_code, value_bytes = 3, struct.pack('<d', const_val); length = len(value_bytes)
                     elif isinstance(const_val, str):
-                        type_code = 4 # string
-                        value_bytes = const_val.encode('utf-8')
-                        length = len(value_bytes)
+                        type_code, value_bytes = 4, const_val.encode('utf-8'); length = len(value_bytes)
                     elif isinstance(const_val, list):
-                        if not const_val:
-                            type_code = 5 # list_int (empty)
-                            length = 0
+                        if not const_val: type_code, length = 5, 0
                         elif all(isinstance(x, int) for x in const_val):
-                            type_code = 5 # list_int
-                            length = len(const_val)
-                            value_bytes = struct.pack(f'<{length}i', *const_val) # 32-bit signed int
+                            type_code, length = 5, len(const_val); value_bytes = struct.pack(f'<{length}i', *const_val)
                         elif all(isinstance(x, (int, float)) for x in const_val):
-                            type_code = 6 # list_float
-                            length = len(const_val)
-                            value_bytes = struct.pack(f'<{length}f', *map(float, const_val)) # 32-bit float
-                        else:
-                             raise TypeError(f"Unsupported list content for binary serialization: {const_val}")
-                    else:
-                        raise TypeError(f"Unsupported constant type for binary serialization: {type(const_val)}")
-
-                    # Writing [ID: u16] [Type: u8] [Length: u16] [Value: bytes]
-                    # For strings/int/float, length is bytes; for lists, it is the number of elements.
+                            type_code, length = 6, len(const_val); value_bytes = struct.pack(f'<{length}f', *map(float, const_val))
+                        else: raise TypeError(f"Unsupported list content for binary serialization: {const_val}")
+                    else: raise TypeError(f"Unsupported constant type for binary serialization: {type(const_val)}")
                     f.write(struct.pack('<HBH', const_id, type_code, length))
-                    if value_bytes:
-                        f.write(value_bytes)
+                    if value_bytes: f.write(value_bytes)
                 
-                offsets['perm'] = f.tell(); f.write(b'PERM')
+                # 5. PERM Section
+                offsets['perm'] = f.tell()
+                f.write(b'PERM')
                 perm_map = {int(k): v for k,v in used_mappings['permutations'].items()}
                 f.write(struct.pack('<I', len(perm_map)))
                 for p_id, p_val_str in perm_map.items():
@@ -172,34 +167,25 @@ class ResultManager:
                     if len(p_val_bytes) > 255: raise ValueError(f"Permutation too long: {p_val_str}")
                     f.write(struct.pack('<HB', p_id, len(p_val_bytes))); f.write(p_val_bytes)
                 
-                offsets['data'] = f.tell(); f.write(b'DATA')
-                
+                # 6. DATA Section
+                offsets['data'] = f.tell()
+                f.write(b'DATA')
                 f.write(struct.pack('<I', len(param_id_to_name)))
                 for p_id, p_name in param_id_to_name.items():
                     name_bytes = p_name.encode('utf-8')
-                    f.write(struct.pack('<HH', p_id, len(name_bytes)))
-                    f.write(name_bytes)
-                
+                    f.write(struct.pack('<HH', p_id, len(name_bytes))); f.write(name_bytes)
                 f.write(struct.pack('<I', len(input_node_idx_to_name)))
                 for i_idx, i_name in input_node_idx_to_name.items():
                     name_bytes = i_name.encode('utf-8')
-                    f.write(struct.pack('<HH', i_idx, len(name_bytes)))
-                    f.write(name_bytes)
-                
+                    f.write(struct.pack('<HH', i_idx, len(name_bytes))); f.write(name_bytes)
                 if store_weights_internally:
                     f.write(struct.pack('<I', len(param_data)))
                     for p_id, data_tuple in param_data.items():
                         tensor, meta = (data_tuple, {}) if isinstance(data_tuple, torch.Tensor) else data_tuple
                         meta['shape'] = list(tensor.shape)
                         meta['dtype'] = self._map_dtype_to_enum(tensor.dtype)
-                        
-                        # Encode metadata into JSON and then into bytes
-                        # It's a compromise between binary purity and flexibility.
                         meta_binary = json.dumps(meta, separators=(',', ':')).encode('utf-8')
-                        
                         data_bytes = tensor.numpy(force=True).tobytes()
-                        # Tensor recording format:
-                        # [ID: u16][meta_len: u32][data_len: u64][meta_bytes][data_bytes]
                         f.write(struct.pack('<HIQ', p_id, len(meta_binary), len(data_bytes)))
                         f.write(meta_binary)
                         f.write(data_bytes)
@@ -215,14 +201,14 @@ class ResultManager:
                     save_file(tensors_to_save, safetensors_path, metadata=metadata_to_save)
                     print(f"Weights saved to {safetensors_path}")
 
-                # --- PROC Section (Tokenizer Manifest) ---
+                # 7. PROC Section
                 if tokenizer_manifest:
                     offsets['proc'] = f.tell()
                     f.write(b'PROC')
                     f.write(struct.pack('<I', len(tokenizer_manifest)))
                     f.write(tokenizer_manifest)
 
-                # --- RSRC Section ---
+                # 8. RSRC Section
                 if tokenizer_resources and store_weights_internally:
                     offsets['rsrc'] = f.tell()
                     f.write(b'RSRC')
@@ -239,6 +225,7 @@ class ResultManager:
                 f.seek(10)
                 
                 all_offsets = [
+                    offsets.get('mmap', 0),
                     offsets.get('ops', 0),
                     offsets.get('cmap', 0),
                     offsets.get('cnst', 0),
@@ -246,8 +233,7 @@ class ResultManager:
                     offsets.get('data', 0),
                     offsets.get('proc', 0),
                     offsets.get('meta', 0),
-                    offsets.get('rsrc', 0),
-                    0  # reserved2_offset
+                    offsets.get('rsrc', 0)
                 ]
                 f.write(struct.pack(offsets_header_format, d_model, *all_offsets))
 
@@ -725,7 +711,7 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
 
     print("Exporting a model to FX graphics...")
     exported_program = torch.export.export(model.eval(), args=dummy_args, dynamic_shapes=dynamic_shapes)
-
+    generated_memory_map = None
     if optimize:
         optimizer_file = 'NAC_optimizer.py'
         if os.path.exists(optimizer_file):
@@ -739,11 +725,12 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
                 GraphConstantFolder = optimizer_module.GraphConstantFolder
                 folder = GraphConstantFolder(exported_program, canonical_op_map=ModelProcessor.CANONICAL_OP_MAP)
                 folder.fold(optimize_memory_locality=optimize_memory_locality)
+                generated_memory_map = getattr(folder, 'generated_memory_map', None)
             except Exception as e:
                 print(f"!!!!! ERROR while executing graph optimization: {e}\nContinuing without optimization...")
         else:
             print(f"--- INFO: Optimizer file '{optimizer_file}' not found. Skipping optimization. ---")
-    
+
     registry_filepath = os.path.join(result_manager.output_path, 'registry.json')
     existing_registry_data = None
     if os.path.exists(registry_filepath) and os.path.getsize(registry_filepath) > 0:
@@ -803,5 +790,6 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
         tokenizer_resources=tokenizer_resources,
         quant_method=quantization_method,
         store_weights_internally=store_weights_internally, 
-        io_counts=processor.io_counts
+        io_counts=processor.io_counts,
+        memory_map=generated_memory_map
     )

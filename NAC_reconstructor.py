@@ -32,6 +32,7 @@ class Reconstructor:
         self.d_model: int = 0
         self.param_id_to_name: Dict[int, str] = {}
         self.input_node_idx_to_name: Dict[int, str] = {}
+        self.memory_map: Dict[int, List[Dict[str, Any]]] = {}
 
         self._numpy_dtype_map = {
             torch.float32: np.float32, torch.float64: np.float64, torch.float16: np.float16,
@@ -47,15 +48,11 @@ class Reconstructor:
             'b': 'const', 's': 'const', 'c': 'const',
         }
 
-        # --- Initializing special and standard operations ---
-        self.id_to_canonical = {
-            2: "<INPUT>",
-            3: "<OUTPUT>",
-            6: "<CONTROL_FLOW>",
-            7: "<CONVERGENCE>",
-        }
-        # Loading standard operations from NAC_kernels.py
+        self.id_to_canonical = { 2: "<INPUT>", 3: "<OUTPUT>", 6: "<CONTROL_FLOW>", 7: "<CONVERGENCE>" }
         self.id_to_canonical.update(NAC_OPS)
+        
+        # Для чтения секции MMAP
+        self.code_to_action: Dict[int, str] = {10: 'SAVE_RESULT', 20: 'FREE', 30: 'FORWARD', 40: 'PRELOAD'}
 
 
     def _map_enum_to_dtype(self, enum: int) -> Optional[torch.dtype]:
@@ -93,27 +90,39 @@ class Reconstructor:
             num_inputs, num_outputs, _ = struct.unpack('<HHB', f.read(5))
             self.io_counts = (num_inputs, num_outputs)
             
-            offsets_header_format = '<H9Q6x'
+            offsets_header_format = '<H9Q6x' 
             header_bytes = f.read(struct.calcsize(offsets_header_format))
-            self.d_model, *offsets = struct.unpack(offsets_header_format, header_bytes)
-            
-            ops_off, cmap_off, cnst_off, perm_off, data_off, \
-            proc_off, meta_off, rsrc_off, reserved2_off = offsets
+            unpacked_header = struct.unpack(offsets_header_format, header_bytes)
+            self.d_model = unpacked_header[0]
+            offsets = unpacked_header[1:]
+        
+            mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, \
+            proc_off, meta_off, rsrc_off = offsets
             
             print(f"NAC v{version}, d_model: {self.d_model}, Quant: '{self.quantization_method}', IO: {self.io_counts}, Weights: {'Internal' if self.weights_stored_internally else 'External'}")
 
-            # --- CMAP (ID-Length-Value) ---
+            # --- MMAP Section (ID-Length-[Action-Target]...) ---
+            if mmap_off > 0:
+                f.seek(mmap_off); f.read(4) # 'MMAP'
+                num_mmap_records = struct.unpack('<I', f.read(4))[0]
+                for _ in range(num_mmap_records):
+                    instr_id, num_commands = struct.unpack('<HB', f.read(3))
+                    commands_for_tick = []
+                    for _ in range(num_commands):
+                        action_code, target_id = struct.unpack('<BH', f.read(3))
+                        action_name = self.code_to_action.get(action_code, f'UNKNOWN_ACTION_{action_code}')
+                        commands_for_tick.append({'action': action_name, 'target_id': target_id})
+                    self.memory_map[instr_id] = commands_for_tick
+            
+            # --- CMAP ---
             f.seek(cmap_off); f.read(4) 
             num_custom_ops = struct.unpack('<I', f.read(4))[0]
             for _ in range(num_custom_ops):
                 op_id, name_len = struct.unpack('<HB', f.read(3))
                 op_name = f.read(name_len).decode('utf-8')
-                if op_id not in self.id_to_canonical:
-                    self.id_to_canonical[op_id] = op_name
-                else:
-                    print(f"Warning: CMAP contains standard op ID {op_id} ('{op_name}'). Ignoring, using predefined '{self.id_to_canonical[op_id]}'.")
+                if op_id not in self.id_to_canonical: self.id_to_canonical[op_id] = op_name
 
-            # --- CNST (ID-Length-Value) ---
+            # --- CNST ---
             f.seek(cnst_off); f.read(4)
             num_consts = struct.unpack('<I', f.read(4))[0]
             for _ in range(num_consts):
@@ -128,7 +137,7 @@ class Reconstructor:
                 elif type_code == 6: val = list(struct.unpack(f'<{length}f', f.read(length * 4))) if length > 0 else []
                 self.constants[const_id] = val
 
-            # --- PERM (ID-Length-Value) ---
+            # --- PERM ---
             f.seek(perm_off); f.read(4)
             for _ in range(struct.unpack('<I', f.read(4))[0]):
                 p_id, p_len = struct.unpack('<HB', f.read(3))
@@ -141,15 +150,9 @@ class Reconstructor:
                 A, B = struct.unpack('<BB', f.read(2))
                 op_name_peek = self.id_to_canonical.get(A)
                 c_vals, d_vals = [], []
-                if op_name_peek == "<CONVERGENCE>":
-                    num_c, = struct.unpack('<h', f.read(2))
-                    c_vals = [num_c] + list(struct.unpack(f'<{num_c}h', f.read(num_c * 2)))
-                    num_d, = struct.unpack('<h', f.read(2))
-                    d_vals = [num_d] + list(struct.unpack(f'<{num_d}h', f.read(num_d * 2)))
-                else:
-                    nC, nD = self._infer_cd_lengths(A, B)
-                    if nC > 0: c_vals = list(struct.unpack(f'<{nC}h', f.read(nC * 2)))
-                    if nD > 0: d_vals = list(struct.unpack(f'<{nD}h', f.read(nD * 2)))
+                nC, nD = self._infer_cd_lengths(A, B)
+                if nC > 0: c_vals = list(struct.unpack(f'<{nC}h', f.read(nC * 2)))
+                if nD > 0: d_vals = list(struct.unpack(f'<{nD}h', f.read(nD * 2)))
                 self.parsed_nodes.append({'A': A, 'B': B, 'C': c_vals, 'D': d_vals})
 
             # --- DATA ---
@@ -164,36 +167,24 @@ class Reconstructor:
             if self.weights_stored_internally:
                 param_count = struct.unpack('<I', f.read(4))[0]
                 for _ in range(param_count):
-                    # [ID: u16][meta_len: u32][data_len: u64]
                     p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14))
-                    
-                    # Read the entire metadata block and parse it as JSON.
-                    meta_bytes = f.read(meta_len)
-                    metadata = json.loads(meta_bytes.decode('utf-8'))
-
-                    # Skip the tensor data, we don't need it for code reconstruction
-                    raw_data = f.read(data_len)
+                    metadata = json.loads(f.read(meta_len).decode('utf-8'))
+                    f.seek(data_len, 1) # Skip tensor data
                     
                     torch_dtype = self._map_enum_to_dtype(metadata.get('dtype'))
-                    shape = metadata.get('shape')
-                    if torch_dtype and shape:
-                        if (np_dtype := self._numpy_dtype_map.get(torch_dtype)):
-                            # We don't create a tensor, we just store its metadata for output.
-                            tensor_info = {'shape': shape, 'dtype': str(torch_dtype)}
-                            # Deleting already used keys
-                            if 'shape' in metadata: del metadata['shape']
-                            if 'dtype' in metadata: del metadata['dtype']
-                            
-                            # Save the dummy tensor and the remaining metadata
-                            dummy_tensor = torch.empty(0) # Plug
-                            self.loaded_param_data[p_id] = (dummy_tensor, {**tensor_info, **metadata})
-            else:
-                print("External weights are not loaded, but parameter names are mapped.")
+                    shape = metadata.get('shape', [])
+                    
+                    tensor_info = {'shape': shape, 'dtype': str(torch_dtype)}
+                    if 'shape' in metadata: del metadata['shape']
+                    if 'dtype' in metadata: del metadata['dtype']
+                    
+                    dummy_tensor = torch.empty(0)
+                    self.loaded_param_data[p_id] = (dummy_tensor, {**tensor_info, **metadata})
 
-        print(f"Successfully loaded {len(self.parsed_nodes)} ops and metadata for {len(self.loaded_param_data)} tensors.")
+        print(f"Successfully loaded {len(self.parsed_nodes)} ops, {len(self.memory_map)} MMAP records, and metadata for {len(self.loaded_param_data)} tensors.")
 
 
-    def reconstruct_from_nac_file(self, nac_path: str) -> str:
+    def reconstruct_from_nac_file(self, nac_path: str, show_mmap: bool = False) -> str:
         try:
             self._load_nac_file(nac_path)
         except (ValueError, IOError, struct.error, json.JSONDecodeError) as e:
@@ -201,27 +192,10 @@ class Reconstructor:
 
         print("\n--- Reconstructing pseudo-code from loaded NAC data ---")
         lines = []
-        indent_level = 0
-        indent_control_points = {}
+        action_priority = {'FORWARD': 0, 'FREE': 1, 'SAVE_RESULT': 2, 'PRELOAD': 3}
 
         for i, node in enumerate(self.parsed_nodes):
-            op_name = self.id_to_canonical.get(node['A'])
-            if op_name == "<CONVERGENCE>":
-                D = node['D']
-                jump_after, num_branches = D[0], D[1]
-                end_of_block = i + jump_after
-                indent_control_points[i + 1] = ('START_BRANCH_BLOCK',)
-                indent_control_points[end_of_block] = ('END_BRANCH_BLOCK',)
-                for offset in D[2:]:
-                    indent_control_points[i + offset] = ('START_BRANCH',)
-
-        for i, node in enumerate(self.parsed_nodes):
-            if i in indent_control_points:
-                if indent_control_points[i][0] == 'END_BRANCH_BLOCK': indent_level -= 1
-            indent_str = "  " * indent_level
-            if i in indent_control_points:
-                if indent_control_points[i][0] == 'START_BRANCH': lines.append(f"{indent_str}# --- Branch ---")
-
+            indent_str = "  "
             var_name = f"v{i}"; self.global_var_map[i] = var_name
             A, B, C, D = node['A'], node['B'], node['C'], node['D']
             op_name = self.id_to_canonical.get(A, f"<UNKNOWN_OP_{A}>")
@@ -236,24 +210,15 @@ class Reconstructor:
                     param_info = f"name='{param_name}', id={param_id}"
                     loaded_param = self.loaded_param_data.get(param_id)
                     if isinstance(loaded_param, tuple):
-                        tensor, metadata = loaded_param; param_info += f", shape={list(tensor.shape)}, quant_meta={metadata}"
-                    elif isinstance(loaded_param, torch.Tensor):
-                        param_info += f", shape={list(loaded_param.shape)}"
+                        _, metadata = loaded_param
+                        # В метаданных shape уже есть, поэтому не дублируем
+                        param_info += f", {', '.join(f'{k}={v}' for k, v in metadata.items())}"
                     line = f"{var_name} = load_param({param_info})"
-                elif B == 2:
-                    line = f"{var_name} = state_input(maps_to_output_idx={C[1]})"
                 elif B == 3:
                     line = f"{var_name} = constant(value={repr(self.constants.get(C[1]))})"
             elif op_name == "<OUTPUT>":
                 output_deps = [self.global_var_map.get(i + offset, f"v{i+offset}_<ERR>") for offset in D]
                 line = f"return {', '.join(output_deps)}"
-            elif op_name == "<CONTROL_FLOW>":
-                pred_var = self.global_var_map.get(i + D[0], f"v{i+D[0]}_<ERR>")
-                line = f"# CONTROL_FLOW on predicate: {pred_var}, true_len={C[1]}, false_len={C[2]}"
-            elif op_name == "<CONVERGENCE>":
-                input_var = self.global_var_map.get(i + C[0], f"v{i+C[0]}_<ERR>")
-                coherence = float(B) / 100.0 if B > 0 else 0.5
-                line = f"{var_name} = <CONVERGENCE>(input={input_var}, coherence={coherence})"
             else: 
                 final_args = []
                 perm = self.permutations.get(B)
@@ -265,39 +230,49 @@ class Reconstructor:
                             offset = next(d_iter)
                             final_args.append(self.global_var_map.get(i + offset, f"v{i+offset}_<ERR>"))
                         elif category == 'const':
-                            # d_iter should still be advanced even if its value is not used for consts
-                            next(d_iter, None) # Use None as the default value to avoid StopIteration
                             const_id = next(c_iter)
                             final_args.append(repr(self.constants.get(const_id, f"<CONST_ERR_{const_id}>")))
                 args_str = ", ".join(final_args)
                 line = f"{var_name} = {op_name}({args_str})"
 
+            # Добавляем запись управления памятью, если флаг -m активен
+            if show_mmap and i in self.memory_map:
+                commands = self.memory_map[i]
+                commands.sort(key=lambda cmd: (action_priority.get(cmd['action'], 99), cmd['target_id']))
+                mmap_str_parts = [f"{cmd['action']} -> {cmd['target_id']}" for cmd in commands]
+                if mmap_str_parts:
+                    line += " " + ", ".join(mmap_str_parts)
+
             lines.append(indent_str + line)
             
-            if i + 1 in indent_control_points:
-                if indent_control_points[i + 1][0] == 'START_BRANCH_BLOCK':
-                    indent_level += 1
         return "\n".join(lines)
 
-def reconstruct_from_file(nac_filepath: str):
+def reconstruct_from_file(nac_filepath: str, show_mmap: bool = False):
     print("\n" + "="*20 + f" RECONSTRUCTION OF {os.path.basename(nac_filepath)} " + "="*20)
     if not os.path.exists(nac_filepath):
         print(f"Error: File not found: {os.path.abspath(nac_filepath)}")
         return
     reconstructor = Reconstructor()
-    pseudo_code = reconstructor.reconstruct_from_nac_file(nac_filepath)
+    pseudo_code = reconstructor.reconstruct_from_nac_file(nac_filepath, show_mmap=show_mmap)
     if pseudo_code:
         print("\n--- Reconstructed Pseudo-code ---")
         print(f"File: {os.path.abspath(nac_filepath)}")
         print(f"Model Dimension (d_model): {reconstructor.d_model}")
         print(f"Quantization Method: {reconstructor.quantization_method}")
+        print(f"Memory Management Records: {'Shown' if show_mmap else 'Hidden'}")
         print("-" * 30)
         print(pseudo_code)
         print("-" * 30)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python NAC_reconstructor.py <path_to_model.nac>")
+    args = sys.argv[1:]
+    show_mmap_flag = '-m' in args or '--mmap' in args
+    if show_mmap_flag:
+        args = [arg for arg in args if arg not in ('-m', '--mmap')]
+
+    if not args:
+        print("Usage: python NAC_reconstructor.py [-m|--mmap] <path_to_model.nac>")
         sys.exit(1)
-    model_to_reconstruct = sys.argv[1]
-    reconstruct_from_file(nac_filepath=model_to_reconstruct)
+        
+    model_to_reconstruct = args[0]
+    reconstruct_from_file(nac_filepath=model_to_reconstruct, show_mmap=show_mmap_flag)

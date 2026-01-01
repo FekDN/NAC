@@ -112,8 +112,8 @@ class NacRuntime(NacKernelBase):
             header_bytes = f.read(struct.calcsize(offsets_header_format))
             self.d_model, *offsets = struct.unpack(offsets_header_format, header_bytes)
             
-            ops_off, cmap_off, cnst_off, perm_off, data_off, \
-            proc_off, meta_off, rsrc_off, reserved2_off = offsets
+            mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, \
+            proc_off, meta_off, rsrc_off = offsets
             
             print(f"NAC v{version}, d_model: {self.d_model}, Quant: '{self.quantization_method}', IO: {self.io_counts}, Weights: {'Internal' if self.weights_stored_internally else 'External'}")
             
