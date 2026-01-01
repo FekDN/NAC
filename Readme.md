@@ -125,20 +125,20 @@ The header has a fixed length and contains essential metadata about the model an
 *   **Type:** `uint16`
 *   **Description:** The key dimension of the model, typically corresponding to the embedding size or hidden state size in transformers. A value of `0` indicates that it is not defined.
 
-### 2.2.5. Section Offset Table (76 bytes)
+#### 2.2.5. Section Offset Table (76 bytes)
 *   **Offset:** `12`
 *   **Length:** 72 bytes (9 offsets of 8 bytes each)
 *   **Type:** `uint64[]`
-*   **Description:** An array of nine 64-bit unsigned integers, each representing the absolute offset (in bytes) from the beginning of the file to the start of the corresponding section. If a section is absent, its offset is `0`.
-    1.  `ops_offset`: Offset to the `OPS` section.
-    2.  `cmap_offset`: Offset to the `CMAP` section.
-    3.  `cnst_offset`: Offset to the `CNST` section.
-    4.  `perm_offset`: Offset to the `PERM` section.
-    5.  `data_offset`: Offset to the `DATA` section.
-    6.  `proc_offset`: Offset to the `PROC` section.
-    7.  `meta_offset`: Offset to the `META` section.
-    8.  `rsrc_offset`: Offset to the `RSRC` section.
-    9.  `reserved2_offset`: Reserved.
+*   **Description:** An array of nine 64-bit unsigned integers, each representing the absolute offset (in bytes) from the beginning of the file to the start of the corresponding section. If a section is absent, its offset is `0`. The offsets are stored in the following order:
+    1.  `mmap_offset`: Offset to the `MMAP` section (Memory Map).
+    2.  `ops_offset`: Offset to the `OPS` section.
+    3.  `cmap_offset`: Offset to the `CMAP` section.
+    4.  `cnst_offset`: Offset to the `CNST` section.
+    5.  `perm_offset`: Offset to the `PERM` section.
+    6.  `data_offset`: Offset to the `DATA` section.
+    7.  `proc_offset`: Offset to the `PROC` section.
+    8.  `meta_offset`: Offset to the `META` section.
+    9.  `rsrc_offset`: Offset to the `RSRC` section.
 *   ---
 *   **Offset:** `84`
 *   **Length:** 4 bytes
@@ -150,6 +150,7 @@ The header has a fixed length and contains essential metadata about the model an
 Each section (except for the header) begins with a 4-byte ASCII tag that identifies its type. The section's data immediately follows the tag. This structure allows for easy location and verification of sections when reading the file.
 
 #### 2.3.2. Description of Section Tags
+*   `MMAP`: (`Memory Map`) Contains a schedule of memory management commands for a parallel coprocessor.
 *   `OPS `: Contains the model's executable code—a sequence of instructions in the ABCD format.
 *   `CMAP`: (`Canonical Map`) A table mapping numerical operation IDs to their string-based canonical names.
 *   `CNST`: (`Constants`) A storage for constant values (numbers, strings, lists) used in the graph.
@@ -224,17 +225,86 @@ Each element `D[i]` corresponds to the `i`-th character in the signature string 
 *   **Zero Value (Marker for Constants from `C`):**
     If `D[i]` is `0`, it serves as a **marker** that instructs the runtime to fetch the next available value from the list of constant IDs previously read from field `C` for this argument. The order of zeros in `D` corresponds exactly to the order of constant IDs in `C` (after the length prefix).
 
+## 4. Memory Map (MMAP Section)
 
-## 4. Metadata Sections
+The `MMAP` section contains a schedule of memory management commands designed to be executed by a dedicated parallel coprocessor. Its primary purpose is to decouple memory operations (loading weights, freeing buffers) from the main computational pipeline (`OPS` section), thus hiding memory latency and maximizing the utilization of computational units. The `MMAP` section essentially provides a microprogram for this memory coprocessor.
+
+### 4.1. Purpose and Philosophy
+
+Execution is synchronized by "ticks," where each tick corresponds to the index of an instruction in the `OPS` section. While the main core executes instruction `i` from `OPS`, the memory coprocessor executes all commands scheduled for tick `i` from `MMAP`.
+
+This parallel execution enables critical optimizations:
+*   **Asynchronous Preloading:** The coprocessor can initiate the loading of weights from slow memory (e.g., DRAM) into fast local memory (SRAM/cache) several ticks before they are needed by the main core.
+*   **Efficient Buffer Management:** The coprocessor can free memory buffers immediately after their last use, preventing memory fragmentation and reducing the overall memory footprint.
+*   **Pipelining:** Results from one operation can be directly forwarded to the next without being written to a shared memory space.
+
+### 4.2. Section Format
+
+The section begins with the 4-byte ASCII tag `MMAP`, followed by a 4-byte integer specifying the number of records.
+
+| Field                | Type       | Size (bytes) | Description                                                                 |
+| -------------------- | ---------- | ------------ | --------------------------------------------------------------------------- |
+| **Section Tag**      | `char[4]`  | 4            | ASCII characters `'M' 'M' 'A' 'P'`.                                         |
+| **Number of Records**| `uint32_t` | 4            | The total number of ticks for which at least one memory command is scheduled. |
+| **Records...**       | `Record[]` | Variable     | A sequence of records, one for each scheduled tick.                         |
+
+### 4.3. Record Format
+
+Each record bundles all commands that must be executed at a specific tick.
+
+| Field                   | Type        | Size (bytes) | Description                                                                   |
+| ----------------------- | ----------- | ------------ | ----------------------------------------------------------------------------- |
+| **Instruction ID (Tick)** | `uint16_t`  | 2            | The index of the instruction in the `OPS` section at which these commands execute. |
+| **Number of Commands**  | `uint8_t`   | 1            | The number of `Command` structures that follow for this tick.                 |
+| **Commands...**         | `Command[]` | Variable     | A sequence of `Number of Commands` commands.                                  |
+
+### 4.4. Command Format
+
+Each command is an atomic instruction for the memory coprocessor.
+
+| Field         | Type       | Size (bytes) | Description                                                        |
+| ------------- | ---------- | ------------ | ------------------------------------------------------------------ |
+| **Action Type** | `uint8_t`  | 1            | A numeric code identifying the type of memory operation.           |
+| **Target ID**   | `uint16_t` | 2            | The ID of an instruction that is the target of the action.         |
+
+### 4.5. Semantics of Actions and Targets
+
+The interpretation of the `Target ID` is strictly dependent on the `Action Type`.
+
+| Code | Command Name   | `Target ID` Interpretation                                                                                                                                                             |
+| :--- | :------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `10` | **SAVE_RESULT**| The ID of the **current** instruction. This command instructs the coprocessor to save the result of the operation being executed at the current tick into shared memory. This is used when the result will be consumed by multiple future operations. |
+| `20` | **FREE**       | The ID of a **previously executed** instruction. This command frees the memory buffer that was allocated for the result of the target instruction or for a preloaded weight. This is scheduled at the tick *after* the last use of that data. |
+| `30` | **FORWARD**    | The ID of the **next** instruction that will consume the result. This command is a pipeline optimization that instructs the coprocessor to directly route the result of the current operation to the input of the target operation, bypassing shared memory. This is used when there is only one consumer. |
+| `40` | **PRELOAD**    | The ID of an `<INPUT B=1>` (`load_param`) instruction from the `OPS` section. This command instructs the coprocessor to begin asynchronously loading the specified parameter (weight/bias) from slow to fast memory. The main execution core, upon reaching the `load_param` instruction at `Target ID`, will find the data already available and can skip the memory access. |
+
+#### Example
+
+Consider the following reconstructed line:
+`v43 = aten.relu.default(v42) FREE -> 26, SAVE_RESULT -> 43, PRELOAD -> 44`
+
+This indicates that at **tick 43**, the memory coprocessor must execute three commands. In the binary `.nac` file, this would be represented by a single record:
+
+1.  **Record for Tick 43:**
+    *   **Instruction ID**: `43` (as `uint16_t`)
+    *   **Number of Commands**: `3` (as `uint8_t`)
+
+2.  **Commands within the Record (sorted by priority during compilation):**
+    *   **Command 1 (FREE):** Action Type: `20`, Target ID: `26`
+    *   **Command 2 (SAVE_RESULT):** Action Type: `10`, Target ID: `43`
+    *   **Command 3 (PRELOAD):** Action Type: `40`, Target ID: `44`
+
+
+## 5. Metadata Sections
 
 The metadata sections (`CMAP`, `PERM`, `CNST`) provide the runtime with all the necessary information to decode and interpret the instructions from the `OPS` section. These sections are loaded into memory during initialization and are used as lookup tables for fast access. Each section begins with a 4-byte tag, followed by a 4-byte integer (`uint32`) that specifies the number of entries in the section.
 
-### 4.1. `CMAP` Section (Canonical Map)
+### 5.1. `CMAP` Section (Canonical Map)
 
-#### 4.1.1. Purpose
+#### 5.1.1. Purpose
 The `CMAP` section contains the mapping from numerical operation identifiers (`A` from the ABCD instruction) to their canonical string names. This section is **optional** and is only present if the model uses operations that are not part of the standard, hardware-accelerated NAC set. Standard operations (e.g., `nac.add`, `nac.matmul`) have fixed, predefined IDs and are not recorded here. This allows the runtime to know the core instruction set without reading the file, making hardware implementation simpler.
 
-#### 4.1.2. Record Format
+#### 5.1.2. Record Format
 The section consists of a sequence of records, each having the following structure:
 
 *   **Operation ID (2 bytes, `uint16`):** The unique numerical identifier for the custom operation, used in the `A` field of an instruction.
@@ -243,7 +313,7 @@ The section consists of a sequence of records, each having the following structu
 
 **Example:** A custom operation `custom.op` with ID=201 would look like this: `0xC9 0x00` (ID=201), `0x0A` (length=10), `0x63 0x75 0x73 ...` ("custom.op").
 
-#### 4.1.3. Role of `CANONICAL_OP_MAP` in Formation
+#### 5.1.3. Role of `CANONICAL_OP_MAP` in Formation
 The compiler (`NAC.py`) uses an intelligent canonization mechanism.
 1.  **Normalization:** It cleans up PyTorch operation names (e.g., `aten.add_.Tensor` becomes `add`).
 2.  **Direct Mapping:** It tries to map the cleaned name to a standard NAC operation (e.g., `add` -> `nac.add`).
@@ -252,12 +322,12 @@ The compiler (`NAC.py`) uses an intelligent canonization mechanism.
 
 Thanks to this process, the dictionary of canonical operations (and consequently, the `CMAP` section) remains small and stable, which simplifies the runtime and makes the 256-ID limit for operations more than sufficient.
 
-### 4.2. `PERM` Section (Permutations / Signatures)
+### 5.2. `PERM` Section (Permutations / Signatures)
 
-#### 4.2.1. Purpose
+#### 5.2.1. Purpose
 The `PERM` section is key to decoding instruction arguments. It contains the mapping from numerical signature IDs (`B` from the ABCD instruction) to strings that describe the number, order, type, and semantics of the arguments for an operation.
 
-#### 4.2.2. Record Format
+#### 5.2.2. Record Format
 The structure of records in `PERM` is similar to `CMAP`:
 
 *   **Signature ID (2 bytes, `uint16`):** The unique numerical identifier used in the `B` field.
@@ -266,7 +336,7 @@ The structure of records in `PERM` is similar to `CMAP`:
 
 **Example:** The record for the signature `TSc` (tensor, shape, other constant) with ID=100 might look like: `0x64 0x00` (ID=100), `0x03` (length=3), `0x54 0x53 0x63` ("TSc").
 
-#### 4.2.3. Specification of Codes in the Signature String
+#### 5.2.3. Specification of Codes in the Signature String
 Each character in the signature string represents one argument and defines its type (tensor or constant), and may also carry additional semantic information.
 
 *   **Codes for Tensors** (indicate that the corresponding element in the `D` field is a relative offset):
@@ -287,12 +357,12 @@ Each character in the signature string represents one argument and defines its t
     *   `s`: `string`
     *   `c`: `complex` (any other JSON-serializable constant, e.g., a `torch.dtype` as a string)
 
-### 4.3. `CNST` Section (Constants)
+### 5.3. `CNST` Section (Constants)
 
-#### 4.3.1. Purpose
+#### 5.3.1. Purpose
 The `CNST` section serves as a centralized storage for all constant scalar and list values used in the computation graph. Instructions refer to these values via IDs from the `C` field.
 
-#### 4.3.2. Record Format
+#### 5.3.2. Record Format
 Records in `CNST` have a purely binary structure for efficient hardware parsing, avoiding the need for a JSON parser.
 
 *   **Constant ID (2 bytes, `uint16`):** The unique numerical identifier for the constant.
@@ -313,33 +383,33 @@ Records in `CNST` have a purely binary structure for efficient hardware parsing,
 **Example:** The record for the constant `[1, 2]` with ID=50 would look like: `0x32 0x00` (ID=50), `0x05` (type=list_int), `0x02 0x00` (length=2 elements), `0x01 0x00 0x00 0x00` (1), `0x02 0x00 0x00 0x00` (2).
 
 
-## 5. Data and Resource Sections (DATA, RSRC, PROC)
+## 6. Data and Resource Sections (DATA, RSRC, PROC)
 
 These sections are responsible for storing data that is not part of the executable graph but is necessary for its operation: model parameters (weights), information about inputs and outputs, and auxiliary resources such as tokenizer data.
 
-### 5.1. `DATA` Section
+### 6.1. `DATA` Section
 
 This section is the central repository for metadata about parameters and, optionally, for the parameter tensors themselves. It begins with the 4-byte tag `DATA`.
 
-#### 5.1.1. Mapping of Parameter IDs to Names
+#### 6.1.1. Mapping of Parameter IDs to Names
 This part of the section maps the numerical parameter IDs, used in `<INPUT>` instructions of type `B=1`, to their original string names from the source model. This is useful for debugging and for loading external weights from a `.safetensors` file, where tensors are identified by name.
 *   **Format:** It starts with a 4-byte integer (`uint32`) specifying the number of records, followed by a sequence of records, each with the structure:
     *   **Parameter ID (2 bytes, `uint16`):** The numerical ID of the parameter.
     *   **Name Length (2 bytes, `uint16`):** The length of the parameter name in bytes.
     *   **Name (variable length, UTF-8):** The parameter's name, e.g., `layers.0.attention.self.query.weight`.
 
-#### 5.1.2. Mapping of Input Indices to Names
+#### 6.1.2. Mapping of Input Indices to Names
 Similar to parameters, this part maps the index of an `<INPUT>` instruction of type `B=0` to the name of the corresponding model input.
 *   **Format:** A 4-byte integer (`uint32`) with the number of records, followed by the records themselves:
     *   **Instruction Index (2 bytes, `uint16`):** The absolute index `i` of the `<INPUT>` instruction in the `OPS` section.
     *   **Name Length (2 bytes, `uint16`):** The length of the input name.
     *   **Name (variable length, UTF-8):** The input's name, e.g., `input_ids`.
 
-### 5.1.3. Internal Weight Storage Format
+### 6.1.3. Internal Weight Storage Format
 This data block is present in the `DATA` section **only if** the internal weight storage flag is set in the file's header.
 *   **Format:** The block begins with a 4-byte integer (`uint32`) indicating the number of tensors stored, followed by a sequence of tensor records.
 *   **Tensor Record Structure:**
-    *   **Parameter ID (2 bytes, `uint16`):** The ID that links this tensor to its name from section 5.1.1.
+    *   **Parameter ID (2 bytes, `uint16`):** The ID that links this tensor to its name from section 6.1.1.
     *   **Metadata Length (4 bytes, `uint32`):** The total length of the metadata JSON block in bytes.
     *   **Data Length (8 bytes, `uint64`):** The length of the tensor's raw binary data in bytes.
     *   **Metadata (variable length, UTF-8):** A single block of text containing all metadata for the tensor, serialized into a compact JSON string. This includes `shape`, `dtype`, and any quantization information.
@@ -358,27 +428,27 @@ This data block is present in the `DATA` section **only if** the internal weight
     *   `8`: `uint8`
     *   `9`: `bool`
 
-### 5.2. `PROC` Section (Processing)
+### 6.2. `PROC` Section (Processing)
 
-#### 5.2.1. Purpose
+#### 6.2.1. Purpose
 The `PROC` section is designed to store data required for preprocessing steps that are executed before the main model runs. In the current version of the standard, it is used exclusively to store a compiled **tokenizer manifest** in the TISA format.
 
-#### 5.2.2. Format
+#### 6.2.2. Format
 The section's structure is very simple and consists of the `PROC` tag followed by:
 *   **Manifest Length (4 bytes, `uint32`):** The total length of the manifest's binary data in bytes.
 *   **Data (variable length):** The binary data of the tokenizer manifest.
 
 ### 5.3. `RSRC` Section (Resources)
 
-#### 5.3.1. Purpose
+#### 6.3.1. Purpose
 The `RSRC` section is used for embedding auxiliary resource files into the `.nac` file, which allows for the creation of fully self-contained artifacts. It is primarily used to store files required for the tokenizer to function, such as vocabularies (`vocab.json`), merge files (`merges.txt`), or SentencePiece models (`spiece.model`).
 
-#### 5.3.2. Format
+#### 6.3.2. Format
 The section begins with the `RSRC` tag, followed by:
 *   **Number of Files (4 bytes, `uint32`):** The total number of files stored in the section.
 *   This is followed by a sequence of records for each file.
 
-#### 5.3.3. File Record Format
+#### 6.3.3. File Record Format
 Each embedded file is described by the following structure:
 *   **Name Length (2 bytes, `uint16`):** The length of the file name in bytes.
 *   **Name (variable length, UTF-8):** The name of the file, e.g., `vm_vocab.json`.
@@ -386,61 +456,61 @@ Each embedded file is described by the following structure:
 *   **Data (variable length):** The raw binary content of the file.
 
 
-## 6. Special (System) Operations
+## 7. Special (System) Operations
 
 Special operations with an ID < 10 are the fundamental building blocks of the graph, managing data input/output and the flow of execution. Unlike regular computational operations, they have a unique structure for their `C` and `D` fields that does not depend on signatures from the `PERM` section.
 
-### 6.1. `<INPUT>` Operation (ID=2)
+### 7.1. `<INPUT>` Operation (ID=2)
 
 This operation serves as the entry point for all data into the graph, whether it's user input, model parameters, or constants. The `B` field specifies the data source.
 
 *   **A = 2**
 *   **D = []** (empty, as an input has no dependencies)
 
-#### 6.1.1. Variant `B=0`: Data Input
+#### 7.1.1. Variant `B=0`: Data Input
 *   **Description:** Represents one of the model's user inputs (e.g., `input_ids`, `attention_mask`). The runtime expects a corresponding tensor to be provided for each such instruction when the model is run.
 *   **B = 0**
 *   **C = []** (empty)
 
-#### 6.1.2. Variant `B=1`: Parameter (Weight/Bias)
+#### 7.1.2. Variant `B=1`: Parameter (Weight/Bias)
 *   **Description:** Loads a parameter tensor (weight or bias) from storage.
 *   **B = 1**
 *   **C = `[2, param_id]`** (length 2, `param_id` is a 16-bit parameter ID). The ID links this instruction to a parameter name in the `DATA` section and to the corresponding tensor (either internal or external).
 
-#### 6.1.3. Variant `B=2`: State
+#### 7.1.3. Variant `B=2`: State
 *   **Description:** Loads a state tensor. This operation is designed for models that maintain state between calls, such as the KV-cache in generative transformers. The runtime manages the storage and updating of these states.
 *   **B = 2**
 *   **C = `[2, state_id]`** (length 2, `state_id` is a 16-bit state ID).
 
-#### 6.1.4. Variant `B=3`: Lifted Constant
+#### 7.1.4. Variant `B=3`: Lifted Constant
 *   **Description:** Loads a constant that was "lifted" from the graph to the input level during the `torch.export` process. These are typically tensor constants (e.g., created via `torch.ones`) that are not parameters.
 *   **B = 3**
 *   **C = `[2, const_id]`** (length 2, `const_id` is a 16-bit constant ID from the `CNST` section).
 
-### 6.2. `<OUTPUT>` Operation (ID=3)
+### 7.2. `<OUTPUT>` Operation (ID=3)
 
 This operation defines the output data of a graph or subgraph. It collects the results of previous instructions and returns them.
 
 *   **A = 3**
 *   **C:** Defined by the `B` variant.
 
-#### 6.2.1. Variant `B=0`: Final Model Output
+#### 7.2.1. Variant `B=0`: Final Model Output
 *   **Description:** Designates the final result(s) of the entire model. The graph's execution terminates after this instruction.
 *   **B = 0**
 *   **C = `[num_outputs + 1, ...]`** (the length of the `C` field is the number of outputs + 1). The purpose of the elements in `C` is not defined in the current version.
 *   **D = `[offset_1, offset_2, ..., offset_n]`**: A list of relative offsets to the instructions whose results are the model's outputs. The number of offsets is equal to `num_outputs` from the file header.
 
-#### 6.2.2. Variant `B=1`: Intermediate Output (for Subgraphs)
+#### 7.2.2. Variant `B=1`: Intermediate Output (for Subgraphs)
 *   **Description:** Used to return a result from a subgraph, for example, within a branch of conditional execution or a `<CONVERGENCE>` operation. It does not terminate the execution of the entire graph.
 *   **B = 1**
 *   **C:** Not used / structure is undefined.
 *   **D:** A list of relative offsets to the output instructions of the subgraph.
 
-### 6.3. Reserved Operations
+### 7.3. Reserved Operations
 
 These operations are defined in the standard, but their full implementation in the reference runtime may be absent or specific. They lay the groundwork for future extensions.
 
-#### 6.3.1. `<CONTROL_FLOW>` (ID=6)
+#### 7.3.1. `<CONTROL_FLOW>` (ID=6)
 *   **Purpose:** Reserved for implementing conditional branching (if/else).
 *   **Structure (intended):**
     *   `B`: Undefined.
@@ -448,7 +518,7 @@ These operations are defined in the standard, but their full implementation in t
     *   `D`: `[predicate_offset]`. A relative offset to the instruction whose result (a boolean tensor) is used as the condition.
 *   **Status:** Not implemented in `NAC_run.py`.
 
-#### 6.3.2. `<CONVERGENCE>` (ID=7)
+#### 7.3.2. `<CONVERGENCE>` (ID=7)
 *   **Purpose:** Reserved for complex logic involving the merging of multiple parallel execution branches. The primary application is for merging experts in MoE models or for model ensembling.
 *   **Structure:** Has a unique structure that breaks the general ABCD rules.
     *   `B`: A coherence threshold (0-100) for "intelligent" merging.
@@ -457,11 +527,11 @@ These operations are defined in the standard, but their full implementation in t
 *   **Status:** The implementation in `NAC_run.py` is a demonstration and may not cover all use cases. It is considered an experimental feature.
 
 
-## 7. Execution Process (Runtime Logic)
+## 8. Execution Process (Runtime Logic)
 
 The runtime is the component responsible for loading a `.nac` file, interpreting the ABCD instructions, and performing the computations. The reference implementation, `NAC_run.py`, demonstrates all the key stages of this process.
 
-### 7.1. Loading and Initialization
+### 8.1. Loading and Initialization
 Before computations begin, the runtime performs a one-time setup:
 
 1.  **Read Header:** The 88-byte header is read to extract the version, quantization information, input/output counts, and, most importantly, the offsets to all sections.
@@ -476,14 +546,14 @@ Before computations begin, the runtime performs a one-time setup:
 4.  **Dequantize Parameters (If Necessary):** Immediately after loading, if the tensor's metadata or the file header specifies a quantization method (e.g., `INT8_CHANNEL`), the runtime applies the reverse operation (dequantization), converting the weights to the standard `float32` format. This is done once at load time to simplify subsequent computations.
 5.  **Initialize States:** The runtime initializes storage for states (e.g., KV-cache) if the graph contains any `<INPUT>` instructions with type `B=2`.
 
-### 7.2. Instruction Execution Loop (from OPS Section)
+### 8.2. Instruction Execution Loop (from OPS Section)
 
 After initialization, the runtime is ready to perform computations. The process is a loop over the array of instructions, pre-loaded from the `OPS` section.
 
 1.  **Initialize Results Buffer:** An array named `results` is created with a size equal to the number of instructions in the graph. `results[i]` will store the result of executing the `i`-th instruction.
 2.  **Iteration:** The runtime iterates through the instructions from `i = 0` to `N-1`.
 3.  **Parse Instruction:** At each iteration `i`, the runtime reads the `A`, `B`, `C`, and `D` fields of the current instruction.
-4.  **Gather Arguments:** The argument gathering mechanism is invoked (see 7.3), which prepares a list of arguments to be passed to the operation's kernel.
+4.  **Gather Arguments:** The argument gathering mechanism is invoked (see 8.3), which prepares a list of arguments to be passed to the operation's kernel.
 5.  **Invoke Operation Kernel:**
     *   Using the operation ID `A`, the runtime finds the corresponding name in `id_to_canonical`.
     *   Based on the operation name, the corresponding computational function (kernel), e.g., `op_nac_add`, is found and called.
@@ -491,7 +561,7 @@ After initialization, the runtime is ready to perform computations. The process 
 6.  **Store Result:** The result returned by the kernel is stored in `results[i]`.
 7.  **Termination:** The loop continues until an `<OUTPUT>` instruction (with `B=0`) is executed or the end of the instruction list is reached. The result(s) specified in the `<OUTPUT>` instruction are returned to the user.
 
-### 7.3. Argument Gathering Mechanism
+### 8.3. Argument Gathering Mechanism
 
 This is a key part of the runtime's logic at each iteration. For the current instruction `i` with fields `A`, `B`, `C`, `D`:
 
@@ -521,6 +591,7 @@ The source code of this project is licensed under the **GNU General Public Licen
 
 
 The accompanying documentation, including this README and the project's White Paper, is licensed under the **Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License**.
+
 
 
 
