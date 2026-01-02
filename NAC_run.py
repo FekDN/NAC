@@ -417,6 +417,29 @@ class NacRuntime(NacKernelBase):
 
     def _gather_args(self, op: Dict[str, Any], current_idx: int) -> List[Any]:
         args = []
+        # Get a list of constant IDs, excluding the first element (the counter)
+        c_ids = op['C'][1:] if op.get('C') and op['C'][0] > 0 else []
+        c_iter = iter(c_ids)
+    
+        # Field D is a catch-all list of sources for all arguments.
+        # Iterate on it, it is the only source of truth.
+        for d_val in op.get('D', []):
+            if d_val != 0:
+                # A non-zero value is a relative offset to the previous instruction.
+                ancestor_idx = current_idx + d_val
+                args.append(self.results[ancestor_idx])
+            else:
+                # The zero value is a marker indicating that the next constant ID from the C list should be taken.
+                try:
+                    const_id = next(c_iter)
+                    args.append(self.constants.get(const_id))
+                except StopIteration:
+                    args.append(None)
+        return args
+
+    def _gather_args1(self, op: Dict[str, Any], current_idx: int) -> List[Any]:
+        # This version uses a different principle - it will work, but does not guarantee correctness
+        args = []
         c_ids = op['C'][1:] if op.get('C') and op['C'][0] > 0 else []
         c_iter, d_iter = iter(c_ids), iter(op.get('D', []))
         perm = self.permutations.get(op.get('B'))
@@ -430,3 +453,4 @@ class NacRuntime(NacKernelBase):
                 try: args.append(self.constants.get(next(c_iter)))
                 except StopIteration: args.append(None)
         return args
+
