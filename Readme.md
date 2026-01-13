@@ -463,7 +463,6 @@ Special operations with an ID < 10 are the fundamental building blocks of the gr
 ### 7.1. `<INPUT>` Operation (ID=2)
 
 This operation serves as the entry point for all data into the graph, whether it's user input, model parameters, or constants. The `B` field specifies the data source.
-
 *   **A = 2**
 *   **D = []** (empty, as an input has no dependencies)
 
@@ -483,14 +482,15 @@ This operation serves as the entry point for all data into the graph, whether it
 *   **C = `[2, state_id]`** (length 2, `state_id` is a 16-bit state ID).
 
 #### 7.1.4. Variant `B=3`: Lifted Constant
-*   **Description:** Loads a constant that was "lifted" from the graph to the input level during the `torch.export` process. These are typically tensor constants (e.g., created via `torch.ones`) that are not parameters.
-*   **B = 3**
-*   **C = `[2, const_id]`** (length 2, `const_id` is a 16-bit constant ID from the `CNST` section).
+* **Description:** Represents a constant value that was "lifted" from the graph to the input level during the `torch.export` process. `torch.export` performs this transformation to make the graph more general, especially when it cannot statically prove that a value is constant throughout execution.
+* **Crucially, these can be either tensor constants (e.g., created via `torch.ones`) or scalar constants (e.g., a `float` like `1.0` or a `bool`).** When a lifted constant is present, the runtime expects a corresponding value to be provided in the input list for `run()`, just like a regular user input (`B=0`). The primary difference is that the value for a lifted constant is fixed and known at compile time.
+* The `DATA` section (specifically, the mapping of input indices to names) may contain a descriptive name for this lifted constant, which helps in identifying it. If a name is not available, tools like `NAC_reconstructor.py` will display it as an unnamed input, signaling to the user that an additional, non-obvious input is required.
+* **B = 3**
+* **C = `[2, const_id]`** (length 2, `const_id` is a 16-bit identifier for the constant value stored in the `CNST` section).
 
 ### 7.2. `<OUTPUT>` Operation (ID=3)
 
 This operation defines the output data of a graph or subgraph. It collects the results of previous instructions and returns them.
-
 *   **A = 3**
 *   **C:** Defined by the `B` variant.
 
@@ -591,6 +591,7 @@ The source code of this project is licensed under the **GNU General Public Licen
 
 
 The accompanying documentation, including this README and the project's White Paper, is licensed under the **Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License**.
+
 
 
 
