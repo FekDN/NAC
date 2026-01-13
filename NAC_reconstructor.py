@@ -19,7 +19,6 @@ except ImportError:
 class Reconstructor:
     """Reconstructs pseudo-code from a single, self-contained NAC file."""
     def __init__(self):
-        # ... (вся секция __init__ остается без изменений) ...
         print("\n--- Initializing Reconstructor ---")
         self.id_to_canonical: Dict[int, str] = {}
         self.constants: Dict[int, Any] = {}
@@ -147,13 +146,12 @@ class Reconstructor:
                     i_idx, name_len = struct.unpack('<HH', f.read(4)); self.input_node_idx_to_name[i_idx] = f.read(name_len).decode('utf-8')
                 
                 if self.weights_stored_internally:
-                    # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ЧТЕНИЯ МЕТАДАННЫХ ---
                     num_tensors = struct.unpack('<I', f.read(4))[0]
                     quant_code_to_str = {0: 'none', 1: 'INT8_TENSOR', 2: 'INT8_CHANNEL'}
                     for _ in range(num_tensors):
                         p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14))
                         meta_bytes = f.read(meta_len)
-                        f.seek(data_len, 1) # Пропускаем данные тензора
+                        f.seek(data_len, 1) # Skip the tensor data
 
                         meta_offset = 0; metadata = {}
                         dtype_id, rank = struct.unpack_from('<BB', meta_bytes, meta_offset); meta_offset += 2
@@ -175,7 +173,6 @@ class Reconstructor:
                         
                         dummy_tensor = torch.empty(0)
                         self.loaded_param_data[p_id] = (dummy_tensor, metadata)
-                    # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
 
         print(f"Successfully loaded {len(self.parsed_nodes)} ops, {len(self.memory_map)} MMAP records, and metadata for {len(self.loaded_param_data)} tensors.")
 
@@ -257,8 +254,7 @@ def reconstruct_from_file(nac_filepath: str, show_mmap: bool = False):
         print(f"Model Dimension (d_model): {reconstructor.d_model}")
         print(f"Quantization Method: {reconstructor.quantization_method}")
         print(f"Total User Inputs: {reconstructor.io_counts[0]}")
-        
-        # ВЫВОДИМ СВОДКУ ПО ВХОДАМ
+
         if input_summary:
             print("\n--- User Input Summary (in order of execution) ---")
             print(input_summary)

@@ -57,7 +57,7 @@ class NacRuntime(NacKernelBase):
         else:  # Regular Operations (A >= 10)
             perm = self.permutations.get(B)
             if perm:
-                # Читаем C, если он ожидается
+                # Read C if it is expected
                 num_consts_in_perm = sum(1 for p in perm if self.CODE_TO_CATEGORY.get(p) == 'const')
                 if num_consts_in_perm > 0:
                     try:
@@ -67,7 +67,7 @@ class NacRuntime(NacKernelBase):
                         else: C = [0]
                     except struct.error: C = []
                 
-                # Читаем D, его длина равна длине пермутации
+                # Read D, its length is equal to the permutation length
                 nD = len(perm)
                 if nD > 0:
                     try:
@@ -100,7 +100,7 @@ class NacRuntime(NacKernelBase):
         self.tokenizer = None
         
         with open(nac_path, 'rb') as f:
-            # 1. Чтение и парсинг заголовка
+            # 1. Reading and parsing the header
             if f.read(3) != b'NAC': raise ValueError("'NAC' magic bytes not found.")
             version, raw_quant_id = struct.unpack('<BB', f.read(2))
             if version != 1: raise ValueError(f"Unsupported NAC version: {version}")
@@ -119,9 +119,9 @@ class NacRuntime(NacKernelBase):
             
             print(f"NAC v{version}, d_model: {self.d_model}, Quant: '{self.quantization_method}', IO: {self.io_counts}, Weights: {'Internal' if self.weights_stored_internally else 'External'}")
 
-            # 2. Загрузка метаданных (CMAP, CNST, PERM)
+            # 2. Loading metadata (CMAP, CNST, PERM)
             if cmap_off > 0:
-                f.seek(cmap_off); f.read(4) # Пропускаем тег
+                f.seek(cmap_off); f.read(4) # Skipping the tag
                 num_entries = struct.unpack('<I', f.read(4))[0]
                 for _ in range(num_entries):
                     op_id, name_len = struct.unpack('<HB', f.read(3))
@@ -152,10 +152,10 @@ class NacRuntime(NacKernelBase):
                 num_ops = struct.unpack('<I', f.read(4))[0]
                 self.operations = [self._read_op(f) for _ in range(num_ops)]
 
-            # 3. Загрузка данных (DATA)
+            # 3. Loading data (DATA)
             if data_off > 0:
                 f.seek(data_off); f.read(4)
-                # Чтение сопоставлений имен
+                # Reading name mappings
                 num_params = struct.unpack('<I', f.read(4))[0]
                 for _ in range(num_params):
                     p_id, name_len = struct.unpack('<HH', f.read(4))
@@ -166,7 +166,7 @@ class NacRuntime(NacKernelBase):
                     i_idx, name_len = struct.unpack('<HH', f.read(4))
                     self.input_node_idx_to_name[i_idx] = f.read(name_len).decode('utf-8')
                 
-                # Загрузка тензоров весов
+                # Loading weight tensors
                 if self.weights_stored_internally:
                     num_tensors = struct.unpack('<I', f.read(4))[0]
                     numpy_dtype_map = {0:np.float32, 1:np.float64, 2:np.float16, 3:"<bf16>", 4:np.int32, 5:np.int64, 6:np.int16, 7:np.int8, 8:np.uint8, 9:np.bool_}
@@ -176,8 +176,7 @@ class NacRuntime(NacKernelBase):
                         p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14))
                         meta_bytes = f.read(meta_len)
                         data_bytes = f.read(data_len)
-                        
-                        # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ДЕСЕРИАЛИЗАЦИИ МЕТАДАННЫХ ---
+
                         meta_offset = 0
                         meta = {}
                         
@@ -207,7 +206,6 @@ class NacRuntime(NacKernelBase):
                             meta_offset += 5
                             scales = list(struct.unpack_from(f'<{num_scales}f', meta_bytes, meta_offset))
                             meta['axis'], meta['scales'] = axis, scales
-                        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
                         
                         dtype = numpy_dtype_map.get(dtype_id, np.float32)
                         if dtype == "<bf16>":
@@ -217,8 +215,7 @@ class NacRuntime(NacKernelBase):
                             arr = np.frombuffer(data_bytes, dtype=dtype).reshape(shape).copy()
                         
                         self.parameters[p_id] = self._dequantize(arr, meta)
-                else: # Загрузка из внешнего файла .safetensors
-                    # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ЗАГРУЗКИ ВНЕШНИХ ВЕСОВ ---
+                else: # Loading from an external .safetensors file
                     safetensors_path = os.path.splitext(nac_path)[0] + '.safetensors'
                     if not os.path.exists(safetensors_path): raise FileNotFoundError(f"External weights file not found: {safetensors_path}")
                     
@@ -227,30 +224,29 @@ class NacRuntime(NacKernelBase):
                     tensors = {}
                     per_tensor_metadata = {}
                     with safe_open(safetensors_path, framework="np", device="cpu") as st_f:
-                        # 1. Загружаем общие метаданные файла
+                        # 1. Loading general file metadata
                         file_metadata = st_f.metadata() or {}
-                        # 2. Извлекаем поле 'metadata', где хранятся метаданные для каждого тензора
+                        # 2. Extract the 'metadata' field, which stores metadata for each tensor.
                         if "metadata" in file_metadata:
-                            # Это строка, содержащая JSON-словарь, где ключ - имя тензора,
-                            # а значение - ЕЩЕ ОДНА СТРОКА JSON с метаданными этого тензора.
+                            # This is a string containing a JSON dictionary where the key is the name of the tensor,
+                            # and the value is ANOTHER JSON ROW with the metadata of this tensor.
                             metadata_of_metadata = json.loads(file_metadata["metadata"])
                             for tensor_name, meta_json_str in metadata_of_metadata.items():
                                 per_tensor_metadata[tensor_name] = json.loads(meta_json_str)
 
-                        # 3. Загружаем сами тензоры
+                        # 3. Loading the tensors
                         for key in st_f.keys():
                             tensors[key] = st_f.get_tensor(key)
 
-                    # 4. Сопоставляем тензоры, их метаданные и деквантуем
+                    # 4. Compare tensors, their metadata and dequantize
                     for p_id, p_name in self.param_id_to_name.items():
                         if p_name in tensors:
-                            meta = per_tensor_metadata.get(p_name, {}) # Получаем словарь метаданных для этого тензора
+                            meta = per_tensor_metadata.get(p_name, {}) # Get the metadata dictionary for this tensor
                             self.parameters[p_id] = self._dequantize(tensors[p_name], meta)
-                    # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
             
-            # 4. Загрузка ресурсов токенизатора (RSRC)
+            # 4. Loading tokenizer resources (RSRC)
             tokenizer_resources_raw = {}
-            if rsrc_off > 0: # Ресурсы внутри .nac
+            if rsrc_off > 0: # Resources inside .nac
                 f.seek(rsrc_off); f.read(4)
                 num_files = struct.unpack('<I', f.read(4))[0]
                 print(f"Reading {num_files} internal resource files from RSRC section...")
@@ -259,7 +255,7 @@ class NacRuntime(NacKernelBase):
                     filename = f.read(name_len).decode('utf-8')
                     data_len = struct.unpack('<I', f.read(4))[0]
                     tokenizer_resources_raw[filename] = f.read(data_len)
-            else: # Ресурсы снаружи
+            else: # Resources outside
                 tokenizer_dir = os.path.splitext(nac_path)[0] + "-tokenizer"
                 if os.path.exists(tokenizer_dir):
                     print(f"Reading external tokenizer resources from: {tokenizer_dir}")
@@ -269,7 +265,7 @@ class NacRuntime(NacKernelBase):
                             with open(fpath, 'rb') as rf: 
                                 tokenizer_resources_raw[fname] = rf.read()
 
-            # 5. Инициализация TISAVM на основе манифеста (PROC) и ресурсов
+            # 5. Initializing TISAVM based on the manifest (PROC) and resources
             if proc_off > 0:
                 f.seek(proc_off); f.read(4)
                 manifest_bytes = f.read(struct.unpack('<I', f.read(4))[0])
@@ -483,7 +479,6 @@ class NacRuntime(NacKernelBase):
         d_values = op.get('D', [])
 
         if len(d_values) != len(perm):
-             # Эта проверка теперь должна проходить успешно
              raise ValueError(f"Instruction {current_idx}: Mismatch between perm length ({len(perm)}) and D field length ({len(d_values)}).")
 
         for i in range(len(perm)):
