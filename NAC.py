@@ -550,23 +550,20 @@ class ModelProcessor:
                 if parts:
                     B = self.perm_tuple_to_id.get(parts, 0)
                     
-                    # --- ИСПРАВЛЕННАЯ ЛОГИКА СОЗДАНИЯ C и D ---
-                    
-                    # 1. Собираем ID только для констант
+                    # 1. Collect IDs only for constants
                     consts = [self._get_hashable_const(val) for _, val, arg_node in arg_details if arg_node is None]
                     const_ids = [ModelProcessor.const_to_id.get(c, 0) for c in consts]
                     if const_ids:
                         C = [len(const_ids)] + const_ids
                     
-                    # 2. Собираем поле D, которое соответствует пермутации.
-                    #    Вставляем смещение для тензора или 0 для константы.
+                    # 2. Collect the field D, which corresponds to the permutation.
+                    #    Insert an offset for a tensor or 0 for a constant.
                     D = []
                     for _, _, arg_node in arg_details:
                         if arg_node is not None:
                             D.append(self.global_node_map.get(arg_node, -1) - i)
                         else:
                             D.append(0)
-                    # --- КОНЕЦ ИСПРАВЛЕННОЙ ЛОГИКИ ---
 
             nodes.append({'A': A, 'B': B, 'C': C, 'D': D})
         return nodes
