@@ -310,33 +310,41 @@ def run_sentiment_analysis(nac_file: str, text: str):
         print("ERROR: TISAVM not initialized. Cannot run sentiment analysis.")
         return
 
-    # --- Use the built-in tokenizer ---
+    # --- Step 1: Create all the necessary tensors ---
     input_ids_list = runtime.encode(text)
-    
-    # Trim to maximum length if needed (important for position_ids)
     max_len = 512 
     if len(input_ids_list) > max_len:
         input_ids_list = input_ids_list[:max_len]
-        print(f"Warning: Input text truncated to {max_len} tokens.")
         
     input_ids = np.array([input_ids_list], dtype=np.int64)
-    attention_mask = np.ones_like(input_ids)
+    attention_mask = np.ones_like(input_ids, dtype=np.int64) # The mask must be int64, just like input_ids.
     seq_len = input_ids.shape[1]
-
-    # 1. position_ids: arange(seq_len)
     position_ids = np.arange(0, seq_len, dtype=np.int64).reshape(1, -1)
-    
-    # 2. lifted_one: constant 1.0
     lifted_one = np.array(1.0, dtype=np.float32)
 
-    # 3. Collect all the inputs in the correct order
-    # The order is critical and must match how the graph was exported.
-    # If NAC_info shows only 2 named entries, the rest are unnamed and come first.
-    all_inputs = [position_ids, lifted_one, input_ids, attention_mask]
+    # --- Step 2: Collect the list of inputs in the EXACT ORDER that we determined from the reconstruction ---
+    # v0 = unnamed_input_0  -> lifted_one
+    # v1 = input_ids         -> input_ids
+    # v2 = attention_mask    -> attention_mask
+    # v6 = unnamed_input_6  -> position_ids
+    #
+    # Since the runtime just takes the inputs in order, we have to pass them in that way.
+    
+    all_inputs = [
+        lifted_one,      # for v0
+        input_ids,       # for v1
+        attention_mask,  # for v2
+        position_ids     # for v6
+    ]
 
-    print(f"Input text: '{text}'")
-    print(f"Input IDs (from VM): {input_ids.tolist()}")
-    print("Executing NAC runtime...")
+    print("\n--- Final Model Inputs (in order) ---")
+    print(f"  Input 0 (for v0): Lifted Constant {lifted_one.shape}")
+    print(f"  Input 1 (for v1): input_ids {input_ids.shape}")
+    print(f"  Input 2 (for v2): attention_mask {attention_mask.shape}")
+    print(f"  Input 3 (for v6): position_ids {position_ids.shape}")
+
+    # --- Step 3: Execute the model ---
+    print("\nExecuting NAC runtime...")
     logits = runtime.run(all_inputs)[0]
     
     # --- Post-processing of the result ---
@@ -344,7 +352,7 @@ def run_sentiment_analysis(nac_file: str, text: str):
     label_map = {0: "NEGATIVE", 1: "POSITIVE"}
     probabilities = softmax(logits[0])
     
-    print("\n--- Analysis Results ---")
+    print(f"\n--- Analysis Results for '{text}'---")
     print(f"  Prediction: {label_map.get(prediction_idx, 'UNKNOWN')}")
     print(f"  Confidence (NEGATIVE): {probabilities[0]:.2%}")
     print(f"  Confidence (POSITIVE): {probabilities[1]:.2%}")

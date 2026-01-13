@@ -15,7 +15,15 @@ def process_gpt2_streaming():
     FIXED_SEQ_LEN = 64
     dummy_input_ids = torch.ones(1, FIXED_SEQ_LEN, dtype=torch.long)
     dummy_mask = torch.tril(torch.ones(FIXED_SEQ_LEN, FIXED_SEQ_LEN)).bool()[None, None, :, :]
-    generate_artifacts("gpt2-streaming", Gpt2LogitsWrapper(model), (dummy_input_ids, dummy_mask), 'none', tokenizer_repo=repo, store_weights_internally=False, optimize=True)
+    generate_artifacts(
+        model_name="gpt2-streaming", 
+        model=Gpt2LogitsWrapper(model), 
+        dummy_args=(dummy_input_ids, dummy_mask), 
+        quantization_method='none', 
+        tokenizer_repo=repo, 
+        store_weights_internally=False, 
+        optimize=True
+    )
 
 def process_sd_unet_vae():
     print("\n" + "#"*20 + " PROCESSING STABLE DIFFUSION (UNET & VAE) " + "#"*20)
@@ -30,12 +38,12 @@ def process_sd_unet_vae():
     dummy_latent = torch.randn(2, 4, latent_res, latent_res) 
     dummy_text_embed = torch.randn(2, 77, 768)
     dummy_timestep = torch.tensor([999, 999], dtype=torch.float32)
-    generate_artifacts("sd-unet-256", UNetWrapper(pipe.unet.eval()), (dummy_latent, dummy_timestep, dummy_text_embed), 'INT8_TENSOR', optimize=True)
+    generate_artifacts(model_name="sd-unet-256", model=UNetWrapper(pipe.unet.eval()), dummy_args=(dummy_latent, dummy_timestep, dummy_text_embed), quantization_method='INT8_TENSOR', optimize=True)
     class VAEDecoderWrapper(torch.nn.Module):
         def __init__(self, vae): super().__init__(); self.vae = vae
         def forward(self, latents): return self.vae.decode(latents, return_dict=False)[0]
     dummy_vae_latent = torch.randn(1, 4, latent_res, latent_res)
-    generate_artifacts("sd-vae-decoder-256", VAEDecoderWrapper(pipe.vae.eval()), (dummy_vae_latent,), 'INT8_TENSOR', optimize=True)
+    generate_artifacts(model_name="sd-vae-decoder-256", model=VAEDecoderWrapper(pipe.vae.eval()), dummy_args=(dummy_vae_latent,), quantization_method='INT8_TENSOR', optimize=True)
 
 def process_roberta_base():
     print("\n" + "#"*20 + " PROCESSING ROBERTA-BASE " + "#"*20)
@@ -57,7 +65,7 @@ def process_roberta_base():
     dummy_args = (inputs['input_ids'], inputs['attention_mask'])
     seq_dim = torch.export.Dim("sequence", min=1, max=model.config.max_position_embeddings - 2)
     dynamic_shapes = {"input_ids": {1: seq_dim}, "attention_mask": {1: seq_dim}}
-    generate_artifacts("roberta-base-fill-mask", RobertaCleanedWrapper(model), dummy_args, 'INT8_TENSOR', dynamic_shapes=dynamic_shapes, tokenizer_repo=repo, optimize=True, tokenizer_input=tokenizer_input)
+    generate_artifacts(model_name="roberta-base-fill-mask", model=RobertaCleanedWrapper(model), dummy_args=dummy_args, quantization_method='INT8_TENSOR', dynamic_shapes=dynamic_shapes, tokenizer_repo=repo, optimize=True, tokenizer_input=tokenizer_input)
 
 class Gpt2LogitsWrapper(torch.nn.Module):
     def __init__(self, model):
@@ -76,10 +84,10 @@ def process_gpt2():
     dummy_input_ids = torch.ones(1, FIXED_SEQ_LEN, dtype=torch.long)
     dummy_mask = torch.tril(torch.ones(FIXED_SEQ_LEN, FIXED_SEQ_LEN)).bool()[None, None, :, :]
     generate_artifacts(
-        "gpt2-text-generation",
-        Gpt2LogitsWrapper(model),
-        (dummy_input_ids, dummy_mask),
-        'INT8_TENSOR',
+        model_name="gpt2-text-generation",
+        model=Gpt2LogitsWrapper(model),
+        dummy_args=(dummy_input_ids, dummy_mask),
+        quantization_method='INT8_TENSOR',
         optimize=True,
         tokenizer_repo="gpt2"
     )
@@ -87,23 +95,41 @@ def process_gpt2():
 def process_distilbert_sentiment():
     print("\n" + "#"*20 + " PROCESSING DistilBERT FOR SENTIMENT (SAFE LOADING) " + "#"*20)
     repo = "distilbert-base-uncased-finetuned-sst-2-english"
-    try: model = AutoModelForSequenceClassification.from_pretrained(repo).eval(); tokenizer = AutoTokenizer.from_pretrained(repo)
-    except Exception as e: print(f"!!!!! ERROR: Could not download DistilBERT model '{repo}'.\n{e}"); return
+    try:
+        model = AutoModelForSequenceClassification.from_pretrained(repo).eval()
+        tokenizer = AutoTokenizer.from_pretrained(repo)
+    except Exception as e:
+        print(f"!!!!! ERROR: Could not download DistilBERT model '{repo}'.\n{e}")
+        return
+
     class DistilBertLogitsWrapper(torch.nn.Module):
-        def __init__(self, model): super().__init__(); self.model = model
-        def forward(self, input_ids, attention_mask=None): return self.model(input_ids=input_ids, attention_mask=attention_mask).logits
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+        def forward(self, input_ids, attention_mask):
+            return self.model(input_ids=input_ids, attention_mask=attention_mask).logits
+
     inputs = tokenizer("This is a test sentence.", return_tensors="pt")
     dummy_args = (inputs['input_ids'], inputs['attention_mask'])
-    max_len = model.config.max_position_embeddings - 1
-    seq_dim = torch.export.Dim("sequence", min=1, max=max_len)
-    dynamic_shapes = {"input_ids": {1: seq_dim}, "attention_mask": {1: seq_dim}}
+
+    # Set the maximum length to be 1 less than the absolute maximum of the model.
+    # This avoids the boundary condition that torch.export trips up.
+    max_len = model.config.max_position_embeddings
+    seq_dim = torch.export.Dim("sequence", min=1, max=max_len - 1)
+    # ---------------------------------------------------------
+    
+    dynamic_shapes = {
+        "input_ids": {1: seq_dim},
+        "attention_mask": {1: seq_dim}
+    }
+    
     generate_artifacts(
-        "distilbert-sst2-sentiment",
-        DistilBertLogitsWrapper(model),
-        dummy_args,
-        'INT8_TENSOR',
+        model_name="distilbert-sst2-sentiment",
+        model=DistilBertLogitsWrapper(model),
+        dummy_args=dummy_args,
+        quantization_method='INT8_TENSOR',
         tokenizer_repo=repo,
-        store_weights_internally=False,
+        store_weights_internally=True,
         optimize=True,
         dynamic_shapes=dynamic_shapes
     )
