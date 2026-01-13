@@ -65,12 +65,12 @@ def inspect_nac_file(filepath: str):
         print(f"IO Counts: {num_inputs} Inputs, {num_outputs} Outputs")
 
         # --- Section Offsets ---
-        offsets_header_format = '<H9Q6x' 
+        offsets_header_format = '<H9Q4x' 
         header_bytes = f.read(struct.calcsize(offsets_header_format))
         
         unpacked_header = struct.unpack(offsets_header_format, header_bytes)
         d_model = unpacked_header[0]
-        offsets = unpacked_header[1:] # Остальные 9 элементов - это смещения
+        offsets = unpacked_header[1:]
         
         mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, \
         proc_off, meta_off, rsrc_off = offsets
@@ -222,13 +222,26 @@ def inspect_nac_file(filepath: str):
                     for _ in range(num_tensors):
                         p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14))
                         meta_bytes = f.read(meta_len)
-                        meta = json.loads(meta_bytes.decode('utf-8'))
-                        f.seek(data_len, 1)
                         
-                        shape = meta.get('shape', '[UNKNOWN]')
-                        dtype_id = meta.get('dtype', -1)
+                        # --- START: New Pure Binary Metadata Deserialization ---
+                        # This block replaces the json.loads() call to parse the binary metadata
+                        meta_offset = 0
+                        
+                        # 1. Dtype and Rank
+                        dtype_id, rank = struct.unpack_from('<BB', meta_bytes, meta_offset)
+                        meta_offset += 2
+                        
+                        # 2. Shape
+                        shape = []
+                        if rank > 0:
+                            shape = list(struct.unpack_from(f'<{rank}I', meta_bytes, meta_offset))
+                        # --- END: New Pure Binary Metadata Deserialization ---
+                        
+                        # The info script doesn't need to read the full meta, just enough for display.
+                        # Now skip the actual tensor data bytes to get to the next tensor header.
+                        f.seek(data_len, 1) 
+                        
                         dtype_str = dtype_map.get(dtype_id, 'UNK')
-                        
                         param_name = f"'{param_names.get(p_id, 'N/A')}'"
                         print(f"  - Tensor ID {p_id:<3} ({param_name:<20}): Shape={str(shape):<20} DType={dtype_str:<5} Size={data_len} bytes")
                 else:

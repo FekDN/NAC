@@ -1,5 +1,4 @@
-# Copyright (c) 2025 Dmitry Feklin (FeklinDN@gmail.com) Apache License 2.0.
-# https://github.com/FekDN/T-ISA-Tokenizer-Instruction-Set-Architecture/
+# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com) Apache License 2.0.
 
 import struct
 import json
@@ -164,7 +163,15 @@ class TISAVM:
     def __init__(self, resources):
         self.res = resources
         self.id_to_token = {}
-        if self.res and 'vocab' in self.res: self.id_to_token = {v: k for k, v in self.res['vocab'].items()}
+        if self.res and 'vocab' in self.res:
+            vocab_data = self.res['vocab']
+            if isinstance(vocab_data, dict):
+                # Стандартный случай (BPE, WordPiece): {"токен": id}
+                self.id_to_token = {v: k for k, v in vocab_data.items()}
+            elif isinstance(vocab_data, list):
+                # Случай Unigram: [["токен", score], ...]
+                # ID здесь - это просто индекс в списке
+                self.id_to_token = {i: token for i, (token, score) in enumerate(vocab_data)}
         self.dispatch = {
             0x01: Primitives.LOWERCASE,
             0x02: Primitives.UNICODE_NORM,
@@ -188,7 +195,11 @@ class TISAVM:
             while offset < len(manifest_data):
                 opcode = manifest_data[offset]; offset += 1
                 p_len = struct.unpack("<I", manifest_data[offset:offset+4])[0]; offset += 4
-                payload = json.loads(manifest_data[offset:offset+p_len].decode('utf-8')); offset += p_len
+
+                p_bytes = manifest_data[offset:offset+p_len]
+                payload = TISACompiler._deserialize_payload_binary(opcode, p_bytes)
+                offset += p_len
+
                 commands.append((opcode, payload))
         else: commands = manifest_data
         for opcode, payload in commands:
@@ -342,31 +353,178 @@ class TISACompiler:
         elif model_type == 'Unigram':
             instructions.append([0x22, {}])
         post_config = state.get('post_processor')
-        template = [('SLOT',)]
+
+        template = [('SLOT', None)]
         if post_config:
             post_type = post_config['type']
             if post_type == 'TemplateProcessing':
                 template_pieces = post_config.get('single') or post_config.get('piece')
                 template = [
-                    ('FIXED', x['SpecialToken']['id']) if 'SpecialToken' in x else ('SLOT',)
+                    ('FIXED', x['SpecialToken']['id']) if 'SpecialToken' in x else ('SLOT', None)
                     for x in template_pieces
                 ]
             elif post_type == 'RobertaProcessing':
-                template = [('FIXED', post_config['cls'][1]), ('SLOT',), ('FIXED', post_config['sep'][1])]
+                template = [('FIXED', post_config['cls'][1]), ('SLOT', None), ('FIXED', post_config['sep'][1])]
         else:
             if getattr(tokenizer, 'add_bos_token', False) and hasattr(tokenizer, 'bos_token_id'):
+                # template already has ('SLOT', None), so we insert it at the beginning
                 template.insert(0, ('FIXED', tokenizer.bos_token_id))
             if getattr(tokenizer, 'add_eos_token', False) and hasattr(tokenizer, 'eos_token_id'):
                 template.append(('FIXED', tokenizer.eos_token_id))
-        if template != [('SLOT',)]:
+        
+        # If the pattern remains simply [('SLOT', None)], then the COMPOSE opcode is not needed
+        if template != [('SLOT', None)]:
             instructions.append([0x30, {'template': template}])
+
         buf = bytearray(b"TISA\x01") # Magic + version
         for op, payload in instructions:
-            p_bytes = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+            p_bytes = TISACompiler._serialize_payload_binary(op, payload)
             buf.append(op)
             buf.extend(struct.pack("<I", len(p_bytes)))
             buf.extend(p_bytes)
         return bytes(buf)
+
+    @staticmethod
+    def _serialize_payload_binary(opcode: int, payload: Dict) -> bytes:
+        """Serializes the payload to binary format instead of JSON."""
+        buf = bytearray()
+        if opcode == 0x01: # LOWERCASE
+            pass # No payload
+        elif opcode == 0x02: # UNICODE_NORM
+            form_bytes = payload['form'].encode('utf-8')
+            buf.extend(struct.pack('<B', len(form_bytes)))
+            buf.extend(form_bytes)
+        elif opcode == 0x03: # REPLACE
+            pattern_bytes = payload['pattern'].encode('utf-8')
+            val_bytes = payload['val'].encode('utf-8')
+            buf.extend(struct.pack('<H', len(pattern_bytes)))
+            buf.extend(pattern_bytes)
+            buf.extend(struct.pack('<H', len(val_bytes)))
+            buf.extend(val_bytes)
+        elif opcode == 0x04: # FILTER_CATEGORY
+            cats = payload['cats']
+            buf.extend(struct.pack('<B', len(cats)))
+            for cat in cats:
+                cat_bytes = cat.encode('utf-8')
+                buf.extend(struct.pack('<B', len(cat_bytes)))
+                buf.extend(cat_bytes)
+        elif opcode == 0x07: # PREPEND
+            val_bytes = payload['val'].encode('utf-8')
+            buf.extend(struct.pack('<H', len(val_bytes)))
+            buf.extend(val_bytes)
+        elif opcode == 0x10: # PARTITION_RULES
+            rules = payload.get('rules', [])
+            buf.extend(struct.pack('<H', len(rules)))
+            behavior_map = {'REMOVE': 1, 'ISOLATE': 2}
+            for rule in rules:
+                flags = 0
+                if rule.get('protected', False): flags |= 1
+                if 'behavior' in rule: flags |= 2
+                if 'trim_preceding_space' in rule: flags |= 4
+                buf.extend(struct.pack('<B', flags))
+                
+                pattern_bytes = rule.get('pattern', '').encode('utf-8')
+                buf.extend(struct.pack('<H', len(pattern_bytes)))
+                buf.extend(pattern_bytes)
+
+                if 'behavior' in rule:
+                    buf.extend(struct.pack('<B', behavior_map.get(rule['behavior'], 0)))
+                if 'trim_preceding_space' in rule:
+                    trim_bytes = rule['trim_preceding_space'].encode('utf-8')
+                    buf.extend(struct.pack('<B', len(trim_bytes))) # Write down the length
+                    buf.extend(trim_bytes)                         # Write the bytes themselves
+        elif opcode == 0x15: # BYTE_ENCODE
+            pass
+        elif opcode in (0x20, 0x22): # BPE_ENCODE, UNIGRAM_ENCODE
+            pass
+        elif opcode == 0x21: # WORDPIECE_ENCODE
+            marker_bytes = payload['marker'].encode('utf-8')
+            buf.extend(struct.pack('<B', len(marker_bytes)))
+            buf.extend(marker_bytes)
+        elif opcode == 0x30: # COMPOSE
+            template = payload.get('template', [])
+            buf.extend(struct.pack('<B', len(template)))
+            for item_type, value in template:
+                is_fixed = 1 if item_type == 'FIXED' else 0
+                buf.extend(struct.pack('<B', is_fixed))
+                if is_fixed:
+                    is_int = 1 if isinstance(value, int) else 0
+                    buf.extend(struct.pack('<B', is_int))
+                    if is_int:
+                        buf.extend(struct.pack('<i', value))
+                    else:
+                        val_bytes = value.encode('utf-8')
+                        buf.extend(struct.pack('<B', len(val_bytes)))
+                        buf.extend(val_bytes)
+        return bytes(buf)
+
+    @staticmethod
+    def _read_string_from_buffer(buffer, offset, length_size):
+        fmt = {1: '<B', 2: '<H'}[length_size]
+        str_len = struct.unpack(fmt, buffer[offset:offset+length_size])[0]
+        offset += length_size
+        value = buffer[offset:offset+str_len].decode('utf-8')
+        offset += str_len
+        return value, offset
+
+    @staticmethod
+    def _deserialize_payload_binary(opcode: int, p_bytes: bytes) -> Dict:
+        """Deserializes the payload from binary format back to Dict."""
+        payload = {}
+        offset = 0
+        if opcode == 0x02: # UNICODE_NORM
+            payload['form'], offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 1)
+        elif opcode == 0x03: # REPLACE
+            payload['pattern'], offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 2)
+            payload['val'], offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 2)
+        elif opcode == 0x04: # FILTER_CATEGORY
+            num_cats = struct.unpack('<B', p_bytes[offset:offset+1])[0]; offset += 1
+            cats = []
+            for _ in range(num_cats):
+                cat, offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 1)
+                cats.append(cat)
+            payload['cats'] = cats
+        elif opcode == 0x07: # PREPEND
+            payload['val'], offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 2)
+        elif opcode == 0x10: # PARTITION_RULES
+            num_rules = struct.unpack('<H', p_bytes[offset:offset+2])[0]; offset += 2
+            rules = []
+            behavior_map_rev = {1: 'REMOVE', 2: 'ISOLATE'}
+            for _ in range(num_rules):
+                rule = {}
+                flags = struct.unpack('<B', p_bytes[offset:offset+1])[0]; offset += 1
+                
+                rule['pattern'], offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 2)
+                if flags & 1: rule['protected'] = True
+                if flags & 2:
+                    behavior_code = struct.unpack('<B', p_bytes[offset:offset+1])[0]; offset += 1
+                    rule['behavior'] = behavior_map_rev.get(behavior_code)
+                if flags & 4:
+                    trim_len = struct.unpack('<B', p_bytes[offset:offset+1])[0]; offset += 1
+                    rule['trim_preceding_space'] = p_bytes[offset:offset+trim_len].decode('utf-8')
+                    offset += trim_len
+                rules.append(rule)
+            payload['rules'] = rules
+        elif opcode == 0x15: # BYTE_ENCODE
+             payload['pipeline'] = [{'type': 'BYTE_ENCODE'}]
+        elif opcode == 0x21: # WORDPIECE_ENCODE
+            payload['marker'], offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 1)
+        elif opcode == 0x30: # COMPOSE
+            num_items = struct.unpack('<B', p_bytes[offset:offset+1])[0]; offset += 1
+            template = []
+            for _ in range(num_items):
+                is_fixed = struct.unpack('<B', p_bytes[offset:offset+1])[0]; offset += 1
+                if is_fixed:
+                    is_int = struct.unpack('<B', p_bytes[offset:offset+1])[0]; offset += 1
+                    if is_int:
+                        value = struct.unpack('<i', p_bytes[offset:offset+4])[0]; offset += 4
+                    else:
+                        value, offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 1)
+                    template.append(('FIXED', value))
+                else:
+                    template.append(('SLOT', None))
+            payload['template'] = template
+        return payload
 
     @staticmethod
     def _prepare_resources(tok, state):
@@ -407,8 +565,12 @@ def disassemble_TISA_manifest(manifest_bytes: bytes) -> Dict[str, Any]:
     while offset < len(manifest_bytes):
         opcode = manifest_bytes[offset]; offset += 1
         p_len = struct.unpack("<I", manifest_bytes[offset:offset+4])[0]; offset += 4
+        
         payload_bytes = manifest_bytes[offset:offset+p_len]
-        payload = json.loads(payload_bytes.decode('utf-8')); offset += p_len
+
+        payload = TISACompiler._deserialize_payload_binary(opcode, payload_bytes)
+        offset += p_len
+
         op_name = OPCODE_NAMES.get(opcode, f"UNKNOWN_0x{opcode:02x}")
         op_key = f"0x{opcode:02x} ({op_name})"
         if op_key not in disassembled:

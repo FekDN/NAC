@@ -64,6 +64,41 @@ def im2col_indices(x, field_height, field_width, padding=1, stride=1):
 class NacKernelBase:
     def _enum_to_numpy_dtype(self, enum: Any) -> Any: return {0:np.float32, 1:np.float64, 2:np.float16, 4:np.int32, 5:np.int64, 6:np.int16, 7:np.int8, 8:np.uint8, 9:np.bool_}.get(enum)
 
+    def op_nac_conv2d_precomputed(self, x, precomputed_weight, bias, params):
+        """
+        Выполняет свертку, используя предвычисленные веса.
+        - x: неизвестный входной тензор.
+        - precomputed_weight: веса, уже преобразованные в матрицу (C_out, C_in * kH * kW).
+        - bias: тензор смещения (если есть).
+        - params: список всех остальных параметров в фиксированном порядке:
+                  [C_out, out_h, out_w, kH, kW, sH, sW, pH, pW, groups]
+        """
+        # Распаковываем параметры из списка
+        C_out, out_h, out_w, kH, kW, sH, sW, pH, pW, groups = params
+
+        if x.dtype != np.float32: x = x.astype(np.float32, copy=False)
+
+        N, C_in, H, W = x.shape
+
+        # im2col - это рантайм операция, так как она зависит от x
+        x_cols = im2col_indices(x, kH, kW, padding=pH, stride=sH)
+
+        # Главное матричное умножение - основная работа в рантайме
+        if groups == 1:
+            out_cols = precomputed_weight @ x_cols
+        else:
+            # Эта логика должна быть реализована, если у вас есть групповые свертки
+            raise NotImplementedError("Grouped precomputed convolution is not implemented yet.")
+
+        # Преобразование колонок обратно в формат изображения
+        out = out_cols.reshape(C_out, out_h, out_w, N).transpose(3, 0, 1, 2)
+
+        if bias is not None:
+            if bias.dtype != np.float32: bias = bias.astype(np.float32, copy=False)
+            out += bias.reshape(1, -1, 1, 1)
+
+        return out
+
     def op_getitem(self, t, i):
         return t[i]
 

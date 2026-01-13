@@ -44,7 +44,8 @@ class NacRuntime(NacKernelBase):
         A, B = struct.unpack('<BB', f.read(2))
         C, D = [], []
         op_name = self.id_to_canonical.get(A)
-        if A < 10:
+
+        if A < 10:  # Special (System) Operations
             nC, nD = self._infer_special_cd_lengths(A, B)
             if op_name == "<CONVERGENCE>":
                 num_elements_c, = struct.unpack('<h', f.read(2))
@@ -53,20 +54,25 @@ class NacRuntime(NacKernelBase):
                 C = list(struct.unpack(f'<{nC}h', f.read(nC * 2)))
             if nD > 0:
                 D = list(struct.unpack(f'<{nD}h', f.read(nD * 2)))
-        else:
+        else:  # Regular Operations (A >= 10)
             perm = self.permutations.get(B)
             if perm:
+                # Читаем C, если он ожидается
                 num_consts_in_perm = sum(1 for p in perm if self.CODE_TO_CATEGORY.get(p) == 'const')
                 if num_consts_in_perm > 0:
                     try:
                         num_consts_from_c, = struct.unpack('<h', f.read(2))
                         if num_consts_from_c > 0:
-                           C = [num_consts_from_c] + list(struct.unpack(f'<{num_consts_from_c}h', f.read(num_consts_from_c * 2)))
-                    except struct.error:
-                        # Handle case where C is expected but file ends
-                        pass
+                            C = [num_consts_from_c] + list(struct.unpack(f'<{num_consts_from_c}h', f.read(num_consts_from_c * 2)))
+                        else: C = [0]
+                    except struct.error: C = []
+                
+                # Читаем D, его длина равна длине пермутации
                 nD = len(perm)
-                if nD > 0: D = list(struct.unpack(f'<{nD}h', f.read(nD * 2)))
+                if nD > 0:
+                    try:
+                        D = list(struct.unpack(f'<{nD}h', f.read(nD * 2)))
+                    except struct.error: D = []
         return {'A': A, 'B': B, 'C': C, 'D': D}
 
     def encode(self, text: str) -> List[int]:
@@ -85,12 +91,7 @@ class NacRuntime(NacKernelBase):
     def _load_nac_file(self, nac_path: str):
         print(f"Loading NAC file (Robust Binary Format): {nac_path}")
         
-        self.id_to_canonical = {
-            2: "<INPUT>",
-            3: "<OUTPUT>",
-            6: "<CONTROL_FLOW>",
-            7: "<CONVERGENCE>",
-        }
+        self.id_to_canonical = { 2: "<INPUT>", 3: "<OUTPUT>", 6: "<CONTROL_FLOW>", 7: "<CONVERGENCE>",}
         self.id_to_canonical.update(NAC_OPS)
         
         self.constants, self.permutations, self.parameters = {}, {}, {}
@@ -99,118 +100,158 @@ class NacRuntime(NacKernelBase):
         self.tokenizer = None
         
         with open(nac_path, 'rb') as f:
-            # --- 1. Reading the Headline ---
+            # 1. Чтение и парсинг заголовка
             if f.read(3) != b'NAC': raise ValueError("'NAC' magic bytes not found.")
             version, raw_quant_id = struct.unpack('<BB', f.read(2))
             if version != 1: raise ValueError(f"Unsupported NAC version: {version}")
-            num_inputs, num_outputs, _ = struct.unpack('<HHB', f.read(5)); self.io_counts = (num_inputs, num_outputs)
+            
+            num_inputs, num_outputs, _ = struct.unpack('<HHB', f.read(5))
+            self.io_counts = (num_inputs, num_outputs)
+            
             self.weights_stored_internally = (raw_quant_id & 0x80) != 0
             quant_map = {0:'none', 1:'FP16', 2:'INT8_TENSOR', 3:'INT8_CHANNEL'}
             self.quantization_method = quant_map.get(raw_quant_id & 0x7F, 'unknown')
             
-            offsets_header_format = '<H9Q6x'
+            offsets_header_format = '<H9Q4x'
             header_bytes = f.read(struct.calcsize(offsets_header_format))
             self.d_model, *offsets = struct.unpack(offsets_header_format, header_bytes)
-            
-            mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, \
-            proc_off, meta_off, rsrc_off = offsets
+            mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, meta_off, rsrc_off = offsets
             
             print(f"NAC v{version}, d_model: {self.d_model}, Quant: '{self.quantization_method}', IO: {self.io_counts}, Weights: {'Internal' if self.weights_stored_internally else 'External'}")
-            
-            # --- 2. Reading the main sections ---
+
+            # 2. Загрузка метаданных (CMAP, CNST, PERM)
             if cmap_off > 0:
-                f.seek(cmap_off); f.read(4)
-                for _ in range(struct.unpack('<I', f.read(4))[0]):
+                f.seek(cmap_off); f.read(4) # Пропускаем тег
+                num_entries = struct.unpack('<I', f.read(4))[0]
+                for _ in range(num_entries):
                     op_id, name_len = struct.unpack('<HB', f.read(3))
-                    op_name = f.read(name_len).decode('utf-8')
-                    if op_id not in self.id_to_canonical:
-                        self.id_to_canonical[op_id] = op_name
-                    else:
-                        print(f"Warning: CMAP tried to override standard op ID {op_id} ('{op_name}'). Sticking with predefined '{self.id_to_canonical[op_id]}'.")
-
+                    self.id_to_canonical[op_id] = f.read(name_len).decode('utf-8')
+            
             if cnst_off > 0:
-                f.seek(cnst_off); f.read(4) # Go to CNST and skip the tag
-                num_consts = struct.unpack('<I', f.read(4))[0]
-                for _ in range(num_consts):
-                    const_id, type_code, length = struct.unpack('<HBH', f.read(5))
-                    
-                    val = None
-                    if type_code == 0: # null
-                        val = None
-                    elif type_code == 1: # bool
-                        val = struct.unpack('<?', f.read(length))[0]
-                    elif type_code == 2: # int
-                        val = struct.unpack('<q', f.read(length))[0]
-                    elif type_code == 3: # float
-                        val = struct.unpack('<d', f.read(length))[0]
-                    elif type_code == 4: # string
-                        val = f.read(length).decode('utf-8')
-                    elif type_code == 5: # list_int
-                        if length > 0:
-                            val = list(struct.unpack(f'<{length}i', f.read(length * 4)))
-                        else:
-                            val = []
-                    elif type_code == 6: # list_float
-                        if length > 0:
-                            val = list(struct.unpack(f'<{length}f', f.read(length * 4)))
-                        else:
-                            val = []
-                    
+                f.seek(cnst_off); f.read(4)
+                num_entries = struct.unpack('<I', f.read(4))[0]
+                for _ in range(num_entries):
+                    const_id, type_code, length = struct.unpack('<HBH', f.read(5)); val = None
+                    if type_code == 1: val = struct.unpack('<?', f.read(length))[0]
+                    elif type_code == 2: val = struct.unpack('<q', f.read(length))[0]
+                    elif type_code == 3: val = struct.unpack('<d', f.read(length))[0]
+                    elif type_code == 4: val = f.read(length).decode('utf-8')
+                    elif type_code == 5: val = list(struct.unpack(f'<{length}i', f.read(length * 4))) if length > 0 else []
+                    elif type_code == 6: val = list(struct.unpack(f'<{length}f', f.read(length * 4))) if length > 0 else []
                     self.constants[const_id] = val
-
+            
             if perm_off > 0:
                 f.seek(perm_off); f.read(4)
-                for _ in range(struct.unpack('<I', f.read(4))[0]):
+                num_entries = struct.unpack('<I', f.read(4))[0]
+                for _ in range(num_entries):
                     p_id, p_len = struct.unpack('<HB', f.read(3))
                     self.permutations[p_id] = tuple(f.read(p_len).decode('utf-8'))
-
+            
             if ops_off > 0:
                 f.seek(ops_off); f.read(4)
-                self.operations = [self._read_op(f) for _ in range(struct.unpack('<I', f.read(4))[0])]
-            
+                num_ops = struct.unpack('<I', f.read(4))[0]
+                self.operations = [self._read_op(f) for _ in range(num_ops)]
+
+            # 3. Загрузка данных (DATA)
             if data_off > 0:
                 f.seek(data_off); f.read(4)
-                for _ in range(struct.unpack('<I', f.read(4))[0]):
+                # Чтение сопоставлений имен
+                num_params = struct.unpack('<I', f.read(4))[0]
+                for _ in range(num_params):
                     p_id, name_len = struct.unpack('<HH', f.read(4))
                     self.param_id_to_name[p_id] = f.read(name_len).decode('utf-8')
-                for _ in range(struct.unpack('<I', f.read(4))[0]):
+                
+                num_inputs = struct.unpack('<I', f.read(4))[0]
+                for _ in range(num_inputs):
                     i_idx, name_len = struct.unpack('<HH', f.read(4))
                     self.input_node_idx_to_name[i_idx] = f.read(name_len).decode('utf-8')
+                
+                # Загрузка тензоров весов
                 if self.weights_stored_internally:
-                    current_pos = f.tell()
-                    f.seek(0, 2)
-                    end_pos = f.tell()
-                    f.seek(current_pos)
-                    if current_pos < end_pos:
-                        numpy_dtype_map = {0:np.float32, 1:np.float64, 2:np.float16, 3:np.byte, 4:np.int32, 5:np.int64, 6:np.int16, 7:np.int8, 8:np.uint8, 9:np.bool_}
+                    num_tensors = struct.unpack('<I', f.read(4))[0]
+                    numpy_dtype_map = {0:np.float32, 1:np.float64, 2:np.float16, 3:"<bf16>", 4:np.int32, 5:np.int64, 6:np.int16, 7:np.int8, 8:np.uint8, 9:np.bool_}
+                    quant_code_to_str = {0: 'none', 1: 'INT8_TENSOR', 2: 'INT8_CHANNEL'}
+
+                    for _ in range(num_tensors):
+                        p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14))
+                        meta_bytes = f.read(meta_len)
+                        data_bytes = f.read(data_len)
                         
-                        num_tensors = struct.unpack('<I', f.read(4))[0]
-                        for _ in range(num_tensors):
-                            p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14))
-                            meta_bytes = f.read(meta_len)
-                            meta = json.loads(meta_bytes.decode('utf-8'))
-                            data_bytes = f.read(data_len)
-                            dtype_id = meta.get('dtype')
-                            dtype = numpy_dtype_map.get(dtype_id) if dtype_id is not None else np.float32
-                            
-                            if dtype == np.byte and meta.get('true_dtype') == 'bfloat16':
-                                arr = np.frombuffer(data_bytes, dtype=np.uint16).view(np.float32)
-                            else:
-                                arr = np.frombuffer(data_bytes, dtype=dtype).reshape(meta['shape']).copy()
-                            
-                            self.parameters[p_id] = self._dequantize(arr, meta)
-                else:
+                        # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ДЕСЕРИАЛИЗАЦИИ МЕТАДАННЫХ ---
+                        meta_offset = 0
+                        meta = {}
+                        
+                        # 1. Dtype and Rank
+                        dtype_id, rank = struct.unpack_from('<BB', meta_bytes, meta_offset)
+                        meta_offset += 2
+                        
+                        # 2. Shape
+                        shape = []
+                        if rank > 0:
+                            shape = list(struct.unpack_from(f'<{rank}I', meta_bytes, meta_offset))
+                            meta_offset += rank * 4
+                        meta['shape'] = shape
+                        
+                        # 3. Quantization Info
+                        quant_type_code, = struct.unpack_from('<B', meta_bytes, meta_offset)
+                        meta_offset += 1
+                        quant_type_str = quant_code_to_str.get(quant_type_code, 'none')
+                        meta['quant_type'] = quant_type_str
+
+                        if quant_type_str == 'INT8_TENSOR':
+                            scale, = struct.unpack_from('<f', meta_bytes, meta_offset)
+                            meta_offset += 4
+                            meta['scale'] = scale
+                        elif quant_type_str == 'INT8_CHANNEL':
+                            axis, num_scales = struct.unpack_from('<BI', meta_bytes, meta_offset)
+                            meta_offset += 5
+                            scales = list(struct.unpack_from(f'<{num_scales}f', meta_bytes, meta_offset))
+                            meta['axis'], meta['scales'] = axis, scales
+                        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+                        
+                        dtype = numpy_dtype_map.get(dtype_id, np.float32)
+                        if dtype == "<bf16>":
+                            u16_arr = np.frombuffer(data_bytes, dtype=np.uint16).reshape(shape)
+                            arr = (u16_arr.astype(np.uint32) << 16).view(np.float32).copy()
+                        else:
+                            arr = np.frombuffer(data_bytes, dtype=dtype).reshape(shape).copy()
+                        
+                        self.parameters[p_id] = self._dequantize(arr, meta)
+                else: # Загрузка из внешнего файла .safetensors
+                    # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ЗАГРУЗКИ ВНЕШНИХ ВЕСОВ ---
                     safetensors_path = os.path.splitext(nac_path)[0] + '.safetensors'
                     if not os.path.exists(safetensors_path): raise FileNotFoundError(f"External weights file not found: {safetensors_path}")
-                    tensors = load_file(safetensors_path)
+                    
+                    from safetensors import safe_open
+                    
+                    tensors = {}
+                    per_tensor_metadata = {}
+                    with safe_open(safetensors_path, framework="np", device="cpu") as st_f:
+                        # 1. Загружаем общие метаданные файла
+                        file_metadata = st_f.metadata() or {}
+                        # 2. Извлекаем поле 'metadata', где хранятся метаданные для каждого тензора
+                        if "metadata" in file_metadata:
+                            # Это строка, содержащая JSON-словарь, где ключ - имя тензора,
+                            # а значение - ЕЩЕ ОДНА СТРОКА JSON с метаданными этого тензора.
+                            metadata_of_metadata = json.loads(file_metadata["metadata"])
+                            for tensor_name, meta_json_str in metadata_of_metadata.items():
+                                per_tensor_metadata[tensor_name] = json.loads(meta_json_str)
+
+                        # 3. Загружаем сами тензоры
+                        for key in st_f.keys():
+                            tensors[key] = st_f.get_tensor(key)
+
+                    # 4. Сопоставляем тензоры, их метаданные и деквантуем
                     for p_id, p_name in self.param_id_to_name.items():
-                        if p_name in tensors: self.parameters[p_id] = self._dequantize(tensors[p_name], {})
+                        if p_name in tensors:
+                            meta = per_tensor_metadata.get(p_name, {}) # Получаем словарь метаданных для этого тензора
+                            self.parameters[p_id] = self._dequantize(tensors[p_name], meta)
+                    # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
             
-            # --- 3. Loading tokenizer resources ---
+            # 4. Загрузка ресурсов токенизатора (RSRC)
             tokenizer_resources_raw = {}
-            if rsrc_off > 0: # Option A: Resources inside .nac
-                f.seek(rsrc_off)
-                if f.read(4) != b'RSRC': raise IOError("RSRC section marker mismatch.")
+            if rsrc_off > 0: # Ресурсы внутри .nac
+                f.seek(rsrc_off); f.read(4)
                 num_files = struct.unpack('<I', f.read(4))[0]
                 print(f"Reading {num_files} internal resource files from RSRC section...")
                 for _ in range(num_files):
@@ -218,7 +259,7 @@ class NacRuntime(NacKernelBase):
                     filename = f.read(name_len).decode('utf-8')
                     data_len = struct.unpack('<I', f.read(4))[0]
                     tokenizer_resources_raw[filename] = f.read(data_len)
-            else: # Option B: Resources from the outside
+            else: # Ресурсы снаружи
                 tokenizer_dir = os.path.splitext(nac_path)[0] + "-tokenizer"
                 if os.path.exists(tokenizer_dir):
                     print(f"Reading external tokenizer resources from: {tokenizer_dir}")
@@ -228,39 +269,56 @@ class NacRuntime(NacKernelBase):
                             with open(fpath, 'rb') as rf: 
                                 tokenizer_resources_raw[fname] = rf.read()
 
-            # --- 4. Initializing TISAVM (if there is a manifest) ---
+            # 5. Инициализация TISAVM на основе манифеста (PROC) и ресурсов
             if proc_off > 0:
-                f.seek(proc_off)
-                if f.read(4) != b'PROC': raise IOError("PROC section marker mismatch.")
+                f.seek(proc_off); f.read(4)
                 manifest_bytes = f.read(struct.unpack('<I', f.read(4))[0])
-                
-                # Preparing VM resources from raw binary data
-                vm_resources = {}
-                
-                # Search only for standardized file names
-                if "vm_vocab.json" in tokenizer_resources_raw:
-                    vm_resources['vocab'] = json.loads(tokenizer_resources_raw["vm_vocab.json"].decode('utf-8'))
-                
-                if "vm_merges.txt" in tokenizer_resources_raw:
-                    merges_content = tokenizer_resources_raw["vm_merges.txt"].decode('utf-8')
-                    merges_lines = merges_content.splitlines()
-                    if merges_lines and (merges_lines[0].startswith("#")): merges_lines = merges_lines[1:]
-                    vm_resources['ranks'] = {tuple(line.split()): i for i, line in enumerate(merges_lines)}
 
-                if 'vocab' in vm_resources and vm_resources['vocab']:
+                vm_resources = {}
+                print("Processing tokenizer resources for TISAVM...")
+
+                tok_json = None
+                if "tokenizer.json" in tokenizer_resources_raw:
+                    try: tok_json = json.loads(tokenizer_resources_raw["tokenizer.json"].decode('utf-8'))
+                    except json.JSONDecodeError: print("  - WARNING: Could not parse 'tokenizer.json'.")
+                
+                if tok_json and tok_json.get('model', {}).get('type') == 'Unigram':
+                    unigram_vocab_list = tok_json.get('model', {}).get('vocab', [])
+                    vm_resources['vocab'] = {token: i for i, (token, score) in enumerate(unigram_vocab_list)}
+                    vm_resources['unigram_scores'] = {token: score for token, score in unigram_vocab_list}
+                    print("  - Vocab and Unigram scores loaded from 'tokenizer.json'.")
+                elif tok_json and 'vocab' in tok_json.get('model', {}):
+                    vm_resources['vocab'] = tok_json.get('model', {}).get('vocab')
+                    print("  - Vocab loaded from 'tokenizer.json'.")
+                elif "vocab.json" in tokenizer_resources_raw:
+                    vm_resources['vocab'] = json.loads(tokenizer_resources_raw["vocab.json"].decode('utf-8'))
+                    print("  - Vocab loaded from 'vocab.json'.")
+                else: print("  - WARNING: No vocab file found ('tokenizer.json' or 'vocab.json').")
+
+                if tok_json and "merges" in tok_json.get("model", {}):
+                    merges_lines = tok_json["model"]["merges"]
+                    vm_resources['ranks'] = {tuple(line.split()): i for i, line in enumerate(merges_lines)}
+                    print("  - Merges loaded from 'tokenizer.json'.")
+                elif "merges.txt" in tokenizer_resources_raw:
+                    merges_content = tokenizer_resources_raw["merges.txt"].decode('utf-8')
+                    merges_lines = [line for line in merges_content.splitlines() if line and not line.startswith("#")]
+                    vm_resources['ranks'] = {tuple(line.split()): i for i, line in enumerate(merges_lines)}
+                    print("  - Merges loaded from 'merges.txt'.")
+
+                if vm_resources.get('vocab'):
                     bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
                     cs = bs[:]; n = 0
                     for b in range(256):
                         if b not in bs: bs.append(b); cs.append(256 + n); n += 1
                     vm_resources['byte_map'] = dict(zip(bs, [chr(c) for c in cs]))
+                    
                     vm_resources.setdefault('ranks', {})
                     vm_resources.setdefault('unigram_scores', {})
 
                     self.tokenizer = TISAVM(vm_resources)
                     self.tokenizer.manifest = manifest_bytes
                     print("TISAVM initialized successfully.")
-                else:
-                    print("Warning: Tokenizer manifest found, but vocab/resource files are missing or empty.")
+                else: print("Warning: Tokenizer manifest found, but vocab/resource files are missing or empty.")
             
             print(f"Loaded {len(self.operations)} ops and {len(self.parameters)} parameters.")
 
@@ -417,24 +475,28 @@ class NacRuntime(NacKernelBase):
 
     def _gather_args(self, op: Dict[str, Any], current_idx: int) -> List[Any]:
         args = []
-        # Get a list of constant IDs, excluding the first element (the counter)
+        perm = self.permutations.get(op.get('B'))
+        if not perm: return []
+
         c_ids = op['C'][1:] if op.get('C') and op['C'][0] > 0 else []
         c_iter = iter(c_ids)
-    
-        # Field D is a catch-all list of sources for all arguments.
-        # Iterate on it, it is the only source of truth.
-        for d_val in op.get('D', []):
+        d_values = op.get('D', [])
+
+        if len(d_values) != len(perm):
+             # Эта проверка теперь должна проходить успешно
+             raise ValueError(f"Instruction {current_idx}: Mismatch between perm length ({len(perm)}) and D field length ({len(d_values)}).")
+
+        for i in range(len(perm)):
+            d_val = d_values[i]
             if d_val != 0:
-                # A non-zero value is a relative offset to the previous instruction.
                 ancestor_idx = current_idx + d_val
                 args.append(self.results[ancestor_idx])
             else:
-                # The zero value is a marker indicating that the next constant ID from the C list should be taken.
                 try:
                     const_id = next(c_iter)
                     args.append(self.constants.get(const_id))
                 except StopIteration:
-                    args.append(None)
+                    raise ValueError(f"Instruction {current_idx}: D field expects a constant, but C field is exhausted.")
         return args
 
     def _gather_args1(self, op: Dict[str, Any], current_idx: int) -> List[Any]:
@@ -453,4 +515,3 @@ class NacRuntime(NacKernelBase):
                 try: args.append(self.constants.get(next(c_iter)))
                 except StopIteration: args.append(None)
         return args
-

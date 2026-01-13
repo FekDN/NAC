@@ -89,7 +89,7 @@ class ResultManager:
                 f.write(struct.pack('<B', quant_id))
                 f.write(struct.pack('<HHB', io_counts[0], io_counts[1], 0))
                 
-                offsets_header_format = '<H9Q6x' 
+                offsets_header_format = '<H9Q4x' 
                 f.write(b'\0' * struct.calcsize(offsets_header_format)) 
                 
                 offsets = {}
@@ -182,13 +182,60 @@ class ResultManager:
                     f.write(struct.pack('<I', len(param_data)))
                     for p_id, data_tuple in param_data.items():
                         tensor, meta = (data_tuple, {}) if isinstance(data_tuple, torch.Tensor) else data_tuple
-                        meta['shape'] = list(tensor.shape)
-                        meta['dtype'] = self._map_dtype_to_enum(tensor.dtype)
-                        meta_binary = json.dumps(meta, separators=(',', ':')).encode('utf-8')
+                        
+                        # --- START: New Pure Binary Metadata Serialization ---
+                        # This block replaces the previous JSON-based metadata serialization.
+                        # The format is designed for easy parsing on low-memory devices.
+                        #
+                        # C-like struct for the metadata block:
+                        # struct TensorMeta {
+                        #     uint8_t  dtype;             // Dtype enum (0-9 from _map_dtype_to_enum)
+                        #     uint8_t  rank;              // Number of dimensions (e.g., 2 for a matrix)
+                        #     uint32_t dims[rank];        // Array of dimensions (shape)
+                        #     uint8_t  quant_type;        // 0:none, 1:INT8_TENSOR, 2:INT8_CHANNEL
+                        #     // Depending on quant_type, the following fields are present:
+                        #     // if quant_type == 1:
+                        #     //     float scale;
+                        #     // if quant_type == 2:
+                        #     //     uint8_t  axis;
+                        #     //     uint32_t num_scales;
+                        #     //     float    scales[num_scales];
+                        # };
+                        
+                        meta_binary = b''
+                        # 1. Dtype and Rank
+                        dtype_enum = self._map_dtype_to_enum(tensor.dtype)
+                        shape = list(tensor.shape)
+                        rank = len(shape)
+                        meta_binary += struct.pack('<BB', dtype_enum, rank)
+                        
+                        # 2. Dimensions (Shape)
+                        if rank > 0:
+                            meta_binary += struct.pack(f'<{rank}I', *shape)
+                            
+                        # 3. Quantization Info
+                        quant_type_str = meta.get('quant_type', 'none')
+                        quant_type_map = {'none': 0, 'INT8_TENSOR': 1, 'INT8_CHANNEL': 2}
+                        quant_type_code = quant_type_map.get(quant_type_str, 0)
+                        meta_binary += struct.pack('<B', quant_type_code)
+
+                        if quant_type_code == 1: # INT8_TENSOR
+                            scale = meta['scale']
+                            meta_binary += struct.pack('<f', scale)
+                        elif quant_type_code == 2: # INT8_CHANNEL
+                            axis = meta['axis']
+                            scales = meta['scales']
+                            num_scales = len(scales)
+                            meta_binary += struct.pack('<BI', axis, num_scales)
+                            meta_binary += struct.pack(f'<{num_scales}f', *scales)
+
                         data_bytes = tensor.numpy(force=True).tobytes()
+
                         f.write(struct.pack('<HIQ', p_id, len(meta_binary), len(data_bytes)))
                         f.write(meta_binary)
                         f.write(data_bytes)
+                        # --- END: New Pure Binary Metadata Serialization ---
+
                 else:
                     safetensors_path = os.path.join(self.output_path, f"{model_name}.safetensors")
                     tensors_to_save, metadata_to_save = {}, {}
@@ -197,7 +244,8 @@ class ResultManager:
                         if not name: continue
                         tensor, meta = (data_tuple, None) if isinstance(data_tuple, torch.Tensor) else data_tuple
                         tensors_to_save[name] = tensor
-                        if meta: metadata_to_save[name] = json.dumps(meta)
+                        # safetensors metadata is still JSON, but it's in a separate file, which is fine.
+                        if meta: metadata_to_save[name] = json.dumps(meta) 
                     save_file(tensors_to_save, safetensors_path, metadata=metadata_to_save)
                     print(f"Weights saved to {safetensors_path}")
 
@@ -486,25 +534,39 @@ class ModelProcessor:
                 if node in self.data_input_nodes: B = 0; self.input_node_idx_to_name[i] = node.target
                 elif node in self.param_nodes: B = 1; C = [1, self.param_to_id.get(node.target, 0)]
                 elif node in self.lifted_const_nodes: B = 3; C = [1, ModelProcessor.const_to_id.get(self._get_hashable_const(self.lifted_const_nodes[node]), 0)]
+            
             elif sig == "<OUTPUT>":
                 B = 0
                 arg_details = self._get_argument_details(node)
-                num_outputs = self.io_counts[1]
-                C = [num_outputs] + [0] * num_outputs
-                D = [self.global_node_map[arg_node] - i for _, _, arg_node in arg_details]
+                D = [self.global_node_map.get(arg_node) - i for _, _, arg_node in arg_details if arg_node]
+                num_outputs = len(D)
+                self.io_counts = (self.io_counts[0], num_outputs)
+                C = [num_outputs] + ([0] * num_outputs)
+
             elif node.op == 'call_function':
                 arg_details = self._get_canonical_argument_details(node)
+                parts = tuple(code for code, _, _ in arg_details)
                 
-                parts = [code for code, _, _ in arg_details]
-                consts = [self._get_hashable_const(val) for _, val, arg_node in arg_details if arg_node is None]
-                arg_nodes = [arg_node for _, _, arg_node in arg_details]
-
-                perm_tuple = tuple(parts)
-                if perm_tuple:
-                    B = self.perm_tuple_to_id.get(perm_tuple, 0)
+                if parts:
+                    B = self.perm_tuple_to_id.get(parts, 0)
+                    
+                    # --- ИСПРАВЛЕННАЯ ЛОГИКА СОЗДАНИЯ C и D ---
+                    
+                    # 1. Собираем ID только для констант
+                    consts = [self._get_hashable_const(val) for _, val, arg_node in arg_details if arg_node is None]
                     const_ids = [ModelProcessor.const_to_id.get(c, 0) for c in consts]
-                    if const_ids: C = [len(const_ids)] + const_ids
-                    D = [(self.global_node_map.get(arg_node, -1) - i) if arg_node else 0 for arg_node in arg_nodes]
+                    if const_ids:
+                        C = [len(const_ids)] + const_ids
+                    
+                    # 2. Собираем поле D, которое соответствует пермутации.
+                    #    Вставляем смещение для тензора или 0 для константы.
+                    D = []
+                    for _, _, arg_node in arg_details:
+                        if arg_node is not None:
+                            D.append(self.global_node_map.get(arg_node, -1) - i)
+                        else:
+                            D.append(0)
+                    # --- КОНЕЦ ИСПРАВЛЕННОЙ ЛОГИКИ ---
 
             nodes.append({'A': A, 'B': B, 'C': C, 'D': D})
         return nodes
@@ -670,30 +732,39 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
             from transformers import AutoTokenizer
             hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo)
             
-            # 1. Extract vocab (always needed)
-            vocab = hf_tokenizer.get_vocab()
-            tokenizer_resources['vm_vocab.json'] = json.dumps(vocab, ensure_ascii=False).encode('utf-8')
-            print("  - Extracted vocab.")
+            # List of standard files that we will try to pack "as is"
+            files_to_pack = [
+                "tokenizer.json",
+                "vocab.json",
+                "merges.txt",
+                "spiece.model",
+                "special_tokens_map.json",
+                "tokenizer_config.json"
+            ]
+            
+            print("  - Attempting to pack original resource files...")
+            for filename in files_to_pack:
+                try:
+                    # Downloading a file from the repository
+                    downloaded_path = hf_hub_download(repo_id=tokenizer_repo, filename=filename)
+                    # Read it as binary data and save it to resources.
+                    with open(downloaded_path, 'rb') as f:
+                        tokenizer_resources[filename] = f.read()
+                    print(f"    - Packed '{filename}' successfully.")
+                except Exception:
+                    # It's okay if the file doesn't exist (for example, WordPiece doesn't have merges.txt)
+                    pass
 
-            # 2. Attempting to download merges.txt (for BPE tokenizers)
-            try:
-                merges_path = hf_hub_download(repo_id=tokenizer_repo, filename="merges.txt")
-                with open(merges_path, 'rb') as f:
-                    tokenizer_resources['vm_merges.txt'] = f.read()
-                print("  - Extracted merges.txt.")
-            except Exception:
-                pass
+            # Important fallback: if vocab.json isn't found, generate it from get_vocab() so we always have a dictionary.
+            if "vocab.json" not in tokenizer_resources:
+                print("  - 'vocab.json' not found. Generating from tokenizer object as a fallback.")
+                vocab = hf_tokenizer.get_vocab()
+                # Sort the vocab by token ID for deterministic output. This is good practice.
+                sorted_vocab = {k: v for k, v in sorted(vocab.items(), key=lambda item: item[1])}
+                tokenizer_resources['vocab.json'] = json.dumps(sorted_vocab, ensure_ascii=False).encode('utf-8')
 
-            # 3. Attempting to download spiece.model (for SentencePiece)
-            try:
-                spiece_path = hf_hub_download(repo_id=tokenizer_repo, filename="spiece.model")
-                with open(spiece_path, 'rb') as f:
-                    tokenizer_resources['vm_spiece.model'] = f.read()
-                print("  - Extracted spiece.model.")
-            except Exception:
-                 pass
 
-            print(f"Extracted {len(tokenizer_resources)} core resource files.")
+            print(f"  - Extracted {len(tokenizer_resources)} total resource files.")
 
             # If store resources externally, we save them to disk
             if not store_weights_internally:
@@ -744,13 +815,13 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
     if tokenizer_repo:
         print(f"\n--- Compiling the tokenizer from '{tokenizer_repo}' ---")
         try:
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo)
+            if 'hf_tokenizer' not in locals():
+                 hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo)
             if tokenizer_input == 'none':
                 probe_text = "This is a probe text."
             else:
                 probe_text = tokenizer_input
-            tokenizer_manifest_bytes = TISACompiler.compile_and_calibrate(tokenizer, probe_text)
+            tokenizer_manifest_bytes = TISACompiler.compile_and_calibrate(hf_tokenizer, probe_text)
             print(f"The tokenizer was successfully compiled into a {len(tokenizer_manifest_bytes)}-byte TISA manifest.")
         except Exception as e:
             print(f"!!!!! WARNING: Failed to compile tokenizer for '{tokenizer_repo}'. Error: {e}")
