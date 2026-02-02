@@ -1,5 +1,4 @@
-// CYD28_SD.cpp
-// Облегченная версия для чтения NAC-моделей
+// Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 #include "CYD28_SD.h"
 
