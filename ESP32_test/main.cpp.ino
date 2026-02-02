@@ -1,6 +1,5 @@
-// =========================================================================
-// 1. Библиотеки и заголовочные файлы
-// =========================================================================
+// Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
+
 #include <Arduino.h>
 #include "TFT_eSPI_Compat.h"
 #include "CYD28_TouchscreenR.h"
