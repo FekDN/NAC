@@ -38,12 +38,12 @@ def process_sd_unet_vae():
     dummy_latent = torch.randn(2, 4, latent_res, latent_res) 
     dummy_text_embed = torch.randn(2, 77, 768)
     dummy_timestep = torch.tensor([999, 999], dtype=torch.float32)
-    generate_artifacts(model_name="sd-unet-256", model=UNetWrapper(pipe.unet.eval()), dummy_args=(dummy_latent, dummy_timestep, dummy_text_embed), quantization_method='INT8_TENSOR', optimize=True)
+    generate_artifacts(model_name="sd-unet-256", model=UNetWrapper(pipe.unet.eval()), dummy_args=(dummy_latent, dummy_timestep, dummy_text_embed), quantization_method='BLOCK_FP8', optimize=True)
     class VAEDecoderWrapper(torch.nn.Module):
         def __init__(self, vae): super().__init__(); self.vae = vae
         def forward(self, latents): return self.vae.decode(latents, return_dict=False)[0]
     dummy_vae_latent = torch.randn(1, 4, latent_res, latent_res)
-    generate_artifacts(model_name="sd-vae-decoder-256", model=VAEDecoderWrapper(pipe.vae.eval()), dummy_args=(dummy_vae_latent,), quantization_method='INT8_TENSOR', optimize=True)
+    generate_artifacts(model_name="sd-vae-decoder-256", model=VAEDecoderWrapper(pipe.vae.eval()), dummy_args=(dummy_vae_latent,), quantization_method='BLOCK_FP8', optimize=True)
 
 def process_roberta_base():
     print("\n" + "#"*20 + " PROCESSING ROBERTA-BASE " + "#"*20)
@@ -65,7 +65,7 @@ def process_roberta_base():
     dummy_args = (inputs['input_ids'], inputs['attention_mask'])
     seq_dim = torch.export.Dim("sequence", min=1, max=model.config.max_position_embeddings - 2)
     dynamic_shapes = {"input_ids": {1: seq_dim}, "attention_mask": {1: seq_dim}}
-    generate_artifacts(model_name="roberta-base-fill-mask", model=RobertaCleanedWrapper(model), dummy_args=dummy_args, quantization_method='INT8_TENSOR', dynamic_shapes=dynamic_shapes, tokenizer_repo=repo, optimize=True, tokenizer_input=tokenizer_input)
+    generate_artifacts(model_name="roberta-base-fill-mask", model=RobertaCleanedWrapper(model), dummy_args=dummy_args, quantization_method='BLOCK_FP8', dynamic_shapes=dynamic_shapes, tokenizer_repo=repo, optimize=True, tokenizer_input=tokenizer_input)
 
 class Gpt2LogitsWrapper(torch.nn.Module):
     def __init__(self, model):
@@ -87,7 +87,7 @@ def process_gpt2():
         model_name="gpt2-text-generation",
         model=Gpt2LogitsWrapper(model),
         dummy_args=(dummy_input_ids, dummy_mask),
-        quantization_method='INT8_TENSOR',
+        quantization_method='BLOCK_FP8',
         optimize=True,
         tokenizer_repo="gpt2"
     )
@@ -127,7 +127,7 @@ def process_distilbert_sentiment():
         model_name="distilbert-sst2-sentiment",
         model=DistilBertLogitsWrapper(model),
         dummy_args=dummy_args,
-        quantization_method='INT8_TENSOR',
+        quantization_method='BLOCK_FP8',
         tokenizer_repo=repo,
         store_weights_internally=True,
         optimize=True,
@@ -184,7 +184,7 @@ def process_t5_translation():
         model_name="t5-encoder",
         model=clean_encoder_wrapper,
         dummy_args=(dummy_input_ids, dummy_attention_mask, dummy_bias),
-        quantization_method='INT8_TENSOR',
+        quantization_method='BLOCK_FP8',
         tokenizer_repo=repo,
         optimize=True,
         dynamic_shapes=dynamic_shapes_encoder
@@ -209,7 +209,7 @@ def process_t5_translation():
         model_name="t5-decoder",
         model=T5DecoderWrapper(model),
         dummy_args=(dummy_decoder_input_ids, dummy_encoder_hidden_states, dummy_encoder_attention_mask),
-        quantization_method='INT8_TENSOR',
+        quantization_method='BLOCK_FP8',
         tokenizer_repo=repo,
         optimize=True,
         dynamic_shapes=dynamic_shapes_decoder
@@ -222,7 +222,7 @@ def process_resnet18():
         model_name="resnet18",
         model=models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1).eval(),
         dummy_args=(torch.randn(1, 3, 224, 224),),
-        quantization_method='INT8_TENSOR',
+        quantization_method='BLOCK_FP8',
         optimize = True
     )
 
