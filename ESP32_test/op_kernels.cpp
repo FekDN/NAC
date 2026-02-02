@@ -1,4 +1,4 @@
-// op_kernels.cpp
+// Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 #include "op_kernels.h"
 #include <cmath>
@@ -1213,4 +1213,5 @@ void register_kernels() {
     g_kernel_string_map["aten.adaptive_avg_pool2d.default"] = &op_aten_adaptive_avg_pool2d_default;
 
     Serial.printf("[KERNELS] Registered %d custom kernels by name for dynamic mapping.\n", g_kernel_string_map.size());
+
 }
