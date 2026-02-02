@@ -83,7 +83,7 @@ class ResultManager:
             with open(filepath, 'wb') as f:
                 # --- HEADER ---
                 f.write(b'NAC\x01')
-                quant_map = {'none':0, 'FP16':1, 'INT8_TENSOR':2, 'INT8_CHANNEL':3}
+                quant_map = {'none': 0, 'FP16': 1, 'INT8_TENSOR': 2, 'INT8_CHANNEL': 3, 'BLOCK_FP8': 4}
                 quant_id = quant_map.get(quant_method, 0)
                 if store_weights_internally: quant_id |= 0x80
                 f.write(struct.pack('<B', quant_id))
@@ -183,25 +183,6 @@ class ResultManager:
                     for p_id, data_tuple in param_data.items():
                         tensor, meta = (data_tuple, {}) if isinstance(data_tuple, torch.Tensor) else data_tuple
                         
-                        # --- START: New Pure Binary Metadata Serialization ---
-                        # This block replaces the previous JSON-based metadata serialization.
-                        # The format is designed for easy parsing on low-memory devices.
-                        #
-                        # C-like struct for the metadata block:
-                        # struct TensorMeta {
-                        #     uint8_t  dtype;             // Dtype enum (0-9 from _map_dtype_to_enum)
-                        #     uint8_t  rank;              // Number of dimensions (e.g., 2 for a matrix)
-                        #     uint32_t dims[rank];        // Array of dimensions (shape)
-                        #     uint8_t  quant_type;        // 0:none, 1:INT8_TENSOR, 2:INT8_CHANNEL
-                        #     // Depending on quant_type, the following fields are present:
-                        #     // if quant_type == 1:
-                        #     //     float scale;
-                        #     // if quant_type == 2:
-                        #     //     uint8_t  axis;
-                        #     //     uint32_t num_scales;
-                        #     //     float    scales[num_scales];
-                        # };
-                        
                         meta_binary = b''
                         # 1. Dtype and Rank
                         dtype_enum = self._map_dtype_to_enum(tensor.dtype)
@@ -215,26 +196,40 @@ class ResultManager:
                             
                         # 3. Quantization Info
                         quant_type_str = meta.get('quant_type', 'none')
-                        quant_type_map = {'none': 0, 'INT8_TENSOR': 1, 'INT8_CHANNEL': 2}
+                        quant_type_map = {'none': 0, 'FP16': 1, 'INT8_TENSOR': 2, 'INT8_CHANNEL': 3, 'BLOCK_FP8': 4}
                         quant_type_code = quant_type_map.get(quant_type_str, 0)
                         meta_binary += struct.pack('<B', quant_type_code)
 
-                        if quant_type_code == 1: # INT8_TENSOR
+                        if quant_type_code == 2: # INT8_TENSOR
                             scale = meta['scale']
                             meta_binary += struct.pack('<f', scale)
-                        elif quant_type_code == 2: # INT8_CHANNEL
+                        elif quant_type_code == 3: # INT8_CHANNEL
                             axis = meta['axis']
                             scales = meta['scales']
+                            if isinstance(scales, (float, int)):
+                                scales = [float(scales)]
                             num_scales = len(scales)
                             meta_binary += struct.pack('<BI', axis, num_scales)
+                            meta_binary += struct.pack(f'<{num_scales}f', *scales)
+                        elif quant_type_code == 4: # BLOCK_FP8
+                            original_shape = meta['original_shape']
+                            original_rank = len(original_shape)
+                            scales = meta['scales']
+                            # Защита от scalar
+                            if isinstance(scales, (float, int)):
+                                scales = [float(scales)]
+                            num_scales = len(scales)
+                            meta_binary += struct.pack('<HB', meta.get('block_size', 64), original_rank)
+                            if original_rank > 0:
+                                meta_binary += struct.pack(f'<{original_rank}I', *original_shape)
+                            meta_binary += struct.pack('<I', num_scales)
                             meta_binary += struct.pack(f'<{num_scales}f', *scales)
 
                         data_bytes = tensor.numpy(force=True).tobytes()
 
-                        f.write(struct.pack('<HIQ', p_id, len(meta_binary), len(data_bytes)))
+                        f.write(struct.pack('<HIQ', p_id, len(meta_binary), len(data_bytes))) #'<HHQ', ...)  # uint16
                         f.write(meta_binary)
                         f.write(data_bytes)
-                        # --- END: New Pure Binary Metadata Serialization ---
 
                 else:
                     safetensors_path = os.path.join(self.output_path, f"{model_name}.safetensors")
@@ -244,7 +239,6 @@ class ResultManager:
                         if not name: continue
                         tensor, meta = (data_tuple, None) if isinstance(data_tuple, torch.Tensor) else data_tuple
                         tensors_to_save[name] = tensor
-                        # safetensors metadata is still JSON, but it's in a separate file, which is fine.
                         if meta: metadata_to_save[name] = json.dumps(meta) 
                     save_file(tensors_to_save, safetensors_path, metadata=metadata_to_save)
                     print(f"Weights saved to {safetensors_path}")
@@ -567,6 +561,37 @@ class ModelProcessor:
 
             nodes.append({'A': A, 'B': B, 'C': C, 'D': D})
         return nodes
+
+    def _quantize_to_block_fp8(self, tensor: torch.Tensor, block_size: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Квантует тензор в формат Block-FP8."""
+        # Убедимся, что тензор одномерный
+        original_shape = tensor.shape
+        tensor_flat = tensor.flatten().to(torch.float32)
+    
+        # 1. Дополняем тензор, если его размер не кратен block_size
+        num_elements = tensor_flat.numel()
+        rem = num_elements % block_size
+        if rem != 0:
+            padding_needed = block_size - rem
+            padding = torch.zeros(padding_needed, dtype=tensor_flat.dtype, device=tensor.device)
+            tensor_flat = torch.cat([tensor_flat, padding])
+    
+        # 2. Решейпим в блоки
+        num_blocks = tensor_flat.numel() // block_size
+        blocked_tensor = tensor_flat.view(num_blocks, block_size)
+    
+        # 3. Находим scale для каждого блока (локально)
+        max_abs_per_block = torch.max(torch.abs(blocked_tensor), dim=1, keepdim=True)[0]
+        scales = max_abs_per_block / 127.0
+        # Предотвращаем деление на ноль, если блок нулевой
+        scales[scales == 0] = 1.0 
+
+        # 4. Квантуем каждый блок с его собственным scale
+        quantized_blocks = torch.round(blocked_tensor / scales).clamp(-128, 127).to(torch.int8)
+    
+        # 5. Возвращаем плоский квантованный тензор и scales
+        # Сжимаем scales до 1D
+        return quantized_blocks.flatten(), scales.squeeze()
         
     def _quantize_parameters(self, method: str):
         if method == 'none': return
@@ -579,10 +604,33 @@ class ModelProcessor:
             elif method in ['INT8_TENSOR', 'INT8_CHANNEL']:
                 is_channel = method == 'INT8_CHANNEL' and v.dim() > 1
                 dims = tuple(range(1, v.dim())) if is_channel else None
-                scales = v.abs().amax(dim=dims, keepdim=True)/127.0; scales[scales==0]=1e-9
-                meta = {'quant_type': 'INT8_CHANNEL' if is_channel else 'INT8_TENSOR', 'scales' if is_channel else 'scale': scales.squeeze().tolist() if is_channel else scales.item()}
+                scales = v.abs().amax(dim=dims, keepdim=True) / 127.0
+                scales[scales == 0] = 1e-9
+
+                if is_channel:
+                    # ГАРАНТИРУЕМ список даже при одном канале
+                    scales_list = scales.reshape(-1).tolist()
+                    meta = {
+                        'quant_type': 'INT8_CHANNEL',
+                        'scales': scales_list,
+                        'axis': 0
+                    }
+                else:
+                    meta = {
+                        'quant_type': 'INT8_TENSOR',
+                        'scale': float(scales.item())
+                    }
                 if is_channel: meta['axis'] = 0
                 quantized_map[k] = ((v / scales).round().clamp(-127, 127).to(torch.int8), meta)
+            elif method == 'BLOCK_FP8':
+                q_flat, scales = self._quantize_to_block_fp8(v)
+                meta = {
+                    'quant_type': 'BLOCK_FP8',
+                    'block_size': 64,
+                    'original_shape': list(v.shape),
+                    'scales': scales.tolist()
+                }
+                quantized_map[k] = (q_flat, meta)
         self.param_data_map = quantized_map
         print("Quantization complete.")
 
@@ -717,7 +765,7 @@ def _get_d_model(model: torch.nn.Module) -> int:
     print("Warning: Could not automatically determine d_model. Defaulting to 0.")
     return 0
 
-def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tuple, d_model: Optional[int] = None, quantization_method: str = 'none', dynamic_shapes=None, store_weights_internally=True, io_counts=(0,0), tokenizer_repo=None, optimize = True, tokenizer_input: str = 'none', optimize_memory_locality: bool = True):
+def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tuple, d_model: Optional[int] = None, quantization_method: str = 'none', dynamic_shapes=None, store_weights_internally=True, io_counts=(0,0), tokenizer_repo=None, optimize = True, tokenizer_input: str = 'none', optimize_memory_locality: bool = True, compile_tokenizer_resources: bool = True):
     print("\n" + "="*20 + f" GENERATION ({model_name}) " + "="*20)
     result_manager = ResultManager()
 
@@ -727,55 +775,107 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
         print(f"Retrieving tokenizer resources from '{tokenizer_repo}'...")
         try:
             from transformers import AutoTokenizer
+            import io
             hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo)
-            
-            # List of standard files that we will try to pack "as is"
-            files_to_pack = [
-                "tokenizer.json",
-                "vocab.json",
-                "merges.txt",
-                "spiece.model",
-                "special_tokens_map.json",
-                "tokenizer_config.json"
-            ]
-            
-            print("  - Attempting to pack original resource files...")
-            for filename in files_to_pack:
+
+            if compile_tokenizer_resources:
+                print("  - Mode: Compiling tokenizer resources into optimized binary format.")
+                # Compilation to .b and .vidx.b
+                print("    - Compiling vocab into vocab.b (for encoding) and vidx.b (for decoding)...")
+                vocab_dict = hf_tokenizer.get_vocab()
+                
+                # 1. Preparing vocab.b (sort by token)
+                vocab_sorted_by_token = sorted(vocab_dict.items(), key=lambda item: item[0])
+                
+                num_entries = len(vocab_sorted_by_token)
+                data_buffer = io.BytesIO()
+                token_offsets = []
+                id_to_offset_map = {}
+
+                for token_str, token_id in vocab_sorted_by_token:
+                    current_offset = data_buffer.tell()
+                    token_offsets.append(current_offset) 
+                    id_to_offset_map[token_id] = current_offset
+                    
+                    token_bytes = token_str.encode('utf-8')
+                    data_buffer.write(struct.pack('<H', len(token_bytes)))
+                    data_buffer.write(token_bytes)
+                    data_buffer.write(struct.pack('<if', token_id, 0.0))
+                
+                final_vocab_b = bytearray()
+                final_vocab_b.extend(struct.pack('<I', num_entries))
+                final_vocab_b.extend(struct.pack(f'<{num_entries}I', *token_offsets))
+                final_vocab_b.extend(data_buffer.getvalue())
+                
+                tokenizer_resources['vocab.b'] = bytes(final_vocab_b)
+                print(f"      - 'vocab.b' created successfully ({len(tokenizer_resources['vocab.b'])} bytes).")
+
+                # 2. Preparing vidx.b (sorted by ID)
+                if id_to_offset_map:
+                    max_id = max(id_to_offset_map.keys())
+                    id_sorted_offsets = [id_to_offset_map.get(i, 0) for i in range(max_id + 1)]
+                    
+                    vidx_b_content = bytearray()
+                    vidx_b_content.extend(struct.pack('<I', len(id_sorted_offsets)))
+                    vidx_b_content.extend(struct.pack(f'<{len(id_sorted_offsets)}I', *id_sorted_offsets))
+                    
+                    tokenizer_resources['vidx.b'] = bytes(vidx_b_content)
+                    print(f"      - 'vidx.b' for fast decoding created successfully ({len(tokenizer_resources['vidx.b'])} bytes).")
+
+                # 3. Compile merges.txt -> merges.b
                 try:
-                    # Downloading a file from the repository
-                    downloaded_path = hf_hub_download(repo_id=tokenizer_repo, filename=filename)
-                    # Read it as binary data and save it to resources.
-                    with open(downloaded_path, 'rb') as f:
-                        tokenizer_resources[filename] = f.read()
-                    print(f"    - Packed '{filename}' successfully.")
+                    merges_path = hf_hub_download(repo_id=tokenizer_repo, filename="merges.txt")
+                    print("    - Compiling merges.txt into merges.b...")
+                    with open(merges_path, 'r', encoding='utf-8') as f: lines = f.readlines()
+                    if lines and lines[0].startswith("#"): lines = lines[1:]
+                    merges_b_content = bytearray()
+                    merges_b_content.extend(struct.pack('<I', len(lines)))
+                    for line in lines:
+                        parts = line.strip().split();
+                        if len(parts) != 2: continue
+                        p1_bytes, p2_bytes = parts[0].encode('utf-8'), parts[1].encode('utf-8')
+                        merges_b_content.extend(struct.pack('<H', len(p1_bytes))); merges_b_content.extend(p1_bytes)
+                        merges_b_content.extend(struct.pack('<H', len(p2_bytes))); merges_b_content.extend(p2_bytes)
+                    tokenizer_resources['merges.b'] = bytes(merges_b_content)
+                    print(f"      - 'merges.b' created successfully ({len(tokenizer_resources['merges.b'])} bytes).")
                 except Exception:
-                    # It's okay if the file doesn't exist (for example, WordPiece doesn't have merges.txt)
-                    pass
+                     print("    - 'merges.txt' not found for this tokenizer. Skipping 'merges.b' compilation.")
+            
+            else:
+                print("  - Mode: Packing original tokenizer files (JSON, txt)...")
+                # Just download and pack
+                files_to_pack = [
+                    "tokenizer.json", "vocab.json", "merges.txt",
+                    "spiece.model", "special_tokens_map.json", "tokenizer_config.json"
+                ]
+                for filename in files_to_pack:
+                    try:
+                        downloaded_path = hf_hub_download(repo_id=tokenizer_repo, filename=filename)
+                        with open(downloaded_path, 'rb') as f:
+                            tokenizer_resources[filename] = f.read()
+                        print(f"    - Packed '{filename}' successfully.")
+                    except Exception:
+                        pass # File not found, this is normal
 
-            # Important fallback: if vocab.json isn't found, generate it from get_vocab() so we always have a dictionary.
-            if "vocab.json" not in tokenizer_resources:
-                print("  - 'vocab.json' not found. Generating from tokenizer object as a fallback.")
-                vocab = hf_tokenizer.get_vocab()
-                # Sort the vocab by token ID for deterministic output. This is good practice.
-                sorted_vocab = {k: v for k, v in sorted(vocab.items(), key=lambda item: item[1])}
-                tokenizer_resources['vocab.json'] = json.dumps(sorted_vocab, ensure_ascii=False).encode('utf-8')
+                # Важный фолбэк для старого режима
+                if "vocab.json" not in tokenizer_resources:
+                    print("    - 'vocab.json' not found. Generating from tokenizer object as a fallback.")
+                    vocab = hf_tokenizer.get_vocab()
+                    sorted_vocab = {k: v for k, v in sorted(vocab.items(), key=lambda item: item[1])}
+                    tokenizer_resources['vocab.json'] = json.dumps(sorted_vocab, ensure_ascii=False).encode('utf-8')
 
-
-            print(f"  - Extracted {len(tokenizer_resources)} total resource files.")
-
-            # If store resources externally, we save them to disk
+            # GENERAL PART for both modes
+            print(f"  - Tokenizer resource processing finished. Total files to pack: {len(tokenizer_resources)}.")
             if not store_weights_internally:
                 tokenizer_dir = os.path.join(result_manager.output_path, f"{model_name}-tokenizer")
                 os.makedirs(tokenizer_dir, exist_ok=True)
                 for filename, content in tokenizer_resources.items():
-                    with open(os.path.join(tokenizer_dir, filename), 'wb') as f:
-                        f.write(content)
+                    with open(os.path.join(tokenizer_dir, filename), 'wb') as f: f.write(content)
                 print(f"Tokenizer resources are stored externally in {tokenizer_dir}")
-                tokenizer_resources = {} # Clean it so as not to write to RSRC
+                tokenizer_resources = {}
 
         except Exception as e:
-            print(f"!!!!! WARNING: Failed to fetch tokenizer resources for '{tokenizer_repo}'. Error: {e}")
-            traceback.print_exc()
+            print(f"!!!!! WARNING: Failed to process tokenizer for '{tokenizer_repo}'. Error: {e}"); traceback.print_exc()
 
     print("Exporting a model to FX graphics...")
     exported_program = torch.export.export(model.eval(), args=dummy_args, dynamic_shapes=dynamic_shapes)
@@ -807,50 +907,29 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
             print(f"Successfully loaded existing registry from {registry_filepath}")
         except Exception as e: print(f"Failed to read existing registry: {e}")
 
-    # --- (TISA Manifest) ---
     tokenizer_manifest_bytes = None
     if tokenizer_repo:
         print(f"\n--- Compiling the tokenizer from '{tokenizer_repo}' ---")
         try:
-            if 'hf_tokenizer' not in locals():
-                 hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo)
-            if tokenizer_input == 'none':
-                probe_text = "This is a probe text."
-            else:
-                probe_text = tokenizer_input
+            if 'hf_tokenizer' not in locals(): hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo)
+            probe_text = tokenizer_input if tokenizer_input != 'none' else "This is a probe text."
             tokenizer_manifest_bytes = TISACompiler.compile_and_calibrate(hf_tokenizer, probe_text)
             print(f"The tokenizer was successfully compiled into a {len(tokenizer_manifest_bytes)}-byte TISA manifest.")
         except Exception as e:
-            print(f"!!!!! WARNING: Failed to compile tokenizer for '{tokenizer_repo}'. Error: {e}")
-            traceback.print_exc()
+            print(f"!!!!! WARNING: Failed to compile tokenizer for '{tokenizer_repo}'. Error: {e}"); traceback.print_exc()
 
     processor = ModelProcessor(existing_registry=existing_registry_data)
-    
-    processor.process_exported_program(
-        exported_program=exported_program, 
-        quantization_method=quantization_method
-    )
-    
+    processor.process_exported_program(exported_program=exported_program, quantization_method=quantization_method)
     used_mappings = processor.get_used_mappings()
+    result_manager.save_registry(processor.op_string_to_id, ModelProcessor.const_to_id, processor.perm_tuple_to_id)
+    final_d_model = d_model if isinstance(d_model, int) else _get_d_model(model)
+    if isinstance(d_model, int): print(f"Uses manually specified d_model: {final_d_model}")
     
-    result_manager.save_registry(
-        processor.op_string_to_id,
-        ModelProcessor.const_to_id,
-        processor.perm_tuple_to_id
-    )
-
-    final_d_model = 0
-    if d_model is not None and isinstance(d_model, int):
-        final_d_model = d_model
-        print(f"Uses manually specified d_model: {final_d_model}")
-    else:
-        final_d_model = _get_d_model(model)
-
     result_manager.save_model_nac(
-        model_name, 
+        model_name,
         used_mappings,
         processor.precomputed_nodes, 
-        processor.param_data_map, 
+        processor.param_data_map,
         processor.param_id_to_name,
         processor.input_node_idx_to_name,
         d_model=final_d_model,

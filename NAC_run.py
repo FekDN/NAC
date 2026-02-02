@@ -109,7 +109,7 @@ class NacRuntime(NacKernelBase):
             self.io_counts = (num_inputs, num_outputs)
             
             self.weights_stored_internally = (raw_quant_id & 0x80) != 0
-            quant_map = {0:'none', 1:'FP16', 2:'INT8_TENSOR', 3:'INT8_CHANNEL'}
+            quant_map = {0:'none', 1:'FP16', 2:'INT8_TENSOR', 3:'INT8_CHANNEL', 4:'BLOCK_FP8'}
             self.quantization_method = quant_map.get(raw_quant_id & 0x7F, 'unknown')
             
             offsets_header_format = '<H9Q4x'
@@ -121,7 +121,7 @@ class NacRuntime(NacKernelBase):
 
             # 2. Loading metadata (CMAP, CNST, PERM)
             if cmap_off > 0:
-                f.seek(cmap_off); f.read(4) # Skipping the tag
+                f.seek(cmap_off); f.read(4)
                 num_entries = struct.unpack('<I', f.read(4))[0]
                 for _ in range(num_entries):
                     op_id, name_len = struct.unpack('<HB', f.read(3))
@@ -155,98 +155,62 @@ class NacRuntime(NacKernelBase):
             # 3. Loading data (DATA)
             if data_off > 0:
                 f.seek(data_off); f.read(4)
-                # Reading name mappings
                 num_params = struct.unpack('<I', f.read(4))[0]
                 for _ in range(num_params):
                     p_id, name_len = struct.unpack('<HH', f.read(4))
                     self.param_id_to_name[p_id] = f.read(name_len).decode('utf-8')
-                
                 num_inputs = struct.unpack('<I', f.read(4))[0]
                 for _ in range(num_inputs):
                     i_idx, name_len = struct.unpack('<HH', f.read(4))
                     self.input_node_idx_to_name[i_idx] = f.read(name_len).decode('utf-8')
                 
-                # Loading weight tensors
                 if self.weights_stored_internally:
                     num_tensors = struct.unpack('<I', f.read(4))[0]
                     numpy_dtype_map = {0:np.float32, 1:np.float64, 2:np.float16, 3:"<bf16>", 4:np.int32, 5:np.int64, 6:np.int16, 7:np.int8, 8:np.uint8, 9:np.bool_}
-                    quant_code_to_str = {0: 'none', 1: 'INT8_TENSOR', 2: 'INT8_CHANNEL'}
-
+                    quant_code_to_str = {0:'none', 1:'FP16', 2:'INT8_TENSOR', 3:'INT8_CHANNEL', 4:'BLOCK_FP8'}
                     for _ in range(num_tensors):
-                        p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14))
-                        meta_bytes = f.read(meta_len)
-                        data_bytes = f.read(data_len)
-
-                        meta_offset = 0
-                        meta = {}
+                        p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14)) #'<HHQ', ...)  # uint16
+                        meta_bytes, data_bytes = f.read(meta_len), f.read(data_len)
                         
-                        # 1. Dtype and Rank
-                        dtype_id, rank = struct.unpack_from('<BB', meta_bytes, meta_offset)
-                        meta_offset += 2
+                        meta_offset, meta = 0, {}
+                        dtype_id, rank = struct.unpack_from('<BB', meta_bytes, meta_offset); meta_offset += 2
+                        shape = list(struct.unpack_from(f'<{rank}I', meta_bytes, meta_offset)) if rank > 0 else []; meta_offset += rank * 4
                         
-                        # 2. Shape
-                        shape = []
-                        if rank > 0:
-                            shape = list(struct.unpack_from(f'<{rank}I', meta_bytes, meta_offset))
-                            meta_offset += rank * 4
-                        meta['shape'] = shape
+                        quant_type_code, = struct.unpack_from('<B', meta_bytes, meta_offset); meta_offset += 1
+                        quant_type_str = quant_code_to_str.get(quant_type_code, 'none'); meta['quant_type'] = quant_type_str
                         
-                        # 3. Quantization Info
-                        quant_type_code, = struct.unpack_from('<B', meta_bytes, meta_offset)
-                        meta_offset += 1
-                        quant_type_str = quant_code_to_str.get(quant_type_code, 'none')
-                        meta['quant_type'] = quant_type_str
-
                         if quant_type_str == 'INT8_TENSOR':
-                            scale, = struct.unpack_from('<f', meta_bytes, meta_offset)
-                            meta_offset += 4
-                            meta['scale'] = scale
+                            meta['scale'], = struct.unpack_from('<f', meta_bytes, meta_offset); meta_offset += 4
                         elif quant_type_str == 'INT8_CHANNEL':
-                            axis, num_scales = struct.unpack_from('<BI', meta_bytes, meta_offset)
-                            meta_offset += 5
-                            scales = list(struct.unpack_from(f'<{num_scales}f', meta_bytes, meta_offset))
-                            meta['axis'], meta['scales'] = axis, scales
-                        
+                            axis, num_scales = struct.unpack_from('<BI', meta_bytes, meta_offset); meta_offset += 5
+                            meta['axis'] = axis
+                            meta['scales'] = list(struct.unpack_from(f'<{num_scales}f', meta_bytes, meta_offset)); meta_offset += num_scales * 4
+                        elif quant_type_str == 'BLOCK_FP8':
+                            meta['block_size'], original_rank = struct.unpack_from('<HB', meta_bytes, meta_offset); meta_offset += 3
+                            if original_rank > 0:
+                                meta['original_shape'] = list(struct.unpack_from(f'<{original_rank}I', meta_bytes, meta_offset)); meta_offset += original_rank * 4
+                            else: meta['original_shape'] = []
+                            num_scales, = struct.unpack_from('<I', meta_bytes, meta_offset); meta_offset += 4
+                            meta['scales'] = list(struct.unpack_from(f'<{num_scales}f', meta_bytes, meta_offset)); meta_offset += num_scales * 4
+
                         dtype = numpy_dtype_map.get(dtype_id, np.float32)
-                        if dtype == "<bf16>":
-                            u16_arr = np.frombuffer(data_bytes, dtype=np.uint16).reshape(shape)
-                            arr = (u16_arr.astype(np.uint32) << 16).view(np.float32).copy()
-                        else:
-                            arr = np.frombuffer(data_bytes, dtype=dtype).reshape(shape).copy()
-                        
+                        arr = (np.frombuffer(data_bytes, dtype=np.uint16).reshape(shape).astype(np.uint32) << 16).view(np.float32).copy() if dtype == "<bf16>" else np.frombuffer(data_bytes, dtype=dtype).reshape(shape).copy()
                         self.parameters[p_id] = self._dequantize(arr, meta)
-                else: # Loading from an external .safetensors file
+                else:
                     safetensors_path = os.path.splitext(nac_path)[0] + '.safetensors'
                     if not os.path.exists(safetensors_path): raise FileNotFoundError(f"External weights file not found: {safetensors_path}")
-                    
                     from safetensors import safe_open
-                    
-                    tensors = {}
-                    per_tensor_metadata = {}
+                    tensors, per_tensor_metadata = {}, {}
                     with safe_open(safetensors_path, framework="np", device="cpu") as st_f:
-                        # 1. Loading general file metadata
                         file_metadata = st_f.metadata() or {}
-                        # 2. Extract the 'metadata' field, which stores metadata for each tensor.
                         if "metadata" in file_metadata:
-                            # This is a string containing a JSON dictionary where the key is the name of the tensor,
-                            # and the value is ANOTHER JSON ROW with the metadata of this tensor.
-                            metadata_of_metadata = json.loads(file_metadata["metadata"])
-                            for tensor_name, meta_json_str in metadata_of_metadata.items():
-                                per_tensor_metadata[tensor_name] = json.loads(meta_json_str)
-
-                        # 3. Loading the tensors
-                        for key in st_f.keys():
-                            tensors[key] = st_f.get_tensor(key)
-
-                    # 4. Compare tensors, their metadata and dequantize
+                            for name, meta_str in json.loads(file_metadata["metadata"]).items(): per_tensor_metadata[name] = json.loads(meta_str)
+                        for key in st_f.keys(): tensors[key] = st_f.get_tensor(key)
                     for p_id, p_name in self.param_id_to_name.items():
-                        if p_name in tensors:
-                            meta = per_tensor_metadata.get(p_name, {}) # Get the metadata dictionary for this tensor
-                            self.parameters[p_id] = self._dequantize(tensors[p_name], meta)
+                        if p_name in tensors: self.parameters[p_id] = self._dequantize(tensors[p_name], per_tensor_metadata.get(p_name, {}))
             
-            # 4. Loading tokenizer resources (RSRC)
             tokenizer_resources_raw = {}
-            if rsrc_off > 0: # Resources inside .nac
+            if rsrc_off > 0:
                 f.seek(rsrc_off); f.read(4)
                 num_files = struct.unpack('<I', f.read(4))[0]
                 print(f"Reading {num_files} internal resource files from RSRC section...")
@@ -255,75 +219,121 @@ class NacRuntime(NacKernelBase):
                     filename = f.read(name_len).decode('utf-8')
                     data_len = struct.unpack('<I', f.read(4))[0]
                     tokenizer_resources_raw[filename] = f.read(data_len)
-            else: # Resources outside
+            else:
                 tokenizer_dir = os.path.splitext(nac_path)[0] + "-tokenizer"
                 if os.path.exists(tokenizer_dir):
                     print(f"Reading external tokenizer resources from: {tokenizer_dir}")
                     for fname in os.listdir(tokenizer_dir):
                         fpath = os.path.join(tokenizer_dir, fname)
                         if os.path.isfile(fpath):
-                            with open(fpath, 'rb') as rf: 
-                                tokenizer_resources_raw[fname] = rf.read()
+                            with open(fpath, 'rb') as rf: tokenizer_resources_raw[fname] = rf.read()
 
-            # 5. Initializing TISAVM based on the manifest (PROC) and resources
             if proc_off > 0:
                 f.seek(proc_off); f.read(4)
                 manifest_bytes = f.read(struct.unpack('<I', f.read(4))[0])
-
                 vm_resources = {}
                 print("Processing tokenizer resources for TISAVM...")
 
-                tok_json = None
-                if "tokenizer.json" in tokenizer_resources_raw:
-                    try: tok_json = json.loads(tokenizer_resources_raw["tokenizer.json"].decode('utf-8'))
-                    except json.JSONDecodeError: print("  - WARNING: Could not parse 'tokenizer.json'.")
+                if "vocab.b" in tokenizer_resources_raw:
+                    print("  - Found binary resource 'vocab.b'. Loading in optimized mode.")
+                    content = tokenizer_resources_raw['vocab.b']
+                    num_entries, = struct.unpack_from('<I', content, 0)
+                    offset = 4 + num_entries * 4 
+                    vocab = {}
+                    for _ in range(num_entries):
+                        key_len, = struct.unpack_from('<H', content, offset); offset += 2
+                        key = content[offset : offset + key_len].decode('utf-8'); offset += key_len
+                        val, _ = struct.unpack_from('<if', content, offset); offset += 8
+                        vocab[key] = val
+                    vm_resources['vocab'] = vocab
+                    print(f"    - Vocab loaded from 'vocab.b' ({len(vocab)} entries).")
+
+                    if "merges.b" in tokenizer_resources_raw:
+                        content = tokenizer_resources_raw['merges.b']
+                        num_entries, = struct.unpack_from('<I', content, 0)
+                        offset = 4
+                        ranks = {}
+                        for i in range(num_entries):
+                            p1_len, = struct.unpack_from('<H', content, offset); offset += 2
+                            p1 = content[offset : offset + p1_len].decode('utf-8'); offset += p1_len
+                            p2_len, = struct.unpack_from('<H', content, offset); offset += 2
+                            p2 = content[offset : offset + p2_len].decode('utf-8'); offset += p2_len
+                            ranks[(p1, p2)] = i
+                        vm_resources['ranks'] = ranks
+                        print(f"    - Merges loaded from 'merges.b' ({len(ranks)} entries).")
+
+                else:
+                    print("  - Binary 'vocab.b' not found. Falling back to JSON/text parsing.")
+                    if "tokenizer.json" in tokenizer_resources_raw:
+                        tok_json = json.loads(tokenizer_resources_raw["tokenizer.json"].decode('utf-8'))
+                        model_data = tok_json.get('model', {})
+                        if model_data.get('type') == 'Unigram':
+                            vocab_list = model_data.get('vocab', [])
+                            vm_resources['vocab'] = {token: i for i, (token, score) in enumerate(vocab_list)}
+                            vm_resources['unigram_scores'] = {token: score for token, score in vocab_list}
+                            print("    - Vocab and Unigram scores loaded from 'tokenizer.json'.")
+                        elif 'vocab' in model_data:
+                            vm_resources['vocab'] = model_data['vocab']
+                            print("    - Vocab loaded from 'tokenizer.json'.")
+                        if "merges" in model_data:
+                            vm_resources['ranks'] = {tuple(line.split()): i for i, line in enumerate(model_data["merges"])}
+                            print("    - Merges loaded from 'tokenizer.json'.")
+                    elif "vocab.json" in tokenizer_resources_raw:
+                        vm_resources['vocab'] = json.loads(tokenizer_resources_raw["vocab.json"].decode('utf-8'))
+                        print("    - Vocab loaded from 'vocab.json'.")
+                    
+                    if "merges.txt" in tokenizer_resources_raw and 'ranks' not in vm_resources:
+                        lines = [line for line in tokenizer_resources_raw["merges.txt"].decode('utf-8').splitlines() if line and not line.startswith("#")]
+                        vm_resources['ranks'] = {tuple(line.split()): i for i, line in enumerate(lines)}
+                        print("    - Merges loaded from 'merges.txt'.")
+
+                    if 'vocab' not in vm_resources:
+                        print("    - WARNING: No vocab file found.")
                 
-                if tok_json and tok_json.get('model', {}).get('type') == 'Unigram':
-                    unigram_vocab_list = tok_json.get('model', {}).get('vocab', [])
-                    vm_resources['vocab'] = {token: i for i, (token, score) in enumerate(unigram_vocab_list)}
-                    vm_resources['unigram_scores'] = {token: score for token, score in unigram_vocab_list}
-                    print("  - Vocab and Unigram scores loaded from 'tokenizer.json'.")
-                elif tok_json and 'vocab' in tok_json.get('model', {}):
-                    vm_resources['vocab'] = tok_json.get('model', {}).get('vocab')
-                    print("  - Vocab loaded from 'tokenizer.json'.")
-                elif "vocab.json" in tokenizer_resources_raw:
-                    vm_resources['vocab'] = json.loads(tokenizer_resources_raw["vocab.json"].decode('utf-8'))
-                    print("  - Vocab loaded from 'vocab.json'.")
-                else: print("  - WARNING: No vocab file found ('tokenizer.json' or 'vocab.json').")
-
-                if tok_json and "merges" in tok_json.get("model", {}):
-                    merges_lines = tok_json["model"]["merges"]
-                    vm_resources['ranks'] = {tuple(line.split()): i for i, line in enumerate(merges_lines)}
-                    print("  - Merges loaded from 'tokenizer.json'.")
-                elif "merges.txt" in tokenizer_resources_raw:
-                    merges_content = tokenizer_resources_raw["merges.txt"].decode('utf-8')
-                    merges_lines = [line for line in merges_content.splitlines() if line and not line.startswith("#")]
-                    vm_resources['ranks'] = {tuple(line.split()): i for i, line in enumerate(merges_lines)}
-                    print("  - Merges loaded from 'merges.txt'.")
-
                 if vm_resources.get('vocab'):
                     bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
                     cs = bs[:]; n = 0
                     for b in range(256):
                         if b not in bs: bs.append(b); cs.append(256 + n); n += 1
                     vm_resources['byte_map'] = dict(zip(bs, [chr(c) for c in cs]))
-                    
-                    vm_resources.setdefault('ranks', {})
-                    vm_resources.setdefault('unigram_scores', {})
-
+                    vm_resources.setdefault('ranks', {}); vm_resources.setdefault('unigram_scores', {})
                     self.tokenizer = TISAVM(vm_resources)
                     self.tokenizer.manifest = manifest_bytes
-                    print("TISAVM initialized successfully.")
-                else: print("Warning: Tokenizer manifest found, but vocab/resource files are missing or empty.")
+                    print("  - TISAVM initialized successfully.")
+                else: 
+                    print("  - Warning: Tokenizer manifest found, but vocab/resource files are missing or empty.")
             
             print(f"Loaded {len(self.operations)} ops and {len(self.parameters)} parameters.")
 
     def _dequantize(self, arr: np.ndarray, metadata: Dict) -> np.ndarray:
-        if metadata.get('quant_type') == 'INT8_TENSOR': return arr.astype(np.float32) * metadata.get('scale', 1.0)
-        if metadata.get('quant_type') == 'INT8_CHANNEL':
-            scales = np.array(metadata['scales'], dtype=np.float32); shape = [1]*arr.ndim; shape[metadata.get('axis',0)]=-1
+        q_type = metadata.get('quant_type')
+        if q_type == 'INT8_TENSOR':
+            return arr.astype(np.float32) * metadata.get('scale', 1.0)
+        if q_type == 'INT8_CHANNEL':
+            scales = np.array(metadata['scales'], dtype=np.float32)
+            shape = [1] * arr.ndim
+            shape[metadata.get('axis', 0)] = -1
             return arr.astype(np.float32) * scales.reshape(shape)
-        if arr.dtype == np.float16: return arr.astype(np.float32)
+        if q_type == 'BLOCK_FP8':
+            block_size = metadata['block_size']
+            original_shape = metadata['original_shape']
+            scales = np.array(metadata['scales'], dtype=np.float32)
+            
+            arr_fp32 = arr.astype(np.float32)
+            num_blocks = arr_fp32.shape[0] // block_size
+            blocked_tensor = arr_fp32.reshape(num_blocks, block_size)
+            
+            dequantized_blocks = blocked_tensor * scales.reshape(-1, 1)
+            
+            flat_tensor = dequantized_blocks.flatten()
+            
+            num_original_elements = np.prod(original_shape) if original_shape else 0
+            
+            truncated_tensor = flat_tensor[:num_original_elements]
+            
+            return truncated_tensor.reshape(original_shape)
+        if arr.dtype == np.float16:
+            return arr.astype(np.float32)
         return arr
 
     def _auto_init_state_map(self):

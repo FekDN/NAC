@@ -54,7 +54,7 @@ def inspect_nac_file(filepath: str):
         quant_id = struct.unpack('<B', f.read(1))[0]
         weights_stored_internally = (quant_id & 0x80) > 0
         quant_method_id = quant_id & 0x7F
-        quant_map = {0:'none', 1:'FP16', 2:'INT8_TENSOR', 3:'INT8_CHANNEL'}
+        quant_map = {0:'none', 1:'FP16', 2:'INT8_TENSOR', 3:'INT8_CHANNEL', 4:'BLOCK_FP8'}
         quant_method = quant_map.get(quant_method_id, f'UNKNOWN ({quant_method_id})')
         storage_method = "Internal" if weights_stored_internally else "External (.safetensors)"
         print(f"Quantization: {quant_method}")
