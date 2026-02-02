@@ -1,4 +1,4 @@
-// op_kernels.h
+// Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 #ifndef OP_KERNELS_H
 #define OP_KERNELS_H
@@ -39,5 +39,6 @@ Tensor* op_aten_adaptive_avg_pool2d_default(NacRuntimeContext* ctx, const Parsed
 
 extern std::map<std::string, KernelFunc> g_kernel_string_map;
 extern std::map<uint8_t, KernelFunc> g_op_kernels;
+
 
 #endif
