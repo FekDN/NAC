@@ -1,4 +1,4 @@
-// --- START OF FILE TISA_VM.cpp ---
+// Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 #include "TISA_VM.h"
 #include <Arduino.h>
@@ -822,4 +822,5 @@ void TISAVM::_primitive_compose(TISA_State& state, const std::vector<uint8_t>& p
         } else { out_ids.insert(out_ids.end(), state.ids.begin(), state.ids.end()); }
     }
     state.ids = out_ids;
+
 }
