@@ -1,4 +1,4 @@
-// --- START OF FILE TISA_VM.h ---
+// Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 #ifndef TISA_VM_H
 #define TISA_VM_H
@@ -106,5 +106,6 @@ private:
     void _primitive_unigram_encode(TISA_State& state);
     void _primitive_compose(TISA_State& state, const std::vector<uint8_t>& payload);
 };
+
 
 #endif // TISA_VM_H
