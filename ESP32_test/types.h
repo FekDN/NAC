@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
+
 #ifndef TYPES_H
 #define TYPES_H
 
@@ -192,5 +194,6 @@ struct NacRuntimeContext {
         for (auto tensor_ptr : user_input_tensors) { if (tensor_ptr) tensor_pool.release(tensor_ptr); }
     }
 };
+
 
 #endif // TYPES_H
