@@ -1,773 +1,872 @@
-// Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
-
+// Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com)
 #include "TISA_VM.h"
 #include <Arduino.h>
 #include <algorithm>
 #include <limits>
-#include "CYD28_SD.h" 
+#include <vector>
+#include "CYD28_SD.h"
 
-// Определяем внешние переменные, которые будут использоваться
 extern CYD28_SD sdcard;
-extern SemaphoreHandle_t g_sd_card_mutex; 
+extern SemaphoreHandle_t g_sd_card_mutex;
 
-#define TISA_VM_DEBUG 1 // Установите в 0, чтобы отключить отладочные сообщения
-
-// --- UCD-Based Unicode Helpers (Full Implementation) ---
-namespace {
-    // --- UTF-8 Utilities ---
-    size_t get_utf8_char_len(unsigned char b) {
-        if (b < 0x80) return 1;
-        if ((b & 0xE0) == 0xC0) return 2;
-        if ((b & 0xF0) == 0xE0) return 3;
-        if ((b & 0xF8) == 0xF0) return 4;
-        return 0; // Invalid start byte
-    }
-
-    uint32_t utf8_to_codepoint(const unsigned char* s, size_t len) {
-        if (len == 0) return 0;
-        switch(len) {
-            case 1: return s[0];
-            case 2: return ((s[0] & 0x1F) << 6) | (s[1] & 0x3F);
-            case 3: return ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
-            case 4: return ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
-            default: return 0;
-        }
-    }
-
-    std::string codepoint_to_utf8(uint32_t cp) {
-        std::string result;
-        if (cp < 0x80) {
-            result += static_cast<char>(cp);
-        } else if (cp < 0x800) {
-            result += static_cast<char>(0xC0 | (cp >> 6));
-            result += static_cast<char>(0x80 | (cp & 0x3F));
-        } else if (cp < 0x10000) {
-            result += static_cast<char>(0xE0 | (cp >> 12));
-            result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-            result += static_cast<char>(0x80 | (cp & 0x3F));
-        } else if (cp < 0x110000) {
-            result += static_cast<char>(0xF0 | (cp >> 18));
-            result += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-            result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-            result += static_cast<char>(0x80 | (cp & 0x3F));
-        }
-        return result;
-    }
-
-    #include "TISA_UCD_TABLES.h"
-    
-    uint32_t codepoint_to_lower(uint32_t cp) {
-        int low = 0, high = (sizeof(LOWERCASE_EXCEPTIONS) / sizeof(UnicodeException)) - 1;
-        while(low <= high) {
-            int mid = low + (high - low) / 2;
-            uint32_t from = pgm_read_dword(&LOWERCASE_EXCEPTIONS[mid].from);
-            if (from < cp) low = mid + 1;
-            else if (from > cp) high = mid - 1;
-            else return pgm_read_dword(&LOWERCASE_EXCEPTIONS[mid].to);
-        }
-        low = 0, high = (sizeof(LOWERCASE_RANGES) / sizeof(UnicodeRange)) - 1;
-        while(low <= high) {
-            int mid = low + (high - low) / 2;
-            uint32_t start = pgm_read_dword(&LOWERCASE_RANGES[mid].start);
-            uint32_t end = pgm_read_dword(&LOWERCASE_RANGES[mid].end);
-            if (cp < start) high = mid - 1;
-            else if (cp > end) low = mid + 1;
-            else return cp + (int32_t)pgm_read_dword(&LOWERCASE_RANGES[mid].delta);
-        }
-        return cp;
-    }
-    
-    bool is_in_category_ranges(uint32_t cp, const CategoryRange* ranges, size_t count) {
-        int low = 0, high = count - 1;
-        while(low <= high) {
-            int mid = low + (high - low) / 2;
-            uint32_t start = pgm_read_dword(&ranges[mid].start);
-            uint32_t end = pgm_read_dword(&ranges[mid].end);
-            if (cp < start) high = mid - 1;
-            else if (cp > end) low = mid + 1;
-            else return true;
-        }
-        return false;
-    }
-    
-    bool is_category(uint32_t cp, const std::string& cat) {
-        if (cat == "Mn") return is_in_category_ranges(cp, CAT_MN_RANGES, sizeof(CAT_MN_RANGES)/sizeof(CategoryRange));
-        if (cat == "Cc") return is_in_category_ranges(cp, CAT_CC_RANGES, sizeof(CAT_CC_RANGES)/sizeof(CategoryRange));
-        if (cat == "Cf") return is_in_category_ranges(cp, CAT_CF_RANGES, sizeof(CAT_CF_RANGES)/sizeof(CategoryRange));
-        if (cat == "P") return is_in_category_ranges(cp, CAT_P_RANGES, sizeof(CAT_P_RANGES)/sizeof(CategoryRange));
-        if (cat == "Z") return is_in_category_ranges(cp, CAT_Z_RANGES, sizeof(CAT_Z_RANGES)/sizeof(CategoryRange));
-        return false;
-    }
-
-    bool is_whitespace(uint32_t cp) {
-        if (cp == 0x0009 || cp == 0x000A || cp == 0x000B || cp == 0x000C || cp == 0x000D) return true;
-        return is_category(cp, "Z");
-    }
-
-    bool is_punctuation(uint32_t cp) {
-        return is_category(cp, "P");
-    }
-    
-    void decompose(uint32_t cp, std::string& result) {
-        int low = 0, high = (sizeof(DECOMP_TABLE)/sizeof(Decomp)) - 1;
-        while(low <= high) {
-            int mid = low + (high - low) / 2;
-            uint32_t from = pgm_read_dword(&DECOMP_TABLE[mid].from);
-            if (from < cp) low = mid + 1;
-            else if (from > cp) high = mid - 1;
-            else {
-                uint32_t to1 = pgm_read_dword(&DECOMP_TABLE[mid].to1);
-                uint32_t to2 = pgm_read_dword(&DECOMP_TABLE[mid].to2);
-                decompose(to1, result);
-                if (to2 != 0) decompose(to2, result);
-                return;
-            }
-        }
-        result += codepoint_to_utf8(cp);
-    }
-    
-    void trim(std::string &s) {
-        s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) { return !isspace(ch); }));
-        s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) { return !isspace(ch); }).base(), s.end());
+// --- Utilities for working with UTF-8 and Unicode categories ---
+static size_t get_utf8_char_len(unsigned char b) {
+    if (b < 0x80) return 1; if ((b & 0xE0) == 0xC0) return 2; if ((b & 0xF0) == 0xE0) return 3; if ((b & 0xF8) == 0xF0) return 4; return 0;
+}
+static uint32_t utf8_to_codepoint(const unsigned char* s, size_t len) {
+    if (len == 0) return 0;
+    switch(len) {
+        case 1: return s[0];
+        case 2: return ((s[0] & 0x1F) << 6) | (s[1] & 0x3F);
+        case 3: return ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+        case 4: return ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+        default: return 0;
     }
 }
-
-// --- ResourceView & Subclasses (Implementations) ---
-
-ResourceView::ResourceView(uint64_t offset, uint32_t size) : _offset(offset), _size(size) {
-    if (_size < 4) {
-        _entry_count = 0;
-        return;
+static std::string codepoint_to_utf8(uint32_t cp) {
+    std::string result;
+    if (cp < 0x80) { result += static_cast<char>(cp); }
+    else if (cp < 0x800) { result += static_cast<char>(0xC0 | (cp >> 6)); result += static_cast<char>(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) { result += static_cast<char>(0xE0 | (cp >> 12)); result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); result += static_cast<char>(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x110000) { result += static_cast<char>(0xF0 | (cp >> 18)); result += static_cast<char>(0x80 | ((cp >> 12) & 0x3F)); result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); result += static_cast<char>(0x80 | (cp & 0x3F)); }
+    return result;
+}
+#include "TISA_UCD_TABLES.h"
+static bool is_in_category_ranges(uint32_t cp, const CategoryRange* ranges, size_t count) {
+    int low = 0, high = count - 1;
+    while(low <= high) {
+        int mid = low + (high - low) / 2;
+        uint32_t start = pgm_read_dword(&ranges[mid].start);
+        uint32_t end = pgm_read_dword(&ranges[mid].end);
+        if (cp < start) high = mid - 1; else if (cp > end) low = mid + 1; else return true;
     }
-    #if TISA_VM_DEBUG
-    Serial.printf("[ResourceView] Constructor for resource at offset %llu, size %u\n", _offset, _size);
-    #endif
+    return false;
+}
+static bool is_category(uint32_t cp, const std::string& cat) {
+    if (cat == "P") return is_in_category_ranges(cp, CAT_P_RANGES, sizeof(CAT_P_RANGES)/sizeof(CategoryRange));
+    if (cat == "Z") return is_in_category_ranges(cp, CAT_Z_RANGES, sizeof(CAT_Z_RANGES)/sizeof(CategoryRange));
+        // Add support for Mn, Cc, Cf for BERT normalizers
+    if (cat == "Mn") return is_in_category_ranges(cp, CAT_MN_RANGES, sizeof(CAT_MN_RANGES)/sizeof(CategoryRange));
+    if (cat == "Cc") return is_in_category_ranges(cp, CAT_CC_RANGES, sizeof(CAT_CC_RANGES)/sizeof(CategoryRange));
+    if (cat == "Cf") return is_in_category_ranges(cp, CAT_CF_RANGES, sizeof(CAT_CF_RANGES)/sizeof(CategoryRange));
+    return false;
+}
+static bool is_whitespace(uint32_t cp) { return (cp >= 0x0009 && cp <= 0x000D) || cp == 0x0020 || cp == 0x00A0 || is_category(cp, "Z"); }
+enum CharType { LETTER, NUMBER, WHITESPACE, OTHER };
+static CharType get_char_type(uint32_t cp) {
+    if (is_whitespace(cp)) return WHITESPACE;
+    if ((cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') || (cp >= 0x0400 && cp <= 0x04FF) || (cp >= 0x00C0 && cp <= 0x02AF)) return LETTER;
+    if (cp >= '0' && cp <= '9') return NUMBER;
+    return OTHER;
+}
+static bool is_punctuation(uint32_t cp) { return is_category(cp, "P"); }
+static bool is_cjk(uint32_t cp) {
+return (cp >= 0x4E00 && cp <= 0x9FFF) ||
+       (cp >= 0x3040 && cp <= 0x309F) ||
+       (cp >= 0x30A0 && cp <= 0x30FF) ||
+       (cp >= 0xAC00 && cp <= 0xD7AF);
+}
+
+// This function is used in TISAVM::_primitive_partition_rules, so it is NOT static
+// IMPORTANT: The order of the checks must exactly match the order of the alternatives in the Python regex:
+// 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+size_t find_gpt_next_token(const std::string& text, size_t start_pos, size_t& out_end) {
+    if (start_pos >= text.length()) {
+        return std::string::npos;
+    }
+
+    // 1. Contractions: 's|'t|'re|'ve|'m|'ll|'d
+    if (text[start_pos] == '\'') {
+        const std::vector<std::string> contractions = {"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"};
+        for (const auto& c : contractions) {
+            if (text.compare(start_pos, c.length(), c) == 0) {
+                out_end = start_pos + c.length();
+                return start_pos;
+            }
+        }
+    }
+
+    // 2-4. " ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+" - optional space + group
+    // These are THREE alternatives, but the logic is the same: optional space + a sequence of characters of the same type
+    size_t cur = start_pos;
+    bool has_space = (text[cur] == ' ');
+    if (has_space) ++cur;
+
+    // Check that there is a non-whitespace character after the optional space
+    if (cur < text.length()) {
+        size_t cl = get_utf8_char_len(text[cur]);
+        if (cl > 0) {
+            uint32_t cp = utf8_to_codepoint((const unsigned char*)&text[cur], cl);
+            CharType type = get_char_type(cp);
+            
+            // If this is NOT whitespace, form a group
+            if (type != WHITESPACE) {
+                size_t group_end = cur;
+                
+                if (type == LETTER) {
+                    // " ?\p{L}+" - form letters
+                    while (group_end < text.length()) {
+                        cl = get_utf8_char_len(text[group_end]);
+                        if (cl == 0) break;
+                        if (get_char_type(utf8_to_codepoint((const unsigned char*)&text[group_end], cl)) != LETTER) break;
+                        group_end += cl;
+                    }
+                } else if (type == NUMBER) {
+                    // " ?\p{N}+" - form numbers
+                    while (group_end < text.length()) {
+                        cl = get_utf8_char_len(text[group_end]);
+                        if (cl == 0) break;
+                        if (get_char_type(utf8_to_codepoint((const unsigned char*)&text[group_end], cl)) != NUMBER) break;
+                        group_end += cl;
+                    }
+                } else { // OTHER
+                    // " ?[^\s\p{L}\p{N}]+" - form non-letters, non-numbers, and non-whitespace.
+                    while (group_end < text.length()) {
+                        cl = get_utf8_char_len(text[group_end]);
+                        if (cl == 0) break;
+                        CharType t = get_char_type(utf8_to_codepoint((const unsigned char*)&text[group_end], cl));
+                        if (t == WHITESPACE || t == LETTER || t == NUMBER) break;
+                        group_end += cl;
+                    }
+                }
+                
+                out_end = group_end;
+                return start_pos; // Return the beginning (including the optional space if there was one)
+            }
+        }
+    }
+
+    // 5-6. "\s+(?!\S)|\s+" - whitespace
+    // If got here, it means it starts with whitespace (or there was a space but after it there is also a space/end)
+    size_t cl = get_utf8_char_len(text[start_pos]);
+    if (cl > 0) {
+        uint32_t cp = utf8_to_codepoint((const unsigned char*)&text[start_pos], cl);
+        if (is_whitespace(cp)) {
+            size_t end = start_pos;
+            while (end < text.length()) {
+                cl = get_utf8_char_len(text[end]);
+                if (cl == 0) break;
+                if (!is_whitespace(utf8_to_codepoint((const unsigned char*)&text[end], cl))) break;
+                end += cl;
+            }
+            out_end = end;
+            return start_pos;
+        }
+    }
+
+    // Shouldn't end up here, but just in case
+    out_end = start_pos + 1;
+    return start_pos;
+}
+
+// --- Classes ResourceView ---
+ResourceView::ResourceView(uint64_t off, uint32_t sz) : _offset(off), _size(sz) {
+    _entry_count = 0;
+    // Работаем с уже открытым файлом, как в старой версии
     xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
-    sdcard.seek(_offset);
-    sdcard.readData((uint8_t*)&_entry_count, 4);
+    if(sdcard.seek(_offset)) {
+        if (sdcard.readData((uint8_t*)&_entry_count, 4) != 4) {
+            _entry_count = 0;
+        }
+    }
     xSemaphoreGive(g_sd_card_mutex);
-    #if TISA_VM_DEBUG
-    Serial.printf("[ResourceView] Found %u entries.\n", _entry_count);
-    #endif
 }
 
 std::string ResourceView::_internal_read_string_from_current_pos() {
-    uint16_t len;
-    if (sdcard.readData((uint8_t*)&len, 2) != 2) return "";
-    if (len > 0) {
-        std::string s(len, '\0');
-        if (sdcard.readData((uint8_t*)s.data(), len) != len) return "";
-        return s;
-    }
-    return "";
+    uint16_t len; if (sdcard.readData((uint8_t*)&len, 2) != 2) return "";
+    std::string s(len, '\0'); if (len > 0 && sdcard.readData((uint8_t*)s.data(), len) != len) return "";
+    return s;
 }
 
-// --- BinaryVocabView (for encoding with block caching) ---
-BinaryVocabView::BinaryVocabView(uint64_t offset, uint32_t size) : ResourceView(offset, size) {
-    _offset_cache.reserve(OFFSETS_PER_CACHE);
-    #if TISA_VM_DEBUG
-    Serial.println("[BinaryVocabView] Initialized for block-based reading.");
-    #endif
-}
+BinaryVocabView::BinaryVocabView(uint64_t off, uint32_t sz) : ResourceView(off, sz) { _offset_cache.reserve(OFFSETS_PER_CACHE); }
 
-uint32_t BinaryVocabView::_get_offset_at(uint32_t index) {
-    if (index >= _entry_count) return 0;
-    uint32_t block_index = index / OFFSETS_PER_CACHE;
-    uint32_t index_in_block = index % OFFSETS_PER_CACHE;
-    if (block_index == _cached_block_index) return _offset_cache[index_in_block];
-
-    #if TISA_VM_DEBUG
-    Serial.printf("[BinaryVocabView] Cache miss for index %u. Loading block %u...\n", index, block_index);
-    #endif
+uint32_t BinaryVocabView::_get_offset_at(uint32_t idx) {
+    if (idx >= _entry_count) return 0xFFFFFFFF;
+    if (idx / OFFSETS_PER_CACHE == _cached_block_index) return _offset_cache[idx % OFFSETS_PER_CACHE];
 
     xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
     _cached_block_index = -1;
-    uint64_t seek_pos = _offset + 4 + (uint64_t)block_index * CACHE_SIZE_BYTES;
+    // БЕЗ openFile/closeFile. ИСПОЛЬЗУЕМ СМЕЩЕНИЕ +4 для пропуска заголовка с кол-вом записей
+    if (sdcard.seek(_offset + 4 + (uint64_t)(idx/OFFSETS_PER_CACHE) * CACHE_SIZE_BYTES)) {
+        uint32_t entries = std::min(OFFSETS_PER_CACHE, _entry_count-(idx/OFFSETS_PER_CACHE)*OFFSETS_PER_CACHE);
+        _offset_cache.resize(entries);
+        if (sdcard.readData((uint8_t*)_offset_cache.data(), entries * sizeof(uint32_t)) == entries * sizeof(uint32_t)) {
+            _cached_block_index = idx / OFFSETS_PER_CACHE;
+        }
+    }
+    xSemaphoreGive(g_sd_card_mutex);
+    return (_cached_block_index == idx/OFFSETS_PER_CACHE) ? _offset_cache[idx % OFFSETS_PER_CACHE] : 0xFFFFFFFF;
+}
+
+BinaryVocabView::VocabEntry BinaryVocabView::_read_entry_at_index(uint32_t idx) {
+    VocabEntry e = {"", -1, 0.0f}; uint32_t rel = _get_offset_at(idx); if (rel == 0xFFFFFFFF) return e;
+    uint64_t data_section_start = _offset + (uint64_t(_entry_count) * 4) + 4;
+
+    xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
+    // БЕЗ openFile/closeFile
+    if (sdcard.seek(data_section_start + rel)) {
+        e.key = _internal_read_string_from_current_pos();
+        if (!e.key.empty()) {
+            sdcard.readData((uint8_t*)&e.id, 4);
+            sdcard.readData((uint8_t*)&e.score, 4);
+        }
+    }
+    xSemaphoreGive(g_sd_card_mutex);
+    return e;
+}
+
+std::string BinaryVocabView::read_token_by_data_offset(uint32_t off) {
+    if (off == 0xFFFFFFFF) return "";
+    std::string tok;
+    uint64_t data_section_start = _offset + (uint64_t(_entry_count) * 4) + 4;
     
-    if (sdcard.seek(seek_pos)) {
-        uint32_t entries_in_this_block = std::min(OFFSETS_PER_CACHE, _entry_count - (block_index * OFFSETS_PER_CACHE));
-        _offset_cache.resize(entries_in_this_block);
-        size_t bytes_to_read = entries_in_this_block * sizeof(uint32_t);
-        if (sdcard.readData((uint8_t*)_offset_cache.data(), bytes_to_read) == bytes_to_read) {
-            _cached_block_index = block_index;
-        } else {
-             Serial.printf("[TISA_VM][ERROR] vocab.b cache read failed for block %u\n", block_index);
+    xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
+    // БЕЗ openFile/closeFile
+    if(sdcard.seek(data_section_start + off)) {
+        tok = _internal_read_string_from_current_pos();
+    }
+    xSemaphoreGive(g_sd_card_mutex);
+    return tok;
+}
+
+bool BinaryVocabView::find(const std::string& tok, int32_t& id, float& score) {
+    if (_entry_count==0) return false; int32_t l=0, h=_entry_count-1;
+    while(l<=h) {
+        int32_t m=l+(h-l)/2; VocabEntry e=_read_entry_at_index(m); if(e.key.empty())return false;
+        int cmp=tok.compare(e.key);
+        if(cmp==0){id=e.id;score=e.score;return true;} else if(cmp<0)h=m-1; else l=m+1;
+    }
+    return false;
+}
+bool BinaryVocabView::find(const std::string& tok, int32_t& id){float d; return find(tok,id,d);}
+
+BinaryVocabIndexView::BinaryVocabIndexView(uint64_t off,uint32_t sz) : ResourceView(off,sz){_id_to_offset_cache.reserve(OFFSETS_PER_CACHE);}
+
+bool BinaryVocabIndexView::get_offset_for_id(int32_t id,uint32_t& off){
+    if(id<0||id>=_entry_count)return false;
+    uint32_t blk=id/OFFSETS_PER_CACHE,idx=id%OFFSETS_PER_CACHE;
+    if(blk==_cached_block_index){off=_id_to_offset_cache[idx];return off!=0xFFFFFFFF;}
+    
+    xSemaphoreTake(g_sd_card_mutex,portMAX_DELAY);
+    _cached_block_index=-1;
+    // БЕЗ openFile/closeFile. ИСПОЛЬЗУЕМ СМЕЩЕНИЕ +4
+    if(sdcard.seek(_offset + 4 + (uint64_t)blk * CACHE_SIZE_BYTES)){
+        uint32_t entries=std::min(OFFSETS_PER_CACHE,_entry_count-(blk*OFFSETS_PER_CACHE));
+        _id_to_offset_cache.resize(entries);
+        if(sdcard.readData((uint8_t*)_id_to_offset_cache.data(), entries * sizeof(uint32_t)) == entries * sizeof(uint32_t)) {
+            _cached_block_index=blk;
         }
     }
     xSemaphoreGive(g_sd_card_mutex);
-
-    return (_cached_block_index == block_index) ? _offset_cache[index_in_block] : 0;
+    
+    if(_cached_block_index==blk){off=_id_to_offset_cache[idx];return off!=0xFFFFFFFF;}
+    return false;
 }
 
-BinaryVocabView::VocabEntry BinaryVocabView::_read_entry_at_index(uint32_t index) {
-    VocabEntry entry = {"", -1, 0.0f};
-    uint32_t entry_relative_offset = _get_offset_at(index);
-    if (entry_relative_offset == 0 && index != 0) return entry;
+BinaryMergesView::BinaryMergesView(uint64_t off,uint32_t sz):ResourceView(off,sz){_offset_cache.reserve(OFFSETS_PER_CACHE);}
 
-    uint64_t data_start_offset = _offset + 4 + (uint64_t(_entry_count) * 4);
-    uint64_t entry_absolute_offset = data_start_offset + entry_relative_offset;
-
-    xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
-    if (sdcard.seek(entry_absolute_offset)) {
-        entry.key = _internal_read_string_from_current_pos();
-        if (!entry.key.empty()) {
-            if (sdcard.readData((uint8_t*)&entry.id, sizeof(int32_t)) != sizeof(int32_t) ||
-                sdcard.readData((uint8_t*)&entry.score, sizeof(float)) != sizeof(float)) {
-                entry.key = ""; // Invalidate entry on read error
-            }
+uint32_t BinaryMergesView::_get_offset_at(uint32_t idx){
+    if(idx>=_entry_count)return 0xFFFFFFFF;
+    if(idx/OFFSETS_PER_CACHE==_cached_block_index)return _offset_cache[idx%OFFSETS_PER_CACHE];
+    
+    xSemaphoreTake(g_sd_card_mutex,portMAX_DELAY);
+    _cached_block_index=-1;
+    // БЕЗ openFile/closeFile. ИСПОЛЬЗУЕМ СМЕЩЕНИЕ +4
+    if(sdcard.seek(_offset + 4 + (uint64_t)(idx/OFFSETS_PER_CACHE) * CACHE_SIZE_BYTES)){
+        uint32_t entries=std::min(OFFSETS_PER_CACHE,_entry_count-(idx/OFFSETS_PER_CACHE)*OFFSETS_PER_CACHE);
+        _offset_cache.resize(entries);
+        if(sdcard.readData((uint8_t*)_offset_cache.data(), entries * sizeof(uint32_t)) == entries * sizeof(uint32_t)) {
+            _cached_block_index=idx/OFFSETS_PER_CACHE;
         }
     }
     xSemaphoreGive(g_sd_card_mutex);
-    return entry;
+    return(_cached_block_index==idx/OFFSETS_PER_CACHE)?_offset_cache[idx%OFFSETS_PER_CACHE]:0xFFFFFFFF;
 }
 
-std::string BinaryVocabView::read_token_by_data_offset(uint32_t data_offset) {
-    uint64_t data_start_offset = get_base_offset() + 4 + (uint64_t(get_entry_count()) * 4);
-    uint64_t entry_absolute_offset = data_start_offset + data_offset;
-    std::string token;
-    xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
-    if (sdcard.seek(entry_absolute_offset)) token = _internal_read_string_from_current_pos();
-    xSemaphoreGive(g_sd_card_mutex);
-    return token;
-}
+bool BinaryMergesView::find(const std::pair<std::string,std::string>& p,int32_t& r){
+    if(_entry_count==0)return false;
+    int32_t low=0,high=_entry_count-1;
+    while(low<=high){
+        int32_t mid=low+(high-low)/2;
+        uint32_t rel=_get_offset_at(mid); if(rel==0xFFFFFFFF)return false;
+        std::string t1,t2; int32_t rank; bool ok=false;
+        uint64_t data_section_start = _offset + (uint64_t(_entry_count) * 4) + 4;
 
-bool BinaryVocabView::find(const std::string& token, int32_t& id) { float d; return find(token, id, d); }
+        xSemaphoreTake(g_sd_card_mutex,portMAX_DELAY);
+        // БЕЗ openFile/closeFile
+        if(sdcard.seek(data_section_start + rel)){
+            t1=_internal_read_string_from_current_pos();
+            t2=_internal_read_string_from_current_pos();
+            if(sdcard.readData((uint8_t*)&rank,4)==4)ok=true;
+        }
+        xSemaphoreGive(g_sd_card_mutex);
 
-bool BinaryVocabView::find(const std::string& token, int32_t& id, float& score) {
-    if (_entry_count == 0) return false;
-    int32_t low = 0, high = _entry_count - 1;
-    while (low <= high) {
-        int32_t mid = low + (high - low) / 2;
-        VocabEntry mid_entry = _read_entry_at_index(mid);
-        if (mid_entry.key.empty()) {
-            #if TISA_VM_DEBUG
-            Serial.printf("[BinaryVocabView] Failed to read entry at mid %d\n", mid);
-            #endif
-            return false;
-        }
-        
-        int cmp = token.compare(mid_entry.key);
-        if (cmp == 0) {
-            id = mid_entry.id;
-            score = mid_entry.score;
-            return true;
-        } else if (cmp < 0) {
-            high = mid - 1;
-        } else {
-            low = mid + 1;
-        }
+        if(!ok)return false;
+        int c1=p.first.compare(t1);
+        if(c1==0){
+            int c2=p.second.compare(t2);
+            if(c2==0){r=rank;return true;}else if(c2<0)high=mid-1;else low=mid+1;
+        }else if(c1<0)high=mid-1;else low=mid+1;
     }
     return false;
 }
 
+// --- TISAVM ---
 
-// --- BinaryVocabIndexView (for decoding with block caching) ---
-BinaryVocabIndexView::BinaryVocabIndexView(uint64_t offset, uint32_t size) : ResourceView(offset, size) {
-    _id_to_offset_cache.reserve(OFFSETS_PER_CACHE);
-    #if TISA_VM_DEBUG
-    Serial.println("[BinaryVocabIndexView] Initialized for block-based reading.");
-    #endif
-}
+TISAVM::TISAVM(VM_Resources& res):m_res(res){}
 
-bool BinaryVocabIndexView::get_offset_for_id(int32_t id, uint32_t& offset) {
-    if (id < 0 || id >= _entry_count) return false;
-    uint32_t block_index = id / OFFSETS_PER_CACHE;
-    uint32_t index_in_block = id % OFFSETS_PER_CACHE;
-    if (block_index == _cached_block_index) {
-        offset = _id_to_offset_cache[index_in_block];
-        return true;
-    }
-
-    #if TISA_VM_DEBUG
-    Serial.printf("[BinaryVocabIndexView] Cache miss for ID %d. Loading block %u...\n", id, block_index);
-    #endif
-
-    xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
-    _cached_block_index = -1;
-    uint64_t seek_pos = _offset + 4 + (uint64_t)block_index * CACHE_SIZE_BYTES;
-    if (sdcard.seek(seek_pos)) {
-        uint32_t entries_in_this_block = std::min(OFFSETS_PER_CACHE, _entry_count - (block_index * OFFSETS_PER_CACHE));
-        _id_to_offset_cache.resize(entries_in_this_block);
-        size_t bytes_to_read = entries_in_this_block * sizeof(uint32_t);
-        if (sdcard.readData((uint8_t*)_id_to_offset_cache.data(), bytes_to_read) == bytes_to_read) {
-            _cached_block_index = block_index;
-        } else {
-             Serial.printf("[TISA_VM][ERROR] vidx.b cache read failed for block %u\n", block_index);
-        }
-    }
-    xSemaphoreGive(g_sd_card_mutex);
-
-    if (_cached_block_index == block_index) {
-        offset = _id_to_offset_cache[index_in_block];
-        return true;
-    }
-    return false;
-}
-
-// --- BinaryMergesView (No changes needed) ---
-bool BinaryMergesView::find(const std::pair<std::string, std::string>& token_pair, int32_t& rank) {
-    uint64_t current_pos = _offset + 4;
-    bool found = false;
-    xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
-    for (uint32_t i = 0; i < _entry_count; ++i) {
-        if (!sdcard.seek(current_pos)) break;
-        std::string token1 = _internal_read_string_from_current_pos();
-        std::string token2 = _internal_read_string_from_current_pos();
-        if (token1 == token_pair.first && token2 == token_pair.second) {
-            rank = i;
-            found = true;
-            break;
-        }
-        current_pos = sdcard.getPosition();
-    }
-    xSemaphoreGive(g_sd_card_mutex);
-    return found;
-}
-
-// --- TISAVM (Implementation) ---
-TISAVM::TISAVM(VM_Resources& res) : m_res(res) {}
-
-std::vector<int32_t> TISAVM::run(const std::vector<uint8_t>& manifest_data, const std::string& text) {
-    Serial.println("[TISA_VM] Starting run...");
-    TISA_State state;
-    state.text = text;
+std::vector<int32_t> TISAVM::run(const std::vector<uint8_t>& mf, const std::string& txt) {
+    TISA_State s;
+    s.text = txt;
     
-    if (manifest_data.size() < 5 || memcmp(manifest_data.data(), "TISA", 4) != 0) {
-        Serial.println("[TISA_VM][ERROR] Invalid manifest header.");
+    // Signature verification
+    if (mf.size() < 5 || memcmp(mf.data(), "TISA", 4) != 0) {
         return {};
     }
     
+    // Execute all operations from the manifest
     size_t offset = 5;
-    while (offset < manifest_data.size()) {
-        uint8_t opcode = manifest_data[offset++];
-        uint32_t payload_len;
-        memcpy(&payload_len, &manifest_data[offset], sizeof(uint32_t));
+    while (offset < mf.size()) {
+        uint8_t op = mf[offset++];
+        uint32_t len;
+        memcpy(&len, &mf[offset], 4);
         offset += 4;
         
-        #if TISA_VM_DEBUG
-        Serial.printf("[TISA_VM] Dispatching opcode 0x%02X\n", opcode);
-        #endif
-        _dispatch_opcode(opcode, &manifest_data[offset], payload_len, state);
+        _dispatch_opcode(op, &mf[offset], len, s);
+        offset += len;
+    }
+    
+    // Each primitive function is responsible for creating fragments when needed.
+    return s.ids;
+}
+
+void TISAVM::_dispatch_opcode(uint8_t op, const uint8_t* p, size_t len, TISA_State& s){
+    switch (op) {
+case 0x01: { // LOWERCASE — full-fledged Unicode (Cyrillic + Latin Extended)
+    std::string lower_text;
+    for (size_t i = 0; i < s.text.length(); ) {
+        size_t char_len = get_utf8_char_len(s.text[i]);
+        if (char_len == 0) { i++; continue; }
+
+        uint32_t cp = utf8_to_codepoint((const unsigned char*)&s.text[i], char_len);
+        uint32_t lower_cp = cp;
+
+        if (cp >= 'A' && cp <= 'Z') lower_cp = cp + 32;                    // ASCII
+        else if (cp >= 0x0410 && cp <= 0x042F) lower_cp = cp + 32;         // А-Я → а-я
+        else if (cp >= 0x00C0 && cp <= 0x00D6) lower_cp = cp + 0x20;       // À-Ö
+        else if (cp >= 0x00D8 && cp <= 0x00DE) lower_cp = cp + 0x20;       // Ø-Þ
+        else if (cp >= 0x0391 && cp <= 0x03A1) lower_cp = cp + 0x20;       // Greek (just in case)
+
+        lower_text += codepoint_to_utf8(lower_cp);
+        i += char_len;
+    }
+    s.text = lower_text;
+    break;
+}
+case 0x02: { // UNICODE_NORM
+    std::string form((char*)&p[1], p[0]); // form = "NFD" or "NFC"
+    std::string normalized_text;
+    for (size_t i = 0; i < s.text.length(); ) {
+        size_t cl = get_utf8_char_len(s.text[i]);
+        if (cl == 0) { i++; continue; }
+        uint32_t cp = utf8_to_codepoint((const unsigned char*)&s.text[i], cl);
+
+        if (form == "NFD" && is_category(cp, "Mn")) {
+            // skip combining marks (strip accents после NFD)
+            i += cl;
+            continue;
+        }
+        // For NFC and the rest, leave it as is (or you can add decomposition, but for now it's enough)
+        normalized_text += s.text.substr(i, cl);
+        i += cl;
+    }
+    s.text = normalized_text;
+    break;
+}
+        case 0x03: { 
+            std::string pat((char*)&p[2],*(uint16_t*)p);
+            std::string val((char*)&p[4+pat.length()],*(uint16_t*)&p[2+pat.length()]); 
+            size_t pos=0; 
+            while((pos=s.text.find(pat,pos))!=std::string::npos) {
+                s.text.replace(pos,pat.length(),val);
+                pos += val.length(); // Continue the search after replacement
+            }
+            break; 
+        }
+        case 0x04: { // FILTER_CATEGORY
+            uint8_t num_cats = p[0];
+            const uint8_t* ptr = &p[1];
+            std::vector<std::string> cats;
+            for(int i = 0; i < num_cats; ++i) {
+                uint8_t cat_len = ptr[0]; ptr++;
+                cats.push_back(std::string((char*)ptr, cat_len));
+                ptr += cat_len;
+            }
+
+            std::string filtered_text;
+            for (size_t i = 0; i < s.text.length(); ) {
+                size_t char_len = get_utf8_char_len(s.text[i]);
+                if (char_len == 0) { i++; continue; }
+                uint32_t cp = utf8_to_codepoint((const unsigned char*)&s.text[i], char_len);
+                bool should_filter = false;
+                for (const auto& cat : cats) {
+                    if (is_category(cp, cat)) {
+                        should_filter = true;
+                        break;
+                    }
+                }
+                if (!should_filter) {
+                    filtered_text += s.text.substr(i, char_len);
+                }
+                i += char_len;
+            }
+            s.text = filtered_text;
+            break;
+        }
+        case 0x07: { 
+            std::string val((char*)&p[2],*(uint16_t*)p); 
+            if(s.text.rfind(val,0)!=0) s.text.insert(0,val); 
+            break; 
+        }
+        case 0x10: _primitive_partition_rules(s, p, len); break;
+case 0x15: { // BYTE_ENCODE
+    // If there are no fragments, create one from the entire text
+    if (s.fragments.empty() && !s.text.empty()) {
+        s.fragments.push_back({s.text, false});
+    }
+    
+    // Apply byte encoding to unprotected fragments
+    for (auto& f : s.fragments) {
+        if (f.is_protected) continue;
         
-        offset += payload_len;
+        std::string encoded;
+        // IMPORTANT: convert to unsigned char for correct operation with byte_map
+        for (size_t i = 0; i < f.text.length(); ++i) {
+            unsigned char byte = static_cast<unsigned char>(f.text[i]);
+            auto it = m_res.byte_map.find(byte);
+            if (it != m_res.byte_map.end()) {
+                encoded += it->second;
+            }
+            // The 'else' block has been removed. A complete byte_map with 256 entries is a
+            // precondition for this algorithm. Appending a raw byte here corrupts
+            // the UTF-8 stream and is a critical bug. If a byte is missing from the map,
+            // it's better to drop it (or fix the resource generator) than to crash the entire pipeline.
+        }
+        f.text = encoded;
+    }
+    break;
+}
+        case 0x20: _primitive_bpe_encode(s); break;
+        case 0x21: { std::string marker((char*)&p[1],p[0]); _primitive_wordpiece_encode(s, marker); break; }
+        case 0x22: _primitive_unigram_encode(s); break;
+        case 0x30: { 
+            std::vector<int32_t> out;
+            uint8_t n=p[0];
+            const uint8_t* ptr=&p[1]; 
+            for(int i=0;i<n;i++){
+                if(ptr[0]){ // is_fixed
+                    ptr++;
+                    if(ptr[0]){ // is_int
+                        ptr++;
+                        int32_t id;memcpy(&id,ptr,4);ptr+=4;out.push_back(id);
+                    }else{ // is_string
+                        ptr++;
+                        std::string tok((char*)&ptr[1],ptr[0]);ptr+=1+tok.length();
+                        int32_t id=2; // default unk
+                        m_res.vocab->find(tok,id);
+                        out.push_back(id);
+                    }
+                }else{ // is_slot
+                    ptr++;
+                    out.insert(out.end(),s.ids.begin(),s.ids.end());
+                }
+            } 
+            s.ids=out; 
+            break; 
+        }
+    }
+}
+
+// Structure for storing the parsed rule
+struct Rule {
+    std::string pattern;
+    bool is_protected = false;
+    std::string behavior; // "REMOVE", "ISOLATE", ""
+    std::string trim_preceding_space;
+    // Flag to simplify, so as not to parse \p{P} every time
+    bool is_punctuation_rule = false;
+    bool is_whitespace_rule = false;
+    bool is_gpt_style_rule = false; // For complex regex gpt2/roberta
+};
+
+// Removes escaping from protected tokens (\\| → |, \\. → . and etc.)
+static std::string unescape_protected_pattern(const std::string& p) {
+    std::string result;
+    for (size_t i = 0; i < p.length(); ++i) {
+        if (p[i] == '\\' && i + 1 < p.length()) {
+            result += p[i + 1];   // skip \
+            ++i;
+        } else {
+            result += p[i];
+        }
+    }
+    return result;
+}
+
+
+// A completely rewritten function that mimics Python logic
+void TISAVM::_primitive_partition_rules(TISA_State& state, const uint8_t* p, size_t len) {
+    state.fragments.clear();
+    const std::string& text = state.text;
+    
+    // Read the number of rules
+    const uint8_t* ptr = p;
+    uint16_t num_rules;
+    memcpy(&num_rules, ptr, 2); 
+    ptr += 2;
+
+    // IMPORTANT: If there are no rules, the entire text is one fragment (like in Python line 47)
+    if (num_rules == 0) {
+        if (!text.empty()) {
+            state.fragments.push_back({text, false});
+        }
+        return;
     }
 
+    // Parsing all the rules
+    std::vector<Rule> rules;
+    for (uint16_t i = 0; i < num_rules; ++i) {
+        Rule rule;
+        uint8_t flags = *ptr++;
+        rule.is_protected = (flags & 1);
+
+        uint16_t pat_len;
+        memcpy(&pat_len, ptr, 2); ptr += 2;
+        rule.pattern = std::string((const char*)ptr, pat_len);
+        ptr += pat_len;
+
+        if (flags & 2) {
+            uint8_t b = *ptr++;
+            rule.behavior = (b == 1) ? "REMOVE" : (b == 2 ? "ISOLATE" : "");
+        }
+        if (flags & 4) {
+            uint8_t tlen = *ptr++;
+            rule.trim_preceding_space = std::string((const char*)ptr, tlen);
+            ptr += tlen;
+        }
+        
+        rules.push_back(rule);
+    }
+
+    // Modifying pattern for protected rules
+    // In Python (lines 42-45): If a protected rule AND starts with < or [,
+    // AND DOES NOT start with "(?: ?)", then "(?: ?)" is added to the beginning
+    for (auto& rule : rules) {
+        if (rule.is_protected) {
+            const std::string& p = rule.pattern;
+            if (!p.empty() && (p[0] == '<' || p[0] == '[')) {
+                // Check that the pattern does NOT start with "(?: ?)"
+                if (rule.pattern.rfind("(?: ?)", 0) != 0) {
+                    rule.pattern = "(?: ?)" + rule.pattern;
+                }
+            }
+        }
+    }
+
+    // Basic text processing loop
+    size_t last_pos = 0;
+    
+    while (last_pos < text.length()) {
+        size_t best_start = std::string::npos;
+        size_t best_end   = 0;
+        int    best_rule_idx = -1;
+
+        // Looking for the closest match among all the rules
+        for (size_t i = 0; i < rules.size(); ++i) {
+            const Rule& rule = rules[i];
+            size_t m_start = std::string::npos;
+            size_t m_end   = 0;
+
+            // ─────── Finding a match based on the pattern type ───────
+            
+            if (rule.pattern.rfind("(?: ?)", 0) == 0) {               
+                // Special tokens with optional space: (?: ?)<token>
+                std::string inner = rule.pattern.substr(6);
+                std::string literal = unescape_protected_pattern(inner);
+                size_t p1 = text.find(literal, last_pos);
+                size_t p2 = text.find(" " + literal, last_pos);
+                
+                if (p1 != std::string::npos && (p2 == std::string::npos || p1 <= p2)) {
+                    m_start = p1; 
+                    m_end = p1 + literal.length();
+                } else if (p2 != std::string::npos) {
+                    m_start = p2; 
+                    m_end = p2 + 1 + literal.length();
+                }
+            }
+            else if (rule.pattern == "\\p{P}") {
+                // Guaranteed isolation of punctuation for BERT/WordPiece (including ASCII)
+                for (size_t k = last_pos; k < text.length(); ) {
+                    size_t cl = get_utf8_char_len(text[k]);
+                    if (cl == 0) { ++k; continue; }
+                    uint32_t cp = utf8_to_codepoint((const unsigned char*)&text[k], cl);
+
+                    // COMBINED CHECK: first a quick ASCII check, then a full one using the Unicode table
+                    bool is_punc = 
+                        (cp == '.' || cp == ',' || cp == '!' || cp == '?' ||
+                         cp == ':' || cp == ';' || cp == '"' || cp == '\'' ||
+                         cp == '(' || cp == ')' || cp == '[' || cp == ']' ||
+                         cp == '{' || cp == '}') 
+                        || is_category(cp, "P");
+
+                    if (is_punc) {
+                        m_start = k;    // Found a match
+                        m_end = k + cl;
+                        break;          // Stop searching, as we only need the first character
+                    }
+                    
+                    k += cl;
+                }
+            }
+            else if (rule.pattern == "\\s+") {
+                // Search for whitespace sequences
+                for (size_t k = last_pos; k < text.length(); ) {
+                    size_t cl = get_utf8_char_len(text[k]);
+                    if (cl == 0) { ++k; continue; }
+                    if (is_whitespace(utf8_to_codepoint((const unsigned char*)&text[k], cl))) {
+                        m_start = k;
+                        size_t e = k + cl;
+                        while (e < text.length()) {
+                            size_t nl = get_utf8_char_len(text[e]);
+                            if (nl == 0 || !is_whitespace(utf8_to_codepoint((const unsigned char*)&text[e], nl))) 
+                                break;
+                            e += nl;
+                        }
+                        m_end = e; 
+                        break;
+                    }
+                    k += cl;
+                }
+            }
+            else if (rule.pattern.find("[\u4E00") != std::string::npos || 
+                     rule.pattern.find("\\u4E00") != std::string::npos) { 
+                // Search CJK characters
+                for (size_t k = last_pos; k < text.length(); ) {
+                    size_t cl = get_utf8_char_len(text[k]);
+                    if (cl == 0) { ++k; continue; }
+                    if (is_cjk(utf8_to_codepoint((const unsigned char*)&text[k], cl))) {
+                        m_start = k; 
+                        m_end = k + cl; 
+                        break;
+                    }
+                    k += cl;
+                }
+            }
+            else if (rule.pattern.find("'s|'t|'re") != std::string::npos) { 
+                // GPT-2 / ByteLevel complex pattern
+                m_start = find_gpt_next_token(text, last_pos, m_end);
+            }
+            else { 
+                // A regular string (including protected tokens)
+                std::string search_pat = rule.pattern;
+                if (rule.is_protected) {
+                    search_pat = unescape_protected_pattern(rule.pattern);
+                }
+                m_start = text.find(search_pat, last_pos);
+                if (m_start != std::string::npos) {
+                    m_end = m_start + search_pat.length();
+                }
+            }
+
+            // Select the earliest match
+            if (m_start != std::string::npos) {
+                if (m_start < best_start) {
+                    // This is a new, earlier match. Take it.
+                    best_start = m_start;
+                    best_end = m_end;
+                    best_rule_idx = i;
+                } else if (m_start == best_start) {
+                    // A match at the same position. Prefer the longer one.
+                    if ((m_end - m_start) > (best_end - best_start)) {
+                        best_end = m_end;
+                        best_rule_idx = i;
+                    }
+                }
+            }
+        }
+
+        // If nothing is found, the rest of the text is presented as one fragment
+        if (best_rule_idx == -1) {
+            if (last_pos < text.length()) {
+                state.fragments.push_back({text.substr(last_pos), false});
+            }
+            break;
+        }
+
+        const Rule& best_rule = rules[best_rule_idx];
+
+        // Add preceding text (text BEFORE the match)
+        if (best_start > last_pos) {
+            std::string pre = text.substr(last_pos, best_start - last_pos);
+            
+            // Processing trim_preceding_space (Python lines 55-57)
+            if (!best_rule.trim_preceding_space.empty() &&
+                pre.size() >= best_rule.trim_preceding_space.size() &&
+                pre.compare(pre.size() - best_rule.trim_preceding_space.size(),
+                            best_rule.trim_preceding_space.size(),
+                            best_rule.trim_preceding_space) == 0) {
+                pre.resize(pre.size() - best_rule.trim_preceding_space.size());
+            }
+            
+            if (!pre.empty()) {
+                state.fragments.push_back({pre, false});
+            }
+        }
+
+        // Add the match (Python lines 60-65)
+        std::string match = text.substr(best_start, best_end - best_start);
+        
+        // Trim leading space for protected tokens (Python lines 61-63)
+        if (best_rule.is_protected && match.size() > 1 && match[0] == ' ') {
+            match = match.substr(1);
+        }
+
+        // Add fragment only if behavior != REMOVE (Python line 64)
+        if (best_rule.behavior != "REMOVE") {
+            state.fragments.push_back({match, best_rule.is_protected});
+        }
+
+        last_pos = best_end;
+    }
+
+    // If there are no fragments after processing,
+    // but the text is not empty, add the entire text as a single fragment
+    // This corresponds to Python lines 67-68
+    if (state.fragments.empty() && !text.empty()) {
+        state.fragments.push_back({text, false});
+    }
+    
+    // DEBUGGING: Printing fragments
+    Serial.printf("PARTITION: %d fragments from text '%s'\n", state.fragments.size(), text.c_str());
+    for (size_t i = 0; i < state.fragments.size(); ++i) {
+        Serial.printf("  [%d] '%s' %s\n", i, state.fragments[i].text.c_str(), 
+                     state.fragments[i].is_protected ? "(protected)" : "");
+    }
+}
+
+
+void TISAVM::_primitive_bpe_encode(TISA_State& state) {
+    Serial.println("=== BPE_ENCODE START ===");
+    Serial.printf("Fragments: %d\n", state.fragments.size());
+    
+    // CRITICAL CHECK: If vocab or merges are not loaded, cannot tokenize
+    if (!m_res.vocab || !m_res.merges) {
+        Serial.println("ERROR: vocab or merges not loaded!");
+        // Leave ids empty - this indicates a resource problem.
+        state.ids.clear();
+        return;
+    }
+    
+    Serial.printf("Vocab entries: %d\n", m_res.vocab->get_entry_count());
+    Serial.printf("Merges entries: %d\n", m_res.merges->get_entry_count());
+    
+    // Defining the UNK token (Python lines 110-111)
+    int32_t unk_id = 0;
+    m_res.vocab->find("<unk>", unk_id);
+    if (unk_id == 0) m_res.vocab->find("[UNK]", unk_id);
+
+    state.ids.clear();
+    
+    // If there are no fragments, process the entire text
     if (state.fragments.empty() && !state.text.empty()) {
         state.fragments.push_back({state.text, false});
     }
-
-    Serial.println("[TISA_VM] Run finished.");
-    return state.ids;
-}
-
-std::string TISAVM::decode(const std::vector<int32_t>& ids, bool skip_special_tokens) {
-    if (!m_res.vocab || !m_res.vocab_idx_for_decode) {
-        Serial.println("[TISA_VM][ERROR] Decode called but vocab or vocab_idx is missing.");
-        return "";
-    }
-
-    std::vector<std::string> tokens;
-    for (int32_t id : ids) {
-        uint32_t data_offset;
-        if (!m_res.vocab_idx_for_decode->get_offset_for_id(id, data_offset)) continue;
-        std::string token = m_res.vocab->read_token_by_data_offset(data_offset);
-        if (token.empty()) continue;
-        if (skip_special_tokens && ((token.rfind("<", 0) == 0 && token.find(">") != std::string::npos) || (token.rfind("[", 0) == 0 && token.find("]") != std::string::npos))) continue;
-        tokens.push_back(token);
-    }
     
-    ModelType model_type = _detect_model_type();
-    if (model_type == ModelType::UNKNOWN) {
-        for(const auto& t : tokens) {
-            if (t.rfind("##", 0) == 0) { model_type = ModelType::WORDPIECE; break; }
-            if (t.find("\xE2\x96\x81") != std::string::npos) { model_type = ModelType::UNIGRAM; break; }
-        }
-    }
-    
-    std::string result;
-    switch (model_type) {
-        case ModelType::BPE: {
-             std::map<unsigned char, unsigned char> byte_decoder;
-            for(const auto& pair : m_res.byte_map) {
-                if (!pair.second.empty()) byte_decoder[static_cast<unsigned char>(pair.second[0])] = pair.first;
-            }
-            std::vector<unsigned char> full_bytes;
-            for (const auto& token : tokens) {
-                 for (unsigned char c : token) {
-                    auto it = byte_decoder.find(c);
-                    if (it != byte_decoder.end()) full_bytes.push_back(it->second);
-                 }
-            }
-            result.assign(full_bytes.begin(), full_bytes.end());
-            return result;
-        }
-        case ModelType::WORDPIECE: {
-            if (tokens.empty()) return "";
-            result = tokens[0];
-            for (size_t i = 1; i < tokens.size(); ++i) {
-                if (tokens[i].rfind("##", 0) == 0) result += tokens[i].substr(2);
-                else result += " " + tokens[i];
-            }
-            return result;
-        }
-        case ModelType::UNIGRAM: {
-            for (const auto& token : tokens) result += token;
-            const std::string metaspace = "\xE2\x96\x81";
-            size_t pos = 0;
-            while((pos = result.find(metaspace, pos)) != std::string::npos) {
-                result.replace(pos, metaspace.length(), " ");
-            }
-            if (result.rfind(" ", 0) == 0) result = result.substr(1);
-            trim(result);
-            return result;
-        }
-        case ModelType::UNKNOWN:
-        default: {
-            if (tokens.empty()) return "";
-            result = tokens[0];
-            for (size_t i = 1; i < tokens.size(); ++i) result += " " + tokens[i];
-            return result;
-        }
-    }
-}
-
-TISAVM::ModelType TISAVM::_detect_model_type() {
-    if (m_res.merges && m_res.merges->get_entry_count() > 0) return ModelType::BPE;
-    if (!m_res.unigram_scores.empty()) return ModelType::UNIGRAM;
-    return ModelType::UNKNOWN;
-}
-
-// --- Primitives (Full code) ---
-
-void TISAVM::_dispatch_opcode(uint8_t opcode, const uint8_t* payload, size_t payload_len, TISA_State& state) {
-    size_t offset = 0;
-    switch (opcode) {
-        case 0x01: _primitive_lowercase(state); break;
-        case 0x02: {
-            uint8_t form_len = payload[offset++];
-            std::string form((char*)&payload[offset], form_len);
-            _primitive_unicode_norm(state, form);
-            break;
-        }
-        case 0x03: {
-            uint16_t pattern_len, val_len;
-            memcpy(&pattern_len, &payload[offset], 2); offset += 2;
-            std::string pattern((char*)&payload[offset], pattern_len); offset += pattern_len;
-            memcpy(&val_len, &payload[offset], 2); offset += 2;
-            std::string val((char*)&payload[offset], val_len);
-            _primitive_replace(state, pattern, val);
-            break;
-        }
-        case 0x04: {
-            uint8_t num_cats = payload[offset++];
-            std::vector<std::string> cats;
-            for(int i=0; i<num_cats; ++i) {
-                uint8_t cat_len = payload[offset++];
-                cats.push_back(std::string((char*)&payload[offset], cat_len));
-                offset += cat_len;
-            }
-            _primitive_filter_category(state, cats);
-            break;
-        }
-        case 0x07: {
-            uint16_t val_len;
-            memcpy(&val_len, &payload[offset], 2); offset += 2;
-            std::string val((char*)&payload[offset], val_len);
-            _primitive_prepend(state, val);
-            break;
-        }
-        case 0x10: _primitive_partition_rules(state, std::vector<uint8_t>(payload, payload + payload_len)); break;
-        case 0x15: _primitive_byte_encode(state); break;
-        case 0x20: _primitive_bpe_encode(state); break;
-        case 0x21: {
-            uint8_t marker_len = payload[offset++];
-            std::string marker((char*)&payload[offset], marker_len);
-            _primitive_wordpiece_encode(state, marker);
-            break;
-        }
-        case 0x22: _primitive_unigram_encode(state); break;
-        case 0x30: _primitive_compose(state, std::vector<uint8_t>(payload, payload + payload_len)); break;
-        default: break;
-    }
-}
-
-void TISAVM::_primitive_lowercase(TISA_State& state) {
-    std::string result;
-    result.reserve(state.text.length());
-    const unsigned char* c_str = (const unsigned char*)state.text.c_str();
-    size_t offset = 0;
-    while(offset < state.text.length()) {
-        size_t len = get_utf8_char_len(c_str[offset]);
-        if (len == 0 || offset + len > state.text.length()) { offset++; continue; }
-        uint32_t cp = utf8_to_codepoint(&c_str[offset], len);
-        result += codepoint_to_utf8(codepoint_to_lower(cp));
-        offset += len;
-    }
-    state.text = result;
-}
-
-void TISAVM::_primitive_unicode_norm(TISA_State& state, const std::string& form) {
-    if (form != "NFD") return;
-    std::string normalized_text;
-    normalized_text.reserve(state.text.length());
-    const unsigned char* c_str = (const unsigned char*)state.text.c_str();
-    size_t offset = 0;
-    while (offset < state.text.length()) {
-        size_t len = get_utf8_char_len(c_str[offset]);
-        if (len == 0 || offset + len > state.text.length()) { offset++; continue; }
-        uint32_t cp = utf8_to_codepoint(&c_str[offset], len);
-        decompose(cp, normalized_text);
-        offset += len;
-    }
-    state.text = normalized_text;
-}
-
-void TISAVM::_primitive_replace(TISA_State& state, const std::string& pattern, const std::string& val) {
-    size_t start_pos = 0;
-    while((start_pos = state.text.find(pattern, start_pos)) != std::string::npos) {
-        state.text.replace(start_pos, pattern.length(), val);
-        start_pos += val.length();
-    }
-}
-
-void TISAVM::_primitive_filter_category(TISA_State& state, const std::vector<std::string>& cats) {
-    std::string result;
-    result.reserve(state.text.length());
-    const unsigned char* c_str = (const unsigned char*)state.text.c_str();
-    size_t offset = 0;
-    while(offset < state.text.length()) {
-        size_t len = get_utf8_char_len(c_str[offset]);
-        if (len == 0 || offset + len > state.text.length()) { offset++; continue; }
-        uint32_t cp = utf8_to_codepoint(&c_str[offset], len);
-        bool should_filter = false;
-        for (const auto& cat : cats) {
-            if (is_category(cp, cat)) { should_filter = true; break; }
-        }
-        if (!should_filter) result.append(state.text.substr(offset, len));
-        offset += len;
-    }
-    state.text = result;
-}
-
-void TISAVM::_primitive_prepend(TISA_State& state, const std::string& val) {
-    if (state.text.rfind(val, 0) != 0) state.text.insert(0, val);
-}
-
-void TISAVM::_primitive_partition_rules(TISA_State& state, const std::vector<uint8_t>& rules_payload) {
-    state.fragments.clear();
-    const uint8_t* p = rules_payload.data();
-
-    enum class PatternType { LITERAL, WHITESPACE, PUNCTUATION, COMPLEX_GPT2 };
-    struct Rule {
-        std::string pattern_str;
-        PatternType type = PatternType::LITERAL;
-        bool is_protected = false;
-        std::string trim_preceding_space;
-        uint8_t behavior_code = 0;
-    };
-    
-    std::vector<Rule> rules;
-    uint16_t num_rules; memcpy(&num_rules, p, 2); p += 2;
-
-    for (int i = 0; i < num_rules; ++i) {
-        Rule r;
-        uint8_t flags = *p++;
-        uint16_t pattern_len; memcpy(&pattern_len, p, 2); p += 2;
-        r.pattern_str = std::string((char*)p, pattern_len); p += pattern_len;
-        r.is_protected = (flags & 1);
-        if (flags & 2) r.behavior_code = *p++;
-        if (flags & 4) { uint8_t trim_len = *p++; r.trim_preceding_space = std::string((char*)p, trim_len); p += trim_len; }
-        
-        if (r.pattern_str == "\\s+") r.type = PatternType::WHITESPACE;
-        else if (r.pattern_str == "\\p{P}") r.type = PatternType::PUNCTUATION;
-        else if (r.pattern_str.find("\\p{L}") != std::string::npos || r.pattern_str.find("\\p{N}") != std::string::npos) r.type = PatternType::COMPLEX_GPT2;
-        else {
-            const std::string prefix = "(?: ?)";
-            if (r.pattern_str.rfind(prefix, 0) == 0) r.pattern_str = r.pattern_str.substr(prefix.length());
-        }
-        rules.push_back(r);
-    }
-    
-    if (rules.empty()) { if (!state.text.empty()) state.fragments.push_back({state.text, false}); return; }
-    
-    std::string current_chunk;
-    size_t offset = 0;
-    const unsigned char* text_ptr = (const unsigned char*)state.text.c_str();
-
-    auto flush_chunk = [&](const std::string& preceding_space_char = "") {
-        if (current_chunk.empty()) return;
-        std::string chunk_to_add = current_chunk;
-        if (!preceding_space_char.empty() && chunk_to_add.length() >= preceding_space_char.length()) {
-            if (chunk_to_add.substr(chunk_to_add.length() - preceding_space_char.length()) == preceding_space_char) {
-                chunk_to_add.erase(chunk_to_add.length() - preceding_space_char.length());
-            }
-        }
-        if (!chunk_to_add.empty()) state.fragments.push_back({chunk_to_add, false});
-        current_chunk.clear();
-    };
-
-    while(offset < state.text.length()) {
-        bool rule_matched = false;
-        // 1. Проверяем правила-литералы (самый высокий приоритет)
-        for (const auto& rule : rules) {
-            if (rule.type == PatternType::LITERAL && state.text.compare(offset, rule.pattern_str.length(), rule.pattern_str) == 0) {
-                flush_chunk(rule.trim_preceding_space);
-                if (rule.behavior_code != 1) state.fragments.push_back({rule.pattern_str, rule.is_protected});
-                offset += rule.pattern_str.length();
-                rule_matched = true;
-                break;
-            }
-        }
-        if (rule_matched) continue;
-        
-        size_t char_len = get_utf8_char_len(text_ptr[offset]);
-        if (char_len == 0) { offset++; continue; }
-        uint32_t cp = utf8_to_codepoint(&text_ptr[offset], char_len);
-        
-        // 2. Проверяем правила по классам символов
-        for (const auto& rule : rules) {
-            bool class_match = (rule.type == PatternType::WHITESPACE && is_whitespace(cp)) || (rule.type == PatternType::PUNCTUATION && is_punctuation(cp));
-            if (class_match) {
-                if (rule.behavior_code == 2) { // ISOLATE
-                    flush_chunk();
-                    state.fragments.push_back({state.text.substr(offset, char_len), false});
-                } else if (rule.behavior_code == 1) { // REMOVE
-                    flush_chunk();
-                }
-                // Для KEEP (behavior_code=0) ничего не делаем, символ попадет в current_chunk
-                offset += char_len;
-                rule_matched = true;
-                break;
-            }
-        }
-        if (rule_matched) continue;
-
-        // 3. Если ничего не совпало, добавляем символ в текущий чанк
-        current_chunk += state.text.substr(offset, char_len);
-        offset += char_len;
-    }
-    flush_chunk();
-
-    bool has_complex_rule = false;
-    for(const auto& r : rules) if(r.type == PatternType::COMPLEX_GPT2) has_complex_rule = true;
-    if (has_complex_rule) {
-        std::vector<Fragment> final_fragments;
-        for(const auto& frag : state.fragments) {
-             if (frag.is_protected) { final_fragments.push_back(frag); continue; }
-             std::string sub_chunk;
-             for (char c : frag.text) {
-                 if (c == ' ') {
-                     if (!sub_chunk.empty()) final_fragments.push_back({sub_chunk, false});
-                     sub_chunk.clear();
-                     final_fragments.push_back({" ", false});
-                 } else { sub_chunk += c; }
-             }
-             if (!sub_chunk.empty()) final_fragments.push_back({sub_chunk, false});
-        }
-        state.fragments = final_fragments;
-    }
-}
-
-void TISAVM::_primitive_byte_encode(TISA_State& state) {
-    for (auto& frag : state.fragments) {
-        if (frag.is_protected) continue;
-        std::string encoded_frag;
-        encoded_frag.reserve(frag.text.length());
-        for (unsigned char c : frag.text) {
-            auto it = m_res.byte_map.find(c);
-            if (it != m_res.byte_map.end()) encoded_frag += it->second;
-        }
-        frag.text = encoded_frag;
-    }
-}
-
-void TISAVM::_primitive_unigram_encode(TISA_State& state) {
-    if (m_res.unigram_scores.empty()) return;
-    int32_t unk_id = 2; m_res.vocab->find("<unk>", unk_id);
-    state.ids.clear();
     for (const auto& frag : state.fragments) {
+        Serial.printf("Processing fragment: '%s' (protected=%d)\n", 
+                     frag.text.substr(0, 20).c_str(), frag.is_protected);
+        
+        // Protected fragments (Python lines 112-115)
         if (frag.is_protected) {
-            int32_t id; state.ids.push_back(m_res.vocab->find(frag.text, id) ? id : unk_id);
-            continue;
-        }
-        const std::string& text = frag.text;
-        int n = text.length();
-        if (n == 0) continue;
-        std::vector<float> dp(n + 1, -std::numeric_limits<float>::infinity());
-        std::vector<int> best_path(n + 1, 0);
-        dp[0] = 0.0f;
-        for (int i = 0; i < n; ++i) {
-            for (int j = i + 1; j <= std::min(n, i + 50); ++j) {
-                std::string sub = text.substr(i, j - i);
-                auto score_it = m_res.unigram_scores.find(sub);
-                if (score_it != m_res.unigram_scores.end()) {
-                    float score = dp[i] + score_it->second;
-                    if (score > dp[j]) { dp[j] = score; best_path[j] = i; }
+            int32_t id = unk_id;
+            // First, let's try to find it as it is.
+            if (!m_res.vocab->find(frag.text, id)) {
+                // If haven't found it and there is a leading space, try without it.
+                if (frag.text.size() > 1 && frag.text[0] == ' ') {
+                    std::string trimmed = frag.text.substr(1);
+                    if (!m_res.vocab->find(trimmed, id)) {
+                        id = unk_id; // If still haven't found it, use unk
+                    }
                 }
             }
-        }
-        if (dp[n] == -std::numeric_limits<float>::infinity()) {
-            const unsigned char* s = (const unsigned char*)text.c_str();
-            for (size_t offset = 0; offset < text.length(); ) {
-                 size_t len = get_utf8_char_len(s[offset]); if(len == 0) { offset++; continue; }
-                 std::string single_char = text.substr(offset, len);
-                 int32_t id; state.ids.push_back(m_res.vocab->find(single_char, id) ? id : unk_id);
-                 offset += len;
-            }
-        } else {
-            std::vector<int32_t> path; int curr = n;
-            while (curr > 0) {
-                int prev = best_path[curr];
-                std::string token = text.substr(prev, curr - prev);
-                int32_t id; path.push_back(m_res.vocab->find(token, id) ? id : unk_id);
-                curr = prev;
-            }
-            std::reverse(path.begin(), path.end());
-            state.ids.insert(state.ids.end(), path.begin(), path.end());
-        }
-    }
-}
-
-void TISAVM::_primitive_bpe_encode(TISA_State& state) {
-    if (!m_res.vocab || !m_res.merges) return;
-    int32_t unk_id = 0; m_res.vocab->find("<unk>", unk_id);
-    state.ids.clear();
-    for (const auto& frag : state.fragments) {
-        if (frag.is_protected) {
-            int32_t id = unk_id; m_res.vocab->find(frag.text, id);
             state.ids.push_back(id);
             continue;
         }
+        
+        if (frag.text.empty()) continue;
+
+        // Splitting into UTF-8 characters (Python line 116: word = tuple(frag.text))
         std::vector<std::string> word;
-        const unsigned char* s = (const unsigned char*)frag.text.c_str();
-        for (size_t offset = 0; offset < frag.text.length(); ) {
-            size_t len = get_utf8_char_len(s[offset]); if (len == 0) { offset++; continue; }
-            word.push_back(frag.text.substr(offset, len)); offset += len;
+        for (size_t off = 0; off < frag.text.size(); ) {
+            size_t len = get_utf8_char_len(frag.text[off]);
+            if (len == 0) { 
+                // Invalid UTF-8 - skip byte
+                off++; 
+                continue; 
+            }
+            word.push_back(frag.text.substr(off, len));
+            off += len;
         }
+        
         if (word.empty()) continue;
+
+        Serial.printf("  Word has %d chars: ", word.size());
+        for (size_t i = 0; i < std::min(word.size(), size_t(5)); ++i) {
+            Serial.printf("'%s' ", word[i].c_str());
+        }
+        Serial.println(word.size() > 5 ? "..." : "");
+
+        // BPE merge loop (Python lines 117-126)
         while (word.size() > 1) {
-            std::pair<std::string, std::string> best_pair;
+            //Find the best pair (with minimum rank)
             int32_t min_rank = std::numeric_limits<int32_t>::max();
-            bool found_pair = false;
+            std::pair<std::string, std::string> best_pair{"", ""};
+            
             for (size_t i = 0; i < word.size() - 1; ++i) {
-                std::pair<std::string, std::string> pair = {word[i], word[i+1]};
                 int32_t rank;
-                if (m_res.merges->find(pair, rank) && rank < min_rank) {
-                    min_rank = rank; best_pair = pair; found_pair = true;
+                if (m_res.merges->find({word[i], word[i+1]}, rank)) {
+                    if (rank < min_rank) {
+                        min_rank = rank;
+                        best_pair = {word[i], word[i+1]};
+                    }
                 }
             }
-            if (!found_pair) break;
+            
+            // If haven't found a suitable pair, exit.
+            if (min_rank == std::numeric_limits<int32_t>::max()) break;
+
+            // Merge ALL occurrences of best_pair (Python lines 121-126)
             std::vector<std::string> new_word;
-            new_word.reserve(word.size());
-            for (size_t i = 0; i < word.size(); ) {
-                if (i < word.size() - 1 && word[i] == best_pair.first && word[i+1] == best_pair.second) {
-                    new_word.push_back(best_pair.first + best_pair.second); i += 2;
-                } else { new_word.push_back(word[i++]); }
+            size_t i = 0;
+            while (i < word.size()) {
+                if (i < word.size() - 1 &&
+                    word[i] == best_pair.first && 
+                    word[i+1] == best_pair.second) {
+                    new_word.push_back(word[i] + word[i+1]);
+                    i += 2;
+                } else {
+                    new_word.push_back(word[i]);
+                    ++i;
+                }
             }
-            word = new_word;
+            word = std::move(new_word);
         }
+
+        // Convert tokens to IDs (Python line 127)
         for (const auto& token : word) {
-            int32_t id; state.ids.push_back(m_res.vocab->find(token, id) ? id : unk_id);
+            int32_t id = unk_id;
+            m_res.vocab->find(token, id);
+            state.ids.push_back(id);
         }
     }
 }
@@ -777,50 +876,107 @@ void TISAVM::_primitive_wordpiece_encode(TISA_State& state, const std::string& m
     int32_t unk_id = 100; m_res.vocab->find("[UNK]", unk_id);
     state.ids.clear();
     for (const auto& frag : state.fragments) {
-        if (frag.is_protected) {
-            int32_t id; state.ids.push_back(m_res.vocab->find(frag.text, id) ? id : unk_id);
-            continue;
+        if (frag.is_protected) { 
+            int32_t id; 
+            state.ids.push_back(m_res.vocab->find(frag.text, id) ? id : unk_id); 
+            continue; 
         }
         std::string text = frag.text; if (text.empty()) continue;
-        size_t start_offset = 0;
-        while (start_offset < text.length()) {
-            size_t end_offset = text.length();
-            bool found_match = false;
-            while (start_offset < end_offset) {
-                std::string sub_token = text.substr(start_offset, end_offset - start_offset);
-                std::string token_to_lookup = (start_offset == 0) ? sub_token : (marker + sub_token);
-                int32_t id;
-                if (m_res.vocab->find(token_to_lookup, id)) {
-                    state.ids.push_back(id); start_offset = end_offset; found_match = true; break;
+        size_t start = 0;
+        while (start < text.length()) {
+            size_t end = text.length(); bool found = false;
+            while (start < end) {
+                std::string sub = text.substr(start, end-start);
+                std::string tok = (start==0)?sub:(marker+sub); int32_t id;
+                if (m_res.vocab->find(tok, id)) { 
+                    state.ids.push_back(id); start=end; found=true; break; 
                 }
-                end_offset--;
+                // Decrement end by moving back one UTF-8 character
+                if (end > start) {
+                    size_t prev_end = end - 1;
+                    while(prev_end > start && (text[prev_end] & 0xC0) == 0x80) {
+                        prev_end--;
+                    }
+                    end = prev_end;
+                } else {
+                    break;
+                }
             }
-            if (!found_match) {
-                state.ids.push_back(unk_id);
-                size_t char_len = get_utf8_char_len(text[start_offset]);
-                start_offset += (char_len > 0 ? char_len : 1);
+            if (!found) { 
+                state.ids.push_back(unk_id); 
+                size_t char_len = get_utf8_char_len(text[start]);
+                start += (char_len > 0) ? char_len : 1;
             }
         }
     }
 }
 
-void TISAVM::_primitive_compose(TISA_State& state, const std::vector<uint8_t>& payload) {
-    std::vector<int32_t> out_ids; size_t offset = 0;
-    const uint8_t* p = payload.data();
-    uint8_t num_items = p[offset++];
-    for (int i = 0; i < num_items; ++i) {
-        uint8_t is_fixed = p[offset++];
-        if (is_fixed) {
-            uint8_t is_int = p[offset++];
-            if (is_int) { int32_t id; memcpy(&id, &p[offset], 4); offset += 4; out_ids.push_back(id); }
-            else {
-                uint8_t len = p[offset++]; std::string token((char*)&p[offset], len); offset += len;
-                int32_t id;
-                if (m_res.vocab && m_res.vocab->find(token, id)) out_ids.push_back(id);
-                else out_ids.push_back(2);
-            }
-        } else { out_ids.insert(out_ids.end(), state.ids.begin(), state.ids.end()); }
-    }
-    state.ids = out_ids;
+void TISAVM::_primitive_unigram_encode(TISA_State& state) {
+    if (!m_res.vocab) return;
+    int32_t unk_id = 2; m_res.vocab->find("<unk>", unk_id);
 
+    state.ids.clear();
+    for (const auto& frag : state.fragments) {
+        if (frag.is_protected) {
+            int32_t id = unk_id;
+            m_res.vocab->find(frag.text, id);
+            state.ids.push_back(id);
+            continue;
+        }
+        const std::string& text = frag.text;
+        if (text.empty()) continue;
+
+        std::vector<size_t> char_positions;
+        for (size_t i = 0; i < text.length(); ) {
+            char_positions.push_back(i);
+            size_t len = get_utf8_char_len(text[i]);
+            i += (len > 0) ? len : 1;
+        }
+        char_positions.push_back(text.length());
+        int n_chars = char_positions.size() - 1;
+        if (n_chars == 0) continue;
+
+        std::vector<float> dp(n_chars + 1, -std::numeric_limits<float>::infinity());
+        std::vector<int> path(n_chars + 1, 0);
+        dp[0] = 0.0f;
+
+        for (int i = 0; i < n_chars; ++i) {
+            if (dp[i] <= -std::numeric_limits<float>::infinity() / 2) continue;
+            size_t start_pos = char_positions[i];
+            for (int j = i + 1; j <= n_chars && j <= i + 50; ++j) {  // ← limit 50 как в Python
+                size_t end_pos = char_positions[j];
+                std::string sub = text.substr(start_pos, end_pos - start_pos);
+                int32_t id; float score;
+                if (m_res.vocab->find(sub, id, score)) {
+                    if (dp[i] + score > dp[j]) {
+                        dp[j] = dp[i] + score;
+                        path[j] = i;
+                    }
+                }
+            }
+        }
+
+        if (dp[n_chars] <= -std::numeric_limits<float>::infinity() / 2) {
+            // fallback — single chars
+            for (int i = 0; i < n_chars; ++i) {
+                std::string ch = text.substr(char_positions[i], char_positions[i+1] - char_positions[i]);
+                int32_t id = unk_id;
+                m_res.vocab->find(ch, id);
+                state.ids.push_back(id);
+            }
+        } else {
+            std::vector<int32_t> ids;
+            int curr = n_chars;
+            while (curr > 0) {
+                int prev = path[curr];
+                std::string token = text.substr(char_positions[prev], char_positions[curr] - char_positions[prev]);
+                int32_t id = unk_id;
+                m_res.vocab->find(token, id);          // ← safely
+                ids.push_back(id);
+                curr = prev;
+            }
+            std::reverse(ids.begin(), ids.end());
+            state.ids.insert(state.ids.end(), ids.begin(), ids.end());
+        }
+    }
 }
