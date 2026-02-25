@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
+# Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import os
 import struct
@@ -88,6 +88,215 @@ class NacRuntime(NacKernelBase):
             ids = ids[0] # Take the first element of the batch
         return self.tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)
 
+    # ------------------------------------------------------------------
+    # Static data-loading utilities
+    # Used by:
+    #   • MEP interpreter — res_load_dynamic(out_var, path_var, file_type)
+    #     file_type=2 → load_npy_file
+    #     file_type=3 → preprocess_image_for_imagenet
+    #   • NACmodels_test.py — direct calls for reference implementations
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def preprocess_image_for_imagenet(image_path: str) -> np.ndarray:
+        """
+        Standard ImageNet preprocessing pipeline.
+        Loads any PIL-readable image (jpg, png, …), applies:
+            RGB → resize(256×256) → center_crop(224×224)
+            → normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+            → shape (1, 3, 224, 224) float32
+
+        This is the canonical implementation for MEP res_load_dynamic
+        with file_type=3. Both the MEP interpreter and NACmodels_test.py
+        MUST call this method to guarantee identical preprocessing.
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            raise ImportError(
+                "Pillow is required for image preprocessing. "
+                "Install with: pip install Pillow"
+            )
+        img = Image.open(image_path).convert('RGB').resize((256, 256))
+        left, top = (256 - 224) // 2, (256 - 224) // 2
+        img = img.crop((left, top, left + 224, top + 224))
+        arr = np.array(img, dtype=np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        arr = (arr - mean) / std
+        return np.expand_dims(arr.transpose(2, 0, 1), axis=0)   # (1, 3, 224, 224)
+
+    @staticmethod
+    def load_dynamic_file(path: str, file_type: int) -> np.ndarray:
+        """
+        Generic dynamic file loader for MEP res_load_dynamic.
+
+        file_type codes
+        ───────────────
+          2  — NumPy binary (.npy), loaded as-is.
+          3  — Image file (jpg / png / …) with ImageNet preprocessing.
+               Calls preprocess_image_for_imagenet() and returns (1,3,224,224).
+
+        Raises ValueError for unknown file_type.
+        This is the single dispatch point that MEP interpreter must call
+        when executing a res_load_dynamic instruction at runtime.
+        """
+        if file_type == 2:
+            return np.load(path)
+        elif file_type == 3:
+            return NacRuntime.preprocess_image_for_imagenet(path)
+        else:
+            raise ValueError(
+                f"res_load_dynamic: unknown file_type={file_type}. "
+                "Supported: 2=.npy, 3=image+ImageNet-preprocessing"
+            )
+
+    # ------------------------------------------------------------------
+    # MEP orchestration — universal model launcher
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def load_mep_from_nac(nac_path: str):
+        """
+        Reads the ORCH section from a .nac file and returns the MEP program.
+
+        Returns:
+            (bytecode: bytes, constants: Dict[int, Any])
+            or (None, None) if the ORCH section is absent or empty.
+
+        ORCH binary layout (slot 7 in the 9-slot header):
+            b'ORCH'                          4 bytes — magic
+            uint32  bytecode_len             4 bytes
+            uint32  constants_count          4 bytes
+            bytes[bytecode_len]              MEP bytecode
+            for each constant:
+                uint16  const_id
+                uint8   type_code            0=None 1=bool 2=int64 3=f64 4=str 5=int[] 6=f[]
+                uint16  length               element count (lists) or byte count (others)
+                bytes[...]                   serialized value
+        """
+        with open(nac_path, 'rb') as f:
+            # Skip: 'NAC\x01'(4) + quant_id(1) + io_counts(5) = 10 bytes
+            f.seek(10)
+            offsets_header_format = '<H9Q4x'
+            header_bytes = f.read(struct.calcsize(offsets_header_format))
+            _d_model, *offsets = struct.unpack(offsets_header_format, header_bytes)
+            orch_off = offsets[7]  # slot 7: ORCH section
+
+            if orch_off == 0:
+                return None, None
+
+            f.seek(orch_off)
+            magic = f.read(4)
+            if magic != b'ORCH':
+                raise ValueError(
+                    f"Expected b'ORCH' magic at offset {orch_off} in '{nac_path}', "
+                    f"got {magic!r}"
+                )
+
+            bytecode_len, constants_count = struct.unpack('<II', f.read(8))
+            if bytecode_len == 0:
+                return None, None  # empty ORCH section — MEP not configured
+
+            bytecode = f.read(bytecode_len)
+
+            constants: Dict[int, Any] = {}
+            for _ in range(constants_count):
+                const_id, type_code, length = struct.unpack('<HBH', f.read(5))
+                val = None
+                if type_code == 1:
+                    val = struct.unpack('<?', f.read(length))[0]
+                elif type_code == 2:
+                    val = struct.unpack('<q', f.read(length))[0]
+                elif type_code == 3:
+                    val = struct.unpack('<d', f.read(length))[0]
+                elif type_code == 4:
+                    val = f.read(length).decode('utf-8')
+                elif type_code == 5:
+                    val = list(struct.unpack(f'<{length}i', f.read(length * 4))) if length > 0 else []
+                elif type_code == 6:
+                    val = list(struct.unpack(f'<{length}f', f.read(length * 4))) if length > 0 else []
+                constants[const_id] = val
+
+            return bytecode, constants
+
+    @classmethod
+    def run_orchestrated(cls, nac_path: str) -> Any:
+        """
+        Universal model launcher. Reads the ORCH section from *nac_path*,
+        creates a MEPInterpreter and executes the plan.
+
+        This is the ONLY entry point NACmodels_test.py needs.
+        The MEP program handles everything: user prompts, preprocessing,
+        model loading, inference, postprocessing, output.
+
+        Raises RuntimeError if nac_path contains no ORCH section.
+        """
+        from MEP_interpreter import MEPInterpreter
+        bytecode, constants = cls.load_mep_from_nac(nac_path)
+        if bytecode is None:
+            raise RuntimeError(
+                f"No MEP orchestration plan (ORCH section) found in '{nac_path}'.\n"
+                "Ensure the model was compiled with generate_artifacts(..., mep_program=...)."
+            )
+        print(f"--- MEP: loaded {len(bytecode)} bytes bytecode, "
+              f"{len(constants)} constants from '{nac_path}' ---")
+        interp = MEPInterpreter(bytecode, constants)
+        return interp.run()
+
+    def get_mep_plan(self):
+        """
+        Reads and deserializes the ORCH section from the loaded .nac file.
+
+        Returns
+        -------
+        (bytecode: bytes, constants: Dict[int, Any])
+            Ready to pass to MEPInterpreter(bytecode, constants).
+        Returns (None, None) if the .nac file has no MEP plan (empty ORCH stub).
+
+        The ORCH section format mirrors the CNST section for the constants pool:
+            b'ORCH'
+            uint32 bytecode_len
+            <bytecode>
+            uint32 const_count
+            foreach: uint16 id | uint8 type | uint16 length | <payload>
+        """
+        orch_off = getattr(self, '_orch_off', 0)
+        if not orch_off:
+            return None, None
+
+        with open(self._nac_path, 'rb') as f:
+            f.seek(orch_off)
+            magic = f.read(4)
+            if magic != b'ORCH':
+                raise ValueError(f"Expected ORCH magic at offset {orch_off}, got {magic!r}")
+
+            # Format: bytecode_len(4) + const_count(4) written BEFORE bytecode
+            bytecode_len, const_count = struct.unpack('<II', f.read(8))
+            if bytecode_len == 0:
+                # Empty stub — no MEP plan stored
+                return None, None
+            bytecode = f.read(bytecode_len)
+            # const_count already read above
+            constants: Dict[int, Any] = {}
+            for _ in range(const_count):
+                const_id, type_code, length = struct.unpack('<HBH', f.read(5))
+                val = None
+                if   type_code == 0: val = None
+                elif type_code == 1: val = struct.unpack('<?', f.read(length))[0]
+                elif type_code == 2: val = struct.unpack('<q', f.read(length))[0]
+                elif type_code == 3: val = struct.unpack('<d', f.read(length))[0]
+                elif type_code == 4: val = f.read(length).decode('utf-8')
+                elif type_code == 5:
+                    val = list(struct.unpack(f'<{length}i', f.read(length * 4))) if length > 0 else []
+                elif type_code == 6:
+                    val = list(struct.unpack(f'<{length}f', f.read(length * 4))) if length > 0 else []
+                else:
+                    raise ValueError(f"ORCH constants: unknown type_code={type_code} for id={const_id}")
+                constants[const_id] = val
+
+        return bytecode, constants
+
     def _load_nac_file(self, nac_path: str):
         print(f"Loading NAC file (Robust Binary Format): {nac_path}")
         
@@ -115,9 +324,13 @@ class NacRuntime(NacKernelBase):
             offsets_header_format = '<H9Q4x'
             header_bytes = f.read(struct.calcsize(offsets_header_format))
             self.d_model, *offsets = struct.unpack(offsets_header_format, header_bytes)
-            mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, meta_off, rsrc_off = offsets
+            mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, orch_off, rsrc_off = offsets
             
             print(f"NAC v{version}, d_model: {self.d_model}, Quant: '{self.quantization_method}', IO: {self.io_counts}, Weights: {'Internal' if self.weights_stored_internally else 'External'}")
+
+            # Remember ORCH offset so get_mep_plan() can load it on demand
+            self._orch_off = orch_off
+            self._nac_path = nac_path
 
             # 2. Loading metadata (CMAP, CNST, PERM)
             if cmap_off > 0:

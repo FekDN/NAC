@@ -1,6 +1,6 @@
 # Файл: NAC_info.py
 
-# Copyright (c) 2025 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
+# Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import sys
 import os
@@ -73,7 +73,7 @@ def inspect_nac_file(filepath: str):
         offsets = unpacked_header[1:]
         
         mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, \
-        proc_off, meta_off, rsrc_off = offsets
+        proc_off, orch_off, rsrc_off = offsets
         
         print(f"Model Dimension (d_model): {d_model}")
 
@@ -86,7 +86,7 @@ def inspect_nac_file(filepath: str):
         print(f"  - DATA Section:     Starts at byte {data_off}")
         print(f"  - PROC Section:     Starts at byte {proc_off} (Tokenizer Manifest)")
         print(f"  - RSRC Section:     Starts at byte {rsrc_off} (Internal Resources)")
-        print(f"  - META Section:     Starts at byte {meta_off} (Reserved)")
+        print(f"  - ORCH Section:     Starts at byte {orch_off} (MEP Orchestrator)")
 
         # --- 1. Read Memory Map (MMAP) ---
         print("\n--- Memory Map (MMAP) ---")
@@ -285,6 +285,104 @@ def inspect_nac_file(filepath: str):
                     print(f"  - File: '{filename}' (Size: {data_len} bytes)")
         else:
             print("No RSRC section found.")
+
+        # --- 8. Read MEP Orchestrator Plan (ORCH) ---
+        print("\n--- MEP Orchestrator Plan (ORCH) ---")
+        if orch_off > 0:
+            f.seek(orch_off)
+            magic = f.read(4)
+            if magic != b'ORCH':
+                print(f"Error: ORCH tag mismatch (got {magic!r}).")
+            else:
+                # Format: bytecode_len(4) + const_count(4) written BEFORE bytecode
+                bytecode_len, const_count = struct.unpack('<II', f.read(8))
+                if bytecode_len == 0:
+                    print("ORCH section present but empty (no MEP plan compiled into this file).")
+                else:
+                    bytecode = f.read(bytecode_len)
+
+                    # Read constants pool
+                    orch_consts = {}
+                    for _ in range(const_count):
+                        const_id, type_code, length = struct.unpack('<HBH', f.read(5))
+                        val = None
+                        if   type_code == 0: val = None
+                        elif type_code == 1: val = struct.unpack('<?'  , f.read(length))[0]
+                        elif type_code == 2: val = struct.unpack('<q'  , f.read(length))[0]
+                        elif type_code == 3: val = struct.unpack('<d'  , f.read(length))[0]
+                        elif type_code == 4: val = f.read(length).decode('utf-8')
+                        elif type_code == 5: val = list(struct.unpack(f'<{length}i', f.read(length * 4))) if length > 0 else []
+                        elif type_code == 6: val = list(struct.unpack(f'<{length}f', f.read(length * 4))) if length > 0 else []
+                        orch_consts[const_id] = val
+
+                    print(f"MEP bytecode: {bytecode_len} bytes")
+                    print(f"MEP constants pool: {const_count} entries")
+
+                    # Disassemble bytecode using opcode names
+                    OPCODE_NAMES = {
+                        0x02: "SRC_USER_PROMPT",    0x04: "SRC_CONSTANT",
+                        0x10: "RES_LOAD_MODEL",     0x11: "RES_LOAD_DATAFILE",
+                        0x12: "RES_LOAD_EXTERN",    0x13: "RES_LOAD_DYNAMIC",
+                        0x1F: "RES_UNLOAD",
+                        0x20: "PREPROC_ENCODE",     0x21: "PREPROC_DECODE",
+                        0x22: "PREPROC_GET_ID",     0x2A: "STRING_FORMAT",
+                        0x30: "TENSOR_CREATE",      0x38: "TENSOR_MANIPULATE",
+                        0x39: "TENSOR_COMBINE",     0x3A: "TENSOR_INFO",
+                        0x3B: "TENSOR_EXTRACT",
+                        0x59: "SYS_COPY",           0x5F: "SYS_DEBUG_PRINT",
+                        0x60: "MATH_UNARY",         0x61: "MATH_BINARY",
+                        0x62: "MATH_AGGREGATE",     0x68: "LOGIC_COMPARE",
+                        0x80: "MODEL_RUN_STATIC",
+                        0xA0: "FLOW_LOOP_START",    0xA1: "FLOW_LOOP_END",
+                        0xA8: "FLOW_BRANCH_IF",     0xA9: "FLOW_BREAK_LOOP_IF",
+                        0xE0: "SERIALIZE_OBJECT",   0xF0: "IO_WRITE",
+                        0xFE: "EXEC_RETURN",        0xFF: "EXEC_HALT",
+                    }
+                    print("\nMEP Bytecode disassembly:")
+                    ip = 0
+                    while ip < len(bytecode):
+                        flag = bytecode[ip]
+                        name = OPCODE_NAMES.get(flag, f"UNK_0x{flag:02X}")
+                        rest = bytecode[ip+1:min(ip+9, len(bytecode))]
+                        hex_args = ' '.join(f'{b:02X}' for b in rest)
+                        print(f"  0x{ip:04X}  {flag:02X}  {name:<22}  {hex_args}")
+                        # Advance IP by known fixed lengths (variable-length ops show at least args)
+                        FIXED_LENGTHS = {
+                            0x02:5, 0x04:4, 0x10:4, 0x11:5, 0x12:5, 0x13:4, 0x1F:3,
+                            0x20:4, 0x21:4, 0x22:5, 0x30:5, 0x3B:4,
+                            0x59:3, 0x5F:4, 0x60:4, 0x61:5, 0x62:4, 0x68:5,
+                            0xA0:3, 0xA1:4, 0xA8:5, 0xA9:5, 0xE0:4, 0xF0:5,
+                            0xFF:1,
+                        }
+                        if flag in FIXED_LENGTHS:
+                            ip += FIXED_LENGTHS[flag]
+                        elif flag == 0x2A:   # STRING_FORMAT: variable
+                            count = bytecode[ip+4] if ip+4 < len(bytecode) else 0
+                            ip += 5 + count
+                        elif flag == 0x38:   # TENSOR_MANIPULATE
+                            ip += 6
+                        elif flag == 0x39:   # TENSOR_COMBINE
+                            count = bytecode[ip+3] if ip+3 < len(bytecode) else 0
+                            ip += 5 + count
+                        elif flag == 0x3A:   # TENSOR_INFO
+                            op = bytecode[ip+1] if ip+1 < len(bytecode) else 0
+                            ip += 4 + (1 if op == 1 else 0)
+                        elif flag == 0x80:   # MODEL_RUN_STATIC
+                            n_in  = bytecode[ip+2] if ip+2 < len(bytecode) else 0
+                            n_out = bytecode[ip+3+n_in] if ip+3+n_in < len(bytecode) else 0
+                            ip += 4 + n_in + n_out
+                        elif flag == 0xFE:   # EXEC_RETURN
+                            count = bytecode[ip+1] if ip+1 < len(bytecode) else 0
+                            ip += 2 + count
+                        else:
+                            ip += 1  # unknown: step 1 to avoid infinite loop
+
+                    if orch_consts:
+                        print("\nMEP Constants pool:")
+                        for cid in sorted(orch_consts):
+                            print(f"  [{cid:3d}] {repr(orch_consts[cid])}")
+        else:
+            print("No ORCH section found (file compiled without MEP plan).")
 
     print("\n" + "="*20 + f" INSPECTION COMPLETE " + "="*20 + "\n")
 

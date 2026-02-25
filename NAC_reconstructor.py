@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
+# Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import os
 import sys
@@ -91,7 +91,7 @@ class Reconstructor:
             if version != 1: raise ValueError(f"Unsupported NAC version {version}.")
             
             self.weights_stored_internally = (quant_byte & 0x80) != 0
-            quant_map = {0: 'none', 1: 'FP16', 2: 'INT8_TENSOR', 3: 'INT8_CHANNEL'}
+            quant_map = {0: 'none', 1: 'FP16', 2: 'INT8_TENSOR', 3: 'INT8_CHANNEL', 4: 'BLOCK_FP8'}
             self.quantization_method = quant_map.get(quant_byte & 0x7F, 'unknown')
             
             num_inputs, num_outputs, _ = struct.unpack('<HHB', f.read(5))
@@ -101,8 +101,8 @@ class Reconstructor:
             header_bytes = f.read(struct.calcsize(offsets_header_format))
             self.d_model, *offsets = struct.unpack(offsets_header_format, header_bytes)
         
-            mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, meta_off, rsrc_off = offsets
-            print(f"NAC v{version}, d_model: {self.d_model}, Quant: '{self.quantization_method}', IO: {self.io_counts}, Weights: {'Internal' if self.weights_stored_internally else 'External'}")
+            mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, orch_off, rsrc_off = offsets
+            print(f"NAC v{version}, d_model: {self.d_model}, Quant: '{self.quantization_method}', IO: {self.io_counts}, Weights: {'Internal' if self.weights_stored_internally else 'External'}, ORCH: {'yes' if orch_off > 0 else 'no'}")
 
             # --- MMAP ---
             if mmap_off > 0:
@@ -174,7 +174,21 @@ class Reconstructor:
                         dummy_tensor = torch.empty(0)
                         self.loaded_param_data[p_id] = (dummy_tensor, metadata)
 
+        # Store orch_off so reconstruct can report it
+        self._orch_off = orch_off
+        self._nac_path = nac_path
+
         print(f"Successfully loaded {len(self.parsed_nodes)} ops, {len(self.memory_map)} MMAP records, and metadata for {len(self.loaded_param_data)} tensors.")
+        if orch_off > 0:
+            with open(nac_path, 'rb') as _f:
+                _f.seek(orch_off)
+                if _f.read(4) == b'ORCH':
+                    # Format: bytecode_len(4) + const_count(4) written BEFORE bytecode
+                    _bytecode_len, _const_count = struct.unpack('<II', _f.read(8))
+                    if _bytecode_len > 0:
+                        print(f"MEP Orchestrator plan: {_bytecode_len} bytes bytecode, {_const_count} constants.")
+                    else:
+                        print("MEP Orchestrator plan: empty stub (no plan compiled).")
 
 
     def reconstruct_from_nac_file(self, nac_path: str, show_mmap: bool = False) -> Tuple[str, str]:
@@ -254,6 +268,19 @@ def reconstruct_from_file(nac_filepath: str, show_mmap: bool = False):
         print(f"Model Dimension (d_model): {reconstructor.d_model}")
         print(f"Quantization Method: {reconstructor.quantization_method}")
         print(f"Total User Inputs: {reconstructor.io_counts[0]}")
+        orch_off = getattr(reconstructor, '_orch_off', 0)
+        if orch_off > 0:
+            with open(nac_filepath, 'rb') as _f:
+                _f.seek(orch_off)
+                if _f.read(4) == b'ORCH':
+                    # Format: bytecode_len(4) + const_count(4) written BEFORE bytecode
+                    _blen, _cc = struct.unpack('<II', _f.read(8))
+                    if _blen > 0:
+                        print(f"MEP Plan: {_blen} bytes bytecode, {_cc} constants (run NAC_info.py for full disassembly)")
+                    else:
+                        print("MEP Plan: empty stub")
+        else:
+            print("MEP Plan: none (file compiled without MEP plan)")
 
         if input_summary:
             print("\n--- User Input Summary (in order of execution) ---")

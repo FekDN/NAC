@@ -5,7 +5,7 @@ import json
 import regex as re
 import unicodedata
 import torch
-from typing import List, Dict, Any, Tuple, Union, Literal
+from typing import List, Dict, Any, Tuple, Union, Literal, Optional
 from dataclasses import dataclass, field
 from transformers import AutoTokenizer
 
@@ -205,6 +205,14 @@ class TISAVM:
         for opcode, payload in commands:
             self.dispatch[opcode](state, self.res, payload)
         return state['ids']
+
+    def get_token_id(self, token: str) -> Optional[int]:
+        """Возвращает ID для строкового токена из словаря."""
+        # 'vocab' должен быть в ресурсах как словарь {токен: id}
+        vocab = self.res.get('vocab')
+        if vocab and isinstance(vocab, dict):
+            return vocab.get(token)
+        return None
 
     def decode(self, ids: List[int], skip_special_tokens: bool = True) -> str:
         tokens = []

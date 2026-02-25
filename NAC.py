@@ -77,7 +77,40 @@ class ResultManager:
     def _map_dtype_to_enum(self, dtype):
         return {torch.float32:0, torch.float64:1, torch.float16:2, torch.bfloat16:3, torch.int32:4, torch.int64:5, torch.int16:6, torch.int8:7, torch.uint8:8, torch.bool:9}.get(dtype, 255)
 
-    def save_model_nac(self, model_name, used_mappings, nodes, param_data, param_id_to_name, input_node_idx_to_name, d_model=0, tokenizer_manifest=None, tokenizer_resources=None, quant_method='none', store_weights_internally=True, io_counts=(0,0), memory_map=None):
+    @staticmethod
+    def _serialize_mep_constant(const_id: int, val) -> bytes:
+        """Serializes one MEP constant in NAC CNST-compatible binary format."""
+        type_code, length, value_bytes = 0, 0, b''
+        if val is None:
+            type_code = 0
+        elif isinstance(val, bool):
+            type_code, length, value_bytes = 1, 1, struct.pack('<?', val)
+        elif isinstance(val, int):
+            type_code, value_bytes = 2, struct.pack('<q', val)
+            length = len(value_bytes)
+        elif isinstance(val, float):
+            type_code, value_bytes = 3, struct.pack('<d', val)
+            length = len(value_bytes)
+        elif isinstance(val, str):
+            type_code, value_bytes = 4, val.encode('utf-8')
+            length = len(value_bytes)
+        elif isinstance(val, list):
+            if not val:
+                type_code, length = 5, 0
+            elif all(isinstance(x, int) for x in val):
+                type_code, length = 5, len(val)
+                value_bytes = struct.pack(f'<{length}i', *val)
+            else:
+                type_code, length = 6, len(val)
+                value_bytes = struct.pack(f'<{length}f', *map(float, val))
+        else:
+            raise TypeError(f"MEP constant type not serializable: {type(val)} = {val!r}")
+        out = struct.pack('<HBH', const_id, type_code, length)
+        if value_bytes:
+            out += value_bytes
+        return out
+
+    def save_model_nac(self, model_name, used_mappings, nodes, param_data, param_id_to_name, input_node_idx_to_name, d_model=0, tokenizer_manifest=None, tokenizer_resources=None, quant_method='none', store_weights_internally=True, io_counts=(0,0), memory_map=None, mep_program=None):
         filepath = os.path.join(self.output_path, f"{model_name}.nac")
         try:
             with open(filepath, 'wb') as f:
@@ -264,18 +297,40 @@ class ResultManager:
                         f.write(content)
                     print(f"Saved {num_files} resource files internally.")
 
+                # 9. ORCH Section — MEP orchestration bytecode
+                # Stored at slot 7 (formerly 'meta', always unused).
+                # Format: b'ORCH' + uint32 bytecode_len + uint32 constants_count
+                #         + bytecode[bytecode_len]
+                #         + constants[]: (uint16 id, uint8 type, uint16 len, bytes data)
+                if mep_program is not None:
+                    mep_bytecode, mep_constants = mep_program
+                    offsets['orch'] = f.tell()
+                    f.write(b'ORCH')
+                    f.write(struct.pack('<II', len(mep_bytecode), len(mep_constants)))
+                    f.write(mep_bytecode)
+                    for cid, cval in sorted(mep_constants.items()):
+                        f.write(ResultManager._serialize_mep_constant(cid, cval))
+                    print(f"ORCH section written: {len(mep_bytecode)} bytes bytecode, "
+                          f"{len(mep_constants)} constants.")
+                else:
+                    # Always write an empty ORCH section to keep slot 7 non-zero
+                    # and signal to the runtime that MEP is not configured.
+                    offsets['orch'] = f.tell()
+                    f.write(b'ORCH')
+                    f.write(struct.pack('<II', 0, 0))  # empty bytecode + empty constants
+
                 f.seek(10)
-                
+
                 all_offsets = [
                     offsets.get('mmap', 0),
-                    offsets.get('ops', 0),
+                    offsets.get('ops',  0),
                     offsets.get('cmap', 0),
                     offsets.get('cnst', 0),
                     offsets.get('perm', 0),
                     offsets.get('data', 0),
                     offsets.get('proc', 0),
-                    offsets.get('meta', 0),
-                    offsets.get('rsrc', 0)
+                    offsets.get('orch', 0),  # slot 7: MEP orchestrator (formerly 'meta')
+                    offsets.get('rsrc', 0),
                 ]
                 f.write(struct.pack(offsets_header_format, d_model, *all_offsets))
 
@@ -765,7 +820,7 @@ def _get_d_model(model: torch.nn.Module) -> int:
     print("Warning: Could not automatically determine d_model. Defaulting to 0.")
     return 0
 
-def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tuple, d_model: Optional[int] = None, quantization_method: str = 'none', dynamic_shapes=None, store_weights_internally=True, io_counts=(0,0), tokenizer_repo=None, optimize = True, tokenizer_input: str = 'none', optimize_memory_locality: bool = True, compile_tokenizer_resources: bool = True):
+def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tuple, d_model: Optional[int] = None, quantization_method: str = 'none', dynamic_shapes=None, store_weights_internally=True, io_counts=(0,0), tokenizer_repo=None, optimize = True, tokenizer_input: str = 'none', optimize_memory_locality: bool = True, compile_tokenizer_resources: bool = True, mep_program=None):
     print("\n" + "="*20 + f" GENERATION ({model_name}) " + "="*20)
     result_manager = ResultManager()
 
@@ -938,5 +993,6 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
         quant_method=quantization_method,
         store_weights_internally=store_weights_internally, 
         io_counts=processor.io_counts,
-        memory_map=generated_memory_map
+        memory_map=generated_memory_map,
+        mep_program=mep_program,
     )
