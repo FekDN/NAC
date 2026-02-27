@@ -365,6 +365,25 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 #sw::before{content:'⌕';position:absolute;left:7px;top:50%;transform:translateY(-50%);
   color:var(--dim);font-size:13px;pointer-events:none}
 
+/* ── Pattern Finder ── */
+#pinfo{position:fixed;bottom:18px;right:18px;z-index:100;
+  background:#090c12e8;border:1px solid var(--border);border-radius:4px;
+  padding:10px 14px;backdrop-filter:blur(8px);
+  font-size:11px;line-height:1.9;display:none;width:240px}
+.pi-h{font-weight:600;color:var(--cyan);margin-bottom:5px;font-size:12px}
+.pi-r{display:flex;gap:8px}
+.pi-k{color:var(--dim);min-width:60px;flex-shrink:0}
+.pi-v{color:var(--w);word-break:break-all}
+.lk.pattern-hl{stroke:#ffeb3b;stroke-width:2.8;opacity:1}
+.nd.pattern-hl > * {
+  stroke:#ffeb3b !important;stroke-width:2.5px !important;
+  filter: drop-shadow(0 0 8px #ffeb3b) !important;
+}
+.nd.pattern-sel > * {
+  stroke:#ff5722 !important;stroke-width:2.8px !important;
+  filter: drop-shadow(0 0 10px #ff5722) !important;
+}
+
 /* ── SVG canvas ── */
 #cv{position:fixed;inset:0;top:48px;z-index:1}
 svg{display:block;width:100%;height:100%}
@@ -424,6 +443,7 @@ svg{display:block;width:100%;height:100%}
     <button class="btn on"  id="bP">weights</button>
     <button class="btn on"  id="bC">consts</button>
     <button class="btn"     id="bU">untangle</button>
+    <button class="btn"     id="bPF">find similar</button>
     <button class="btn"     id="bF">fit</button>
     <button class="btn"     id="bR">reset</button>
   </div>
@@ -454,7 +474,7 @@ svg{display:block;width:100%;height:100%}
   <div class="li"><div class="ld" style="background:var(--cx)"></div>other</div>
 </div>
 <div id="prog">settling…</div>
-
+<div id="pinfo"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
 <script>
 // ══════════════════════════════════════════════════════════════════
@@ -484,8 +504,14 @@ function eid(e, f) { const v = e[f]; return (v !== null && typeof v === 'object'
 // ══════════════════════════════════════════════════════════════════
 let showP = true, showC = true;
 let allNodes = [], allEdges = [];
+let nodeMap = {}; // Added for quick node lookup by ID
 let _sim, _zoom, _svg, _nG, _lk, _hl = null;
 let simState = {}, readyQueue = [], isSimActive = false, _autoSimInterval = null;
+
+// --- PATTERN FINDER STATE ---
+let isPatternFindMode = false;
+let selectedPattern = []; // Array of node objects in selection order
+
 
 // ══════════════════════════════════════════════════════════════════
 // Topological rank-based initial layout
@@ -553,7 +579,11 @@ function buildGraph(nodes, edges, forceLayout) {
   _nG=d3.select('#gn').selectAll('g').data(visN,d=>d.id).join('g').attr('class','nd')
     .call(d3.drag().on('start',(ev,d)=>{if(!ev.active)_sim.alphaTarget(.15).restart();d.fx=d.x;d.fy=d.y;})
     .on('drag',(ev,d)=>{d.fx=ev.x;d.fy=ev.y;}).on('end',(ev,d)=>{if(!ev.active)_sim.alphaTarget(0);d.fx=null;d.fy=null;}))
-    .on('mouseover',showTT).on('mousemove',moveTT).on('mouseout',hideTT).on('click',(ev,d)=>hlNode(d));
+    .on('mouseover',showTT).on('mousemove',moveTT).on('mouseout',hideTT)
+    .on('click',(ev,d) => {
+      if (isPatternFindMode) { handlePatternClick(d); }
+      else { hlNode(d); }
+    });
   _nG.each(function(d){
     const g=d3.select(this),c=nc(d),gl=`drop-shadow(0 0 5px ${c}88)`;
     if(d.type==='param'){
@@ -598,7 +628,7 @@ function buildGraph(nodes, edges, forceLayout) {
 // ══════════════════════════════════════════════════════════════════
 function updateProgress(){if(!_sim)return;const a=_sim.alpha();const prog=document.getElementById('prog');if(a>0.02)prog.textContent='settling… '+Math.round(a*100)+'%';}
 function fitView(){if(!_svg||!_zoom)return;const ns=allNodes.filter(n=>n.x!=null);if(!ns.length)return;const xs=ns.map(n=>n.x),ys=ns.map(n=>n.y);const x0=Math.min(...xs)-70,x1=Math.max(...xs)+70;const y0=Math.min(...ys)-70,y1=Math.max(...ys)+70;const W=_svg.node().clientWidth,H=_svg.node().clientHeight;const sc=Math.min(.95,.95*Math.min(W/(x1-x0),H/(y1-y0)));const tx=W/2-sc*(x0+x1)/2,ty=H/2-sc*(y0+y1)/2;_svg.transition().duration(650).call(_zoom.transform,d3.zoomIdentity.translate(tx,ty).scale(sc));}
-function hlNode(d){if(_hl===d.id){_hl=null;_nG.classed('dim',false);_lk.classed('hl',false).attr('marker-end',e=>e.is_param?'url(#arp)':'url(#ar)');return;}_hl=d.id;const conn=new Set([d.id]);allEdges.forEach(e=>{const s=eid(e,'source'),t=eid(e,'target');if(s===d.id||t===d.id){conn.add(s);conn.add(t);}});_nG.classed('dim',n=>!conn.has(n.id));_lk.classed('hl',e=>eid(e,'source')===d.id||eid(e,'target')===d.id).attr('marker-end',e=>(eid(e,'source')===d.id||eid(e,'target')===d.id)?'url(#arh)':(e.is_param?'url(#arp)':'url(#ar)'));}
+function hlNode(d){if(isPatternFindMode) return; if(_hl===d.id){_hl=null;_nG.classed('dim',false);_lk.classed('hl',false).attr('marker-end',e=>e.is_param?'url(#arp)':'url(#ar)');return;}_hl=d.id;const conn=new Set([d.id]);allEdges.forEach(e=>{const s=eid(e,'source'),t=eid(e,'target');if(s===d.id||t===d.id){conn.add(s);conn.add(t);}});_nG.classed('dim',n=>!conn.has(n.id));_lk.classed('hl',e=>eid(e,'source')===d.id||eid(e,'target')===d.id).attr('marker-end',e=>(eid(e,'source')===d.id||eid(e,'target')===d.id)?'url(#arh)':(e.is_param?'url(#arp)':'url(#ar)'));}
 const _tt=document.getElementById('tt');
 function showTT(ev,d){const r=(k,v)=>`<div class="tt-r"><span class="tt-k">${k}</span><span class="tt-v">${v}</span></div>`;let h=`<div class="tt-h">${d.label}</div>${r('type',d.type)}${r('v-index','v'+d.index)}`;if(d.detail){for(const[k,v] of Object.entries(d.detail)){if(v===null||v===''||(Array.isArray(v)&&!v.length))continue;h+=r(k,Array.isArray(v)?v.join(' × '):String(v));}}_tt.innerHTML=h;_tt.style.display='block';moveTT(ev);}
 function moveTT(ev){let x=ev.clientX+15,y=ev.clientY+15;if(x+300>window.innerWidth)x=ev.clientX-300-15;if(y+220>window.innerHeight)y=ev.clientY-220-15;_tt.style.left=x+'px';_tt.style.top=y+'px';}
@@ -614,34 +644,226 @@ function propagateStep(){if(!isSimActive||readyQueue.length===0){stopAllSimulati
 function runAutoSimulation(){resetSimulation();const btnS=document.getElementById('bS'),btnA=document.getElementById('bSA');btnS.disabled=true;btnA.disabled=true;_autoSimInterval=setInterval(()=>{if(!propagateStep()){/* stop handled inside */}},333);}
 
 // ══════════════════════════════════════════════════════════════════
-// ADDED: Untangle Logic
+// Untangle Logic
 // ══════════════════════════════════════════════════════════════════
 let isUntangling = false;
 function untangleGraph() {
   if (!_sim || isUntangling) return;
   isUntangling = true;
-
   const btn = document.getElementById('bU');
   btn.disabled = true;
   document.getElementById('prog').textContent = 'untangling…';
-
   const chargeForce = _sim.force('charge');
   const originalStrength = chargeForce.strength();
-
-  // 1. Push nodes apart with strong repulsion
   chargeForce.strength(-800);
-
-  // 2. Reheat simulation to give nodes energy to move
   _sim.alpha(0.7).restart();
-
-  // 3. After a delay, restore original forces and let them settle
   setTimeout(() => {
     chargeForce.strength(originalStrength);
-    _sim.alpha(0.3).restart(); // a smaller reheat to encourage settling
+    _sim.alpha(0.3).restart();
     isUntangling = false;
     btn.disabled = false;
     document.getElementById('prog').textContent = 'settling…';
   }, 1800);
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Pattern Finder Logic
+// ══════════════════════════════════════════════════════════════════
+// Helper function to check node identity
+function areNodesIdentical(n1, n2) {
+  if (!n1 || !n2 || !n1.detail || !n2.detail) return false;
+  // For 'op' nodes, the core identity is the operation name.
+  if (n1.type === 'op' && n2.type === 'op') {
+      return n1.detail.full_name === n2.detail.full_name;
+  }
+  // You could add more sophisticated checks for other types if needed
+  return false;
+}
+
+// Helper function to check if two nodes are connected in the main graph
+function areNodesNeighbors(n1_id, n2_id) {
+    return allEdges.some(e =>
+        (eid(e, 'source') === n1_id && eid(e, 'target') === n2_id) ||
+        (eid(e, 'source') === n2_id && eid(e, 'target') === n1_id)
+    );
+}
+
+function handlePatternClick(d) {
+    if (d.type !== 'op') {
+        return; // Only allow 'op' nodes to be part of a pattern.
+    }
+
+    const nodeIndex = selectedPattern.findIndex(n => n.id === d.id);
+
+    if (nodeIndex > -1) {
+        // Node is already selected, so deselect it.
+        selectedPattern.splice(nodeIndex, 1);
+    } else {
+        // It's a new node. Add it IF it's the first node OR connected to the existing pattern.
+        if (selectedPattern.length === 0 || selectedPattern.some(p_node => areNodesNeighbors(p_node.id, d.id))) {
+            selectedPattern.push(d);
+        } else {
+            // Ignore clicks on nodes not adjacent to the current selection.
+            return;
+        }
+    }
+    findAndShowPattern();
+}
+
+function getPatternAdjacency(pattern) {
+    const adj = new Map(pattern.map(n => [n.id, { 'in': [], 'out': [] }]));
+    const patternIds = new Set(pattern.map(n => n.id));
+
+    for (const edge of allEdges) {
+        const sourceId = eid(edge, 'source');
+        const targetId = eid(edge, 'target');
+        if (patternIds.has(sourceId) && patternIds.has(targetId)) {
+            adj.get(targetId).in.push(sourceId);
+            adj.get(sourceId).out.push(targetId);
+        }
+    }
+    return adj;
+}
+
+function findAndShowPattern() {
+    clearHighlights();
+    const pInfo = document.getElementById('pinfo');
+
+    if (selectedPattern.length === 0) {
+        pInfo.style.display = 'none';
+        return;
+    }
+
+    if (selectedPattern.length === 1) {
+        const p_node = selectedPattern[0];
+        const identicalNodes = allNodes.filter(n => areNodesIdentical(n, p_node));
+        const foundNodeIds = new Set(identicalNodes.map(n => n.id));
+        updatePatternUI(foundNodeIds, new Set(), identicalNodes.length);
+        return;
+    }
+
+    // --- Subgraph Isomorphism Search ---
+    const patternAdj = getPatternAdjacency(selectedPattern);
+    const foundGroups = [];
+    const visitedGroups = new Set(); // To store stringified versions of found groups to avoid duplicates
+
+    // Backtracking search function
+    function findMatches(patternNodeIndex, currentMapping) {
+        if (patternNodeIndex === selectedPattern.length) {
+            // --- Found a full match ---
+            const matchedGroup = Object.values(currentMapping);
+            const groupKey = matchedGroup.map(n => n.id).sort().join(',');
+            if (!visitedGroups.has(groupKey)) {
+                foundGroups.push(matchedGroup);
+                visitedGroups.add(groupKey);
+            }
+            return;
+        }
+
+        const patternNode = selectedPattern[patternNodeIndex];
+        const prevPatternNodes = selectedPattern.slice(0, patternNodeIndex);
+        const alreadyMappedGraphNodeIds = new Set(Object.values(currentMapping).map(n => n.id));
+
+        // Find candidate nodes in the main graph
+        let candidates = allNodes.filter(n =>
+            areNodesIdentical(n, patternNode) && !alreadyMappedGraphNodeIds.has(n.id)
+        );
+
+        for (const candidate of candidates) {
+            // CORRECTED: Removed space in variable name
+            let isTopologicallyConsistent = true;
+            
+            // Check connections to already-mapped nodes
+            for (const prevPatternNode of prevPatternNodes) {
+                const prevGraphNode = currentMapping[prevPatternNode.id];
+
+                // Check outgoing edges from previous pattern node TO current pattern node
+                if (patternAdj.get(patternNode.id).in.includes(prevPatternNode.id)) {
+                    if (!allEdges.some(e => eid(e,'source') === prevGraphNode.id && eid(e,'target') === candidate.id)) {
+                        // CORRECTED: Removed space in variable name
+                        isTopologicallyConsistent = false; 
+                        break;
+                    }
+                }
+                
+                // Check incoming edges TO previous pattern node FROM current pattern node
+                if (patternAdj.get(patternNode.id).out.includes(prevPatternNode.id)) {
+                    if (!allEdges.some(e => eid(e,'source') === candidate.id && eid(e,'target') === prevGraphNode.id)) {
+                        // CORRECTED: Removed space in variable name
+                        isTopologicallyConsistent = false; 
+                        break;
+                    }
+                }
+            }
+            
+            if (isTopologicallyConsistent) {
+                const newMapping = { ...currentMapping, [patternNode.id]: candidate };
+                findMatches(patternNodeIndex + 1, newMapping);
+            }
+        }
+    }
+    
+    // Start the search
+    findMatches(0, {});
+
+    // Collect all nodes and edges from found groups for highlighting
+    const foundNodeIds = new Set();
+    const foundEdgeIds = new Set();
+    foundGroups.forEach(group => {
+        const groupIds = new Set(group.map(n => n.id));
+        group.forEach(node => foundNodeIds.add(node.id));
+        allEdges.forEach((e, idx) => {
+            if (groupIds.has(eid(e, 'source')) && groupIds.has(eid(e, 'target'))) {
+                foundEdgeIds.add(idx);
+            }
+        });
+    });
+
+    updatePatternUI(foundNodeIds, foundEdgeIds, foundGroups.length);
+}
+
+function updatePatternUI(nodeIds, edgeIds, groupCount) {
+    const pInfo = document.getElementById('pinfo');
+    if (groupCount === 0) {
+        pInfo.style.display = 'none';
+        return;
+    }
+
+    // Highlight found nodes and edges
+    _nG.classed('pattern-hl', d => nodeIds.has(d.id));
+    _lk.classed('pattern-hl', (d, i) => edgeIds.has(i));
+    
+    // Highlight the selected pattern itself more prominently
+    const selectedIds = new Set(selectedPattern.map(n => n.id));
+    _nG.classed('pattern-sel', d => selectedIds.has(d.id));
+
+    // Update info panel
+    const r = (k,v) => `<div class="pi-r"><span class="pi-k">${k}</span><span class="pi-v">${v}</span></div>`;
+    let html = '';
+    if (selectedPattern.length === 1) {
+        html += `<div class="pi-h">Single Node Search</div>`;
+        html += r('Operation', selectedPattern[0].detail.full_name);
+        html += r('Found', `${groupCount} nodes`);
+    } else {
+        html += `<div class="pi-h">Pattern Search</div>`;
+        const patternStr = selectedPattern.map(n => n.label).join(' → ');
+        html += r('Pattern', tr(patternStr, 30));
+        html += r('Found', `${groupCount} groups`);
+    }
+    pInfo.innerHTML = html;
+    pInfo.style.display = 'block';
+}
+
+function clearHighlights() {
+    _hl = null;
+    _nG.classed('dim pattern-hl pattern-sel', false);
+    _lk.classed('hl pattern-hl', false).attr('marker-end', e => e.is_param ? 'url(#arp)' : 'url(#ar)');
+}
+
+function clearPatternSelection() {
+    selectedPattern = [];
+    document.getElementById('pinfo').style.display = 'none';
+    clearHighlights();
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -653,7 +875,13 @@ document.getElementById('bF').addEventListener('click',fitView);
 document.getElementById('bR').addEventListener('click',()=>{allNodes.forEach(n=>{delete n.x;delete n.y;delete n.vx;delete n.vy;delete n.fx;delete n.fy;});document.getElementById('prog').textContent='settling…';buildGraph(allNodes,allEdges,true);});
 document.getElementById('bS').addEventListener('click',()=>{if(!isSimActive){resetSimulation();}propagateStep();});
 document.getElementById('bSA').addEventListener('click',runAutoSimulation);
-document.getElementById('bU').addEventListener('click', untangleGraph); // ADDED listener
+document.getElementById('bU').addEventListener('click', untangleGraph);
+
+document.getElementById('bPF').addEventListener('click', function() {
+    isPatternFindMode = !isPatternFindMode;
+    this.classList.toggle('on', isPatternFindMode);
+    clearPatternSelection();
+});
 
 let _st;
 document.getElementById('sq').addEventListener('input',function(){clearTimeout(_st);_st=setTimeout(()=>{if(!_nG)return;const q=this.value.toLowerCase().trim();if(!q){_nG.classed('dim',false);return;}_nG.classed('dim',d=>!d.label.toLowerCase().includes(q)&&!(d.detail?.full_name||'').toLowerCase().includes(q));},100);});
@@ -663,6 +891,7 @@ document.getElementById('sq').addEventListener('input',function(){clearTimeout(_
 // ══════════════════════════════════════════════════════════════════
 fetch('/api/graph').then(r=>r.json()).then(({nodes,edges,meta})=>{
   allNodes=nodes;allEdges=edges;
+  allNodes.forEach(n => nodeMap[n.id] = n);
   initSimulationState(allNodes,allEdges);
   document.getElementById('hf').textContent=meta.filename||'?';
   document.getElementById('ho').textContent=meta.n_ops;
