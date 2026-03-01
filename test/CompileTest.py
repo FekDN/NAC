@@ -328,85 +328,84 @@ def process_gpt2():
     dummy_input_ids = torch.ones(1, FIXED_SEQ_LEN, dtype=torch.long)
     dummy_mask = torch.tril(torch.ones(FIXED_SEQ_LEN, FIXED_SEQ_LEN)).bool()[None, None, :, :]
 
-    # Save the causal mask to .npy for loading by the MEP runtime
     causal_mask_np = np.tril(np.ones((FIXED_SEQ_LEN, FIXED_SEQ_LEN), dtype=bool))[np.newaxis, np.newaxis, :, :]
     np.save("gpt2_causal_mask.npy", causal_mask_np)
 
-    print("--- Compiling MEP plan for GPT-2 ---")
+    print("--- Compiling the MEP plan for GPT-2 ---")
     c = MEPCompiler()
 
-    # Step 1: Load resources
+    # ── Step 1: Loading Resources ─────────────────────────────
     c.res_load_model(MODEL_ID, MODEL_PATH)
     c.res_load_extern("tokenizer_runtime", 0, MODEL_ID)
     c.res_load_datafile("const_causal_mask", "gpt2_causal_mask.npy", file_type=2)
 
-    # Constants
-    c.src_constant("max_tokens", 30)
-    c.src_constant("model_len",  FIXED_SEQ_LEN)
-    c.src_constant("const_one",  1)
-    c.src_constant("const_zero", 0)
-    c.src_constant("axis_one",   1)
+    # ── Constants ────────────────────────────────────────────
+    c.src_constant("max_tokens",  30)
+    c.src_constant("model_len",   FIXED_SEQ_LEN)
+    c.src_constant("const_one",   1)
+    c.src_constant("const_zero",  0)
+    c.src_constant("axis_one",    1)
+    # INT8-quantized model: temperature=0.7, top_k=50
+    # At lower temperatures, quantization noise causes loops
+    c.src_constant("temperature", 0.7)
+    c.src_constant("top_k",       50)
 
     c.preproc_get_id("tokenizer_runtime", "<|endoftext|>", "eos_id")
     c.sys_copy("pad_id", "eos_id")
 
-    # Step 2: Input and preprocessing
+    # ── Step 2: Input ──────────────────────────────────────────
     c.src_user_prompt("prompt", "Enter the beginning of the text: ")
     c.io_write("prompt", dest_type=0, write_mode=0)
     c.preproc_encode("tokenizer_runtime", "prompt", "prompt_ids_list")
     c.tensor_create(from_py={'out_var': "generated_ids", 'in_var': "prompt_ids_list", 'dtype_code': 5})
 
-    # Step 3: Generation loop
+    # ── Step 3: Generation Cycle ────────────────────────────────
     c.flow_loop_start("max_tokens")
 
-    # RIGHT padding via concat, as in NACmodels_test.py:
-    #   np.pad(ids, ((0,0),(0,PAD_LEN)), constant_values=pad_id)
-    # tensor_manipulate('pad') direction is undefined, so build explicitly.
     c.tensor_info('dim', "current_seq_len", "generated_ids", dim_idx_var="const_one")
     c.math_binary('sub', "pad_len", "model_len", "current_seq_len")
-    # Build pad tensor [pad_id * pad_len]: arange → *0 → +pad_id
+
+    # Right padding: arange(pad_len) * 0 + pad_id
     c.tensor_create(arange={'out_var': "pad_range", 'end_var': "pad_len", 'dtype_code': 5})
     c.math_binary('mul', "pad_zeros",  "pad_range", "const_zero")
     c.math_binary('add', "pad_tokens", "pad_zeros", "pad_id")
-    # Concatenate [generated_ids | pad_tokens] → right padding
     c.tensor_combine('concat', "input_ids_padded",
                      ["generated_ids", "pad_tokens"], axis_var="axis_one")
 
-    # Run model → logits (1, seq_len, vocab_size)
+    # Dynamic mask: causal AND attention
+    # (1,1,64,64) * (1,64) → broadcasting → (1,1,64,64)
+    c.logic_compare('neq', "attention_mask", "input_ids_padded", "pad_id")
+    c.math_binary('mul', "final_mask", "const_causal_mask", "attention_mask")
+
     c.model_run_static(MODEL_ID,
-                       in_vars=["input_ids_padded", "const_causal_mask"],
+                       in_vars=["input_ids_padded", "final_mask"],
                        out_vars=["logits"])
 
-    # Logits of the last real token (right padding → index = current_seq_len-1)
     c.math_binary('sub', "last_token_idx", "current_seq_len", "const_one")
     c.tensor_extract("next_token_logits", "logits", "last_token_idx")
 
-    # Greedy sampling
-    c.math_aggregate('argmax', "next_token_id_tensor", "next_token_logits")
-    c.tensor_info('to_py', 'next_token_id', 'next_token_id_tensor')
-    c.tensor_create(from_py={'out_var': "next_token_2d", 'in_var': "next_token_id", 'dtype_code': 5})
+    # Stochastic decoding: temperature + top-k sampling
+    c.analysis_top_k("next_token_logits", "top_k", "topk_indices", "topk_vals")
+    c.analysis_sample("next_token_logits", "temperature", "top_k", "next_token_id")
 
-    # Concatenate new token
+    c.tensor_create(from_py={'out_var': "next_token_2d", 'in_var': "next_token_id", 'dtype_code': 5})
     c.src_constant("axis_one", 1)
     c.tensor_combine('concat', "generated_ids", ["generated_ids", "next_token_2d"], axis_var="axis_one")
 
-    # Stream token to console
     c.preproc_decode("tokenizer_runtime", "next_token_id", "new_token_text")
-    c.io_write("new_token_text", dest_type=0, write_mode=2)  # write_mode=2: no newline
+    c.io_write("new_token_text", dest_type=0, write_mode=2)
 
-    # Exit on EOS
     c.logic_compare('eq', "is_eos", "next_token_id", "eos_id")
     c.flow_break_loop_if("is_eos")
 
     c.flow_loop_end()
 
-    # Step 4: Finalize
     c.src_constant("done_msg", "\n--- Generation complete ---")
     c.io_write("done_msg", dest_type=0, write_mode=0)
     c.exec_return(["generated_ids"])
 
     mep_program = c.get_program()
-    print("--- MEP plan compiled ---")
+    print("--- The MEP plan has been compiled ---")
 
     generate_artifacts(
         model_name=model_name,
