@@ -117,17 +117,17 @@ class MEPCompiler:
         self.bytecode += struct.pack('<BBB', out_key, path_key, file_type)
 
     def res_load_extern(self, out_var: str, res_type: int, resource_id: Any):
-        """0x12: RES_LOAD_EXTERN (универсальный).
+        """0x12: RES_LOAD_EXTERN (universal).
         
         res_type:
-            0 - извлечь компонент из уже загруженной модели (NacRuntime)
-            1 - standalone ресурс (по пути/имени)
+            0 - extract a component from an already loaded model (NacRuntime)
+            1 - standalone resource (by path/name)
         """
         key = self._get_context_key(out_var)
         res_id_const = self._get_const_id(resource_id)
         
         self.bytecode.append(0x12)
-        # Параметры: out_key(1), res_type(1), res_id_const_id(2)
+        # Parameters: out_key(1), res_type(1), res_id_const_id(2)
         self.bytecode += struct.pack('<BBH', key, res_type, res_id_const)
 
     # --- 0x20-0x2F: Preprocessing ---
@@ -276,6 +276,33 @@ class MEPCompiler:
         out_key, in_key1, in_key2 = self._get_context_key(out_var), self._get_context_key(in_var1), self._get_context_key(in_var2)
         self.bytecode.append(0x68)
         self.bytecode += struct.pack('<BBBB', op_code, out_key, in_key1, in_key2)
+
+    def analysis_top_k(self, in_var: str, k_var: str,
+                       out_indices_var: str, out_vals_var: str):
+        """0x70: ANALYSIS_TOP_K.
+        Finds top-K values and their indices in a 1-D logits tensor.
+        Parameters: in_key(1), k_key(1), out_indices_key(1), out_vals_key(1)
+        """
+        in_key       = self._get_context_key(in_var)
+        k_key        = self._get_context_key(k_var)
+        out_idx_key  = self._get_context_key(out_indices_var)
+        out_vals_key = self._get_context_key(out_vals_var)
+        self.bytecode.append(0x70)
+        self.bytecode += struct.pack('<BBBB', in_key, k_key, out_idx_key, out_vals_key)
+
+    def analysis_sample(self, logits_var: str, temp_var: str,
+                        topk_var: str, out_var: str):
+        """0x71: ANALYSIS_SAMPLE.
+        Applies temperature scaling + top-k masking + softmax, then samples
+        a token ID from the resulting distribution.
+        Parameters: logits_key(1), temp_key(1), topk_key(1), out_key(1)
+        """
+        logits_key = self._get_context_key(logits_var)
+        temp_key   = self._get_context_key(temp_var)
+        topk_key   = self._get_context_key(topk_var)
+        out_key    = self._get_context_key(out_var)
+        self.bytecode.append(0x71)
+        self.bytecode += struct.pack('<BBBB', logits_key, temp_key, topk_key, out_key)
 
     # --- 0x80-0x8F: Model Execution ---
 
@@ -426,7 +453,7 @@ class MEPCompiler:
         return bytes(self.bytecode), const_map_for_runtime
 
     def save_to_file(self, mep_path: str = "hello.mep", constants_path: str = "hello.constants.json"):
-        """Сохраняет скомпилированный план и пул констант в файлы."""
+        """Saves the compiled plan and constant pool to files."""
         program, const_map = self.get_program()
         
         with open(mep_path, "wb") as f:
@@ -437,6 +464,6 @@ class MEPCompiler:
             with open(constants_path, "w", encoding="utf-8") as f:
                 json.dump(const_map, f, ensure_ascii=False, indent=2)
         
-        print(f"✅ MEP успешно сохранён:")
-        print(f"   • Байт-код:     {mep_path}  ({len(program)} байт)")
-        print(f"   • Константы:    {constants_path}  ({len(const_map)} записей)")
+        print(f"✅ MEP saved successfully:")
+        print(f"   • Bytecode:     {mep_path}  ({len(program)} byte)")
+        print(f"   • Constants:    {constants_path}  ({len(const_map)} records)")
