@@ -38,50 +38,50 @@ def process_resnet18():
     MODEL_ID = 0
     MODEL_PATH = f"{model_name}.nac"
 
-    print("--- Компиляция MEP плана для ResNet-18 ---")
+    print("--- Compiling MEP plan for ResNet-18 ---")
     c = MEPCompiler()
 
-    # Загружаем модель
+    # Load the model
     c.res_load_model(MODEL_ID, MODEL_PATH)
 
-    # Запрашиваем путь к изображению у пользователя.
-    # res_load_dynamic(out_var, path_var, file_type) — динамическая загрузка файла:
-    #   path_var  — MEP-переменная (результат src_user_prompt), не строковый литерал.
-    #   file_type=2 → .npy, загрузка as-is
+    # Ask the user for an image path.
+    # res_load_dynamic(out_var, path_var, file_type) — dynamic file loading:
+    #   path_var  — MEP variable (result of src_user_prompt), not a string literal.
+    #   file_type=2 → .npy, load as-is
     #   file_type=3 → image + ImageNet preprocessing:
     #       PIL.Image.open → resize(256) → center_crop(224×224)
     #       → normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
     #       → shape (1, 3, 224, 224) float32
-    # Реализация препроцессинга: NacRuntime.preprocess_image_for_imagenet()
-    # (вызывается MEP-интерпретатором и NACmodels_test.py напрямую).
-    c.src_user_prompt("image_path", "Введите путь к изображению (jpg/png/…): ")
+    # Preprocessing implementation: NacRuntime.preprocess_image_for_imagenet()
+    # (called by the MEP interpreter and NACmodels_test.py directly).
+    c.src_user_prompt("image_path", "Enter path to image (jpg/png/...): ")
     c.res_load_dynamic("image_tensor", "image_path", file_type=3)
 
-    # Запуск модели
+    # Run the model
     c.model_run_static(MODEL_ID, in_vars=["image_tensor"], out_vars=["logits"])
 
-    # Постобработка: argmax + softmax
+    # Post-processing: argmax + softmax
     c.math_aggregate('argmax', "predicted_idx_tensor", "logits")
     c.math_unary('softmax', "probabilities", "logits")
     c.tensor_info('to_py', 'predicted_idx', 'predicted_idx_tensor')
 
-    # Вероятность предсказанного класса
+    # Confidence of the predicted class
     c.tensor_extract("confidence_tensor", "probabilities", "predicted_idx")
     c.tensor_info('to_py', 'confidence', 'confidence_tensor')
 
-    # Форматированный вывод
-    # NOTE: string_format принимает САМУ строку формата (compile-time константа),
-    # не имя переменной. Инлайним строку напрямую.
+    # Formatted output
+    # NOTE: string_format takes the format string itself (compile-time constant),
+    # not a variable name. Inline the string directly.
     c.string_format("final_output",
-        "\n--- Результат классификации ---\n"
-        "  Класс (ImageNet ID): {}\n"
-        "  Уверенность:         {:.2%}",
+        "\n--- Classification Result ---\n"
+        "  Class (ImageNet ID): {}\n"
+        "  Confidence:          {:.2%}",
         ["predicted_idx", "confidence"])
     c.io_write("final_output", dest_type=0, write_mode=0)
     c.exec_return(["predicted_idx", "confidence"])
 
     mep_program = c.get_program()
-    print("--- MEP план скомпилирован ---")
+    print("--- MEP plan compiled ---")
 
     generate_artifacts(
         model_name=model_name,
@@ -124,43 +124,43 @@ def process_distilbert_sentiment():
     seq_dim = torch.export.Dim("sequence", min=1, max=max_len - 1)
     dynamic_shapes = {"input_ids": {1: seq_dim}, "attention_mask": {1: seq_dim}}
 
-    print("--- Компиляция MEP плана для DistilBERT ---")
+    print("--- Compiling MEP plan for DistilBERT ---")
     c = MEPCompiler()
 
-    # Шаг 1: Загрузка ресурсов
+    # Step 1: Load resources
     c.res_load_model(MODEL_ID, MODEL_PATH)
-    c.res_load_extern("tokenizer_runtime", 0, MODEL_ID)  # res_type=0: компонент из NacRuntime
+    c.res_load_extern("tokenizer_runtime", 0, MODEL_ID)  # res_type=0: component from NacRuntime
 
-    # Шаг 2: Получение пользовательского ввода и препроцессинг
-    c.src_user_prompt("user_text", "Введите текст для анализа: ")
+    # Step 2: Get user input and preprocess
+    c.src_user_prompt("user_text", "Enter text for analysis: ")
     c.preproc_encode("tokenizer_runtime", "user_text", "input_ids_list")
     c.tensor_create(from_py={'out_var': "input_ids", 'in_var': "input_ids_list", 'dtype_code': 5})
 
-    # Формируем attention_mask: те же размерности, что и у input_ids, заполненные 1
+    # Build attention_mask: same dimensions as input_ids, filled with 1s
     c.tensor_info('shape', "input_shape", "input_ids")
     c.tensor_create(ones={'out_var': "attention_mask", 'shape_var': "input_shape", 'dtype_code': 5})
 
-    # lifted_one — скаляр float32=1.0, первый вход графа (v0).
-    # position_ids — arange(seq_len), четвёртый вход (v6).
-    # Источник: NACmodels_test.py all_inputs = [lifted_one, input_ids, attention_mask, position_ids]
+    # lifted_one — float32 scalar=1.0, first graph input (v0).
+    # position_ids — arange(seq_len), fourth input (v6).
+    # Source: NACmodels_test.py all_inputs = [lifted_one, input_ids, attention_mask, position_ids]
     c.src_constant("dim_index_1", 1)
     c.tensor_info('dim', "seq_len", "input_ids", dim_idx_var="dim_index_1")
     c.tensor_create(arange={'out_var': "position_ids", 'end_var': "seq_len", 'dtype_code': 5})
     c.src_constant("one_float", 1.0)
     c.tensor_create(from_py={'out_var': "lifted_one", 'in_var': "one_float", 'dtype_code': 0})
 
-    # Шаг 3: Запуск модели → logits (1, 2)
-    # ПРАВИЛЬНЫЙ ПОРЯДОК: [lifted_one, input_ids, attention_mask, position_ids]
+    # Step 3: Run model → logits (1, 2)
+    # CORRECT ORDER: [lifted_one, input_ids, attention_mask, position_ids]
     c.model_run_static(MODEL_ID,
                        in_vars=["lifted_one", "input_ids", "attention_mask", "position_ids"],
                        out_vars=["logits"])
 
-    # Шаг 4: Постобработка — argmax и softmax
+    # Step 4: Post-processing — argmax and softmax
     c.math_aggregate('argmax', "prediction_idx_tensor", "logits")
     c.tensor_info('to_py', 'prediction_idx', 'prediction_idx_tensor')
     c.math_unary('softmax', "probabilities", "logits")
 
-    # Ветвление для определения текстовой метки
+    # Branching to determine the text label
     c.src_constant("zero", 0)
     c.src_constant("one", 1)
     c.src_constant("true_const", True)
@@ -175,22 +175,22 @@ def process_distilbert_sentiment():
     c.sys_copy("prediction_label_text", "label_negative")
     c.place_label("end_label_if")
 
-    # Извлекаем вероятности из тензора (1, 2)
+    # Extract probabilities from tensor (1, 2)
     c.tensor_extract("prob_neg", "probabilities", "zero")
     c.tensor_extract("prob_pos", "probabilities", "one")
 
-    # Шаг 5: Форматированный вывод
+    # Step 5: Formatted output
     c.string_format("final_output",
-        "\n--- Результаты анализа ---\n"
-        "  Метка:              {}\n"
-        "  Уверенность (NEG):  {:.2%}\n"
-        "  Уверенность (POS):  {:.2%}",
+        "\n--- Analysis Results ---\n"
+        "  Label:              {}\n"
+        "  Confidence (NEG):   {:.2%}\n"
+        "  Confidence (POS):   {:.2%}",
         ["prediction_label_text", "prob_neg", "prob_pos"])
     c.io_write("final_output", dest_type=0, write_mode=0)
     c.exec_return(["prediction_label_text", "prob_neg", "prob_pos"])
 
     mep_program = c.get_program()
-    print("--- MEP план скомпилирован ---")
+    print("--- MEP plan compiled ---")
 
     generate_artifacts(
         model_name=model_name,
@@ -241,42 +241,42 @@ def process_roberta_base():
     seq_dim = torch.export.Dim("sequence", min=1, max=model.config.max_position_embeddings - 2)
     dynamic_shapes = {"input_ids": {1: seq_dim}, "attention_mask": {1: seq_dim}}
 
-    print("--- Компиляция MEP плана для RoBERTa fill-mask ---")
+    print("--- Compiling MEP plan for RoBERTa fill-mask ---")
     c = MEPCompiler()
 
-    # Шаг 1: Загрузка ресурсов
+    # Step 1: Load resources
     c.res_load_model(MODEL_ID, MODEL_PATH)
     c.res_load_extern("tokenizer_runtime", 0, MODEL_ID)
 
-    # Шаг 2: Ввод и препроцессинг
-    c.src_user_prompt("user_text", "Введите предложение с токеном <mask>: ")
+    # Step 2: Input and preprocessing
+    c.src_user_prompt("user_text", "Enter a sentence with the <mask> token: ")
     c.preproc_encode("tokenizer_runtime", "user_text", "input_ids_list")
     c.tensor_create(from_py={'out_var': "input_ids", 'in_var': "input_ids_list", 'dtype_code': 5})
 
-    # attention_mask — единицы, той же формы что и input_ids
+    # attention_mask — ones, same shape as input_ids
     c.tensor_info('shape', "input_shape", "input_ids")
     c.tensor_create(ones={'out_var': "attention_mask", 'shape_var': "input_shape", 'dtype_code': 5})
 
-    # lifted_one — скаляр float32=1.0, первый вход графа (v0).
+    # lifted_one — float32 scalar=1.0, first graph input (v0).
     # NACmodels_test.py: all_inputs = [lifted_one, input_ids, attention_mask]
     c.src_constant("one_float", 1.0)
     c.tensor_create(from_py={'out_var': "lifted_one", 'in_var': "one_float", 'dtype_code': 0})
 
-    # Vocab ID токена <mask> (для RoBERTa = 50264)
+    # Vocab ID of the <mask> token (for RoBERTa = 50264)
     c.preproc_get_id("tokenizer_runtime", "<mask>", "mask_token_id")
 
-    # Шаг 3: Запуск модели → logits (1, seq_len, vocab_size)
-    # ПРАВИЛЬНЫЙ ПОРЯДОК: [lifted_one, input_ids, attention_mask]
+    # Step 3: Run model → logits (1, seq_len, vocab_size)
+    # CORRECT ORDER: [lifted_one, input_ids, attention_mask]
     c.model_run_static(MODEL_ID,
                        in_vars=["lifted_one", "input_ids", "attention_mask"],
                        out_vars=["logits"])
 
-    # Шаг 4: Найти ПОЗИЦИЮ <mask> в input_ids, затем извлечь логиты.
-    # mask_token_id — это vocab ID (~50264), его НЕЛЬЗЯ использовать как
-    # индекс в seq-размерность logits. Нужно найти позицию в input_ids:
+    # Step 4: Find the POSITION of <mask> in input_ids, then extract logits.
+    # mask_token_id is a vocab ID (~50264), it CANNOT be used as
+    # an index into the seq dimension of logits. Need to find position in input_ids:
     #   mask_idx = np.where(input_ids[0] == mask_token_id)[0][0]
     c.logic_compare('eq', "is_mask_pos", "input_ids", "mask_token_id")  # bool (1, seq_len)
-    c.math_aggregate('argmax', "mask_pos_idx", "is_mask_pos")           # первый True → позиция
+    c.math_aggregate('argmax', "mask_pos_idx", "is_mask_pos")           # first True → position
     c.tensor_extract("mask_logits", "logits", "mask_pos_idx")
     c.math_unary('softmax', "mask_probs", "mask_logits")
     c.math_aggregate('argmax', "pred_id_tensor", "mask_logits")
@@ -285,17 +285,17 @@ def process_roberta_base():
     c.tensor_info('to_py', 'pred_confidence', 'pred_confidence_tensor')
     c.preproc_decode("tokenizer_runtime", "pred_id", "predicted_word")
 
-    # Шаг 5: Форматированный вывод
+    # Step 5: Formatted output
     c.string_format("final_output",
-        "\n--- Результат предсказания маски ---\n"
-        "  Предсказанное слово: {}\n"
-        "  Уверенность:         {:.2%}",
+        "\n--- Mask Prediction Result ---\n"
+        "  Predicted word: {}\n"
+        "  Confidence:     {:.2%}",
         ["predicted_word", "pred_confidence"])
     c.io_write("final_output", dest_type=0, write_mode=0)
     c.exec_return(["predicted_word", "pred_confidence"])
 
     mep_program = c.get_program()
-    print("--- MEP план скомпилирован ---")
+    print("--- MEP plan compiled ---")
 
     generate_artifacts(
         model_name=model_name,
@@ -311,7 +311,7 @@ def process_roberta_base():
 
 
 # ============================================================
-# process_gpt2
+# process_gpt2 / process_gpt2_streaming — final MEP plan
 # ============================================================
 
 def process_gpt2():
@@ -328,19 +328,19 @@ def process_gpt2():
     dummy_input_ids = torch.ones(1, FIXED_SEQ_LEN, dtype=torch.long)
     dummy_mask = torch.tril(torch.ones(FIXED_SEQ_LEN, FIXED_SEQ_LEN)).bool()[None, None, :, :]
 
-    # Сохраняем каузальную маску в .npy для загрузки MEP рантаймом
+    # Save the causal mask to .npy for loading by the MEP runtime
     causal_mask_np = np.tril(np.ones((FIXED_SEQ_LEN, FIXED_SEQ_LEN), dtype=bool))[np.newaxis, np.newaxis, :, :]
     np.save("gpt2_causal_mask.npy", causal_mask_np)
 
-    print("--- Компиляция MEP плана для GPT-2 ---")
+    print("--- Compiling MEP plan for GPT-2 ---")
     c = MEPCompiler()
 
-    # Шаг 1: Загрузка ресурсов
+    # Step 1: Load resources
     c.res_load_model(MODEL_ID, MODEL_PATH)
     c.res_load_extern("tokenizer_runtime", 0, MODEL_ID)
     c.res_load_datafile("const_causal_mask", "gpt2_causal_mask.npy", file_type=2)
 
-    # Константы
+    # Constants
     c.src_constant("max_tokens", 30)
     c.src_constant("model_len",  FIXED_SEQ_LEN)
     c.src_constant("const_one",  1)
@@ -350,63 +350,63 @@ def process_gpt2():
     c.preproc_get_id("tokenizer_runtime", "<|endoftext|>", "eos_id")
     c.sys_copy("pad_id", "eos_id")
 
-    # Шаг 2: Ввод и препроцессинг
-    c.src_user_prompt("prompt", "Введите начало текста: ")
+    # Step 2: Input and preprocessing
+    c.src_user_prompt("prompt", "Enter the beginning of the text: ")
     c.io_write("prompt", dest_type=0, write_mode=0)
     c.preproc_encode("tokenizer_runtime", "prompt", "prompt_ids_list")
     c.tensor_create(from_py={'out_var': "generated_ids", 'in_var': "prompt_ids_list", 'dtype_code': 5})
 
-    # Шаг 3: Цикл генерации
+    # Step 3: Generation loop
     c.flow_loop_start("max_tokens")
 
-    # ПРАВЫЙ padding через concat, как в NACmodels_test.py:
+    # RIGHT padding via concat, as in NACmodels_test.py:
     #   np.pad(ids, ((0,0),(0,PAD_LEN)), constant_values=pad_id)
-    # Направление tensor_manipulate('pad') неопределено, поэтому строим явно.
+    # tensor_manipulate('pad') direction is undefined, so build explicitly.
     c.tensor_info('dim', "current_seq_len", "generated_ids", dim_idx_var="const_one")
     c.math_binary('sub', "pad_len", "model_len", "current_seq_len")
-    # Создаём pad-тензор [pad_id * pad_len]: arange → *0 → +pad_id
+    # Build pad tensor [pad_id * pad_len]: arange → *0 → +pad_id
     c.tensor_create(arange={'out_var': "pad_range", 'end_var': "pad_len", 'dtype_code': 5})
     c.math_binary('mul', "pad_zeros",  "pad_range", "const_zero")
     c.math_binary('add', "pad_tokens", "pad_zeros", "pad_id")
-    # Конкатенируем [generated_ids | pad_tokens] → правый padding
+    # Concatenate [generated_ids | pad_tokens] → right padding
     c.tensor_combine('concat', "input_ids_padded",
                      ["generated_ids", "pad_tokens"], axis_var="axis_one")
 
-    # Запуск модели → logits (1, seq_len, vocab_size)
+    # Run model → logits (1, seq_len, vocab_size)
     c.model_run_static(MODEL_ID,
                        in_vars=["input_ids_padded", "const_causal_mask"],
                        out_vars=["logits"])
 
-    # Логиты последнего реального токена (right padding → индекс = current_seq_len-1)
+    # Logits of the last real token (right padding → index = current_seq_len-1)
     c.math_binary('sub', "last_token_idx", "current_seq_len", "const_one")
     c.tensor_extract("next_token_logits", "logits", "last_token_idx")
 
-    # Жадная выборка
+    # Greedy sampling
     c.math_aggregate('argmax', "next_token_id_tensor", "next_token_logits")
     c.tensor_info('to_py', 'next_token_id', 'next_token_id_tensor')
     c.tensor_create(from_py={'out_var': "next_token_2d", 'in_var': "next_token_id", 'dtype_code': 5})
 
-    # Конкатенация нового токена
+    # Concatenate new token
     c.src_constant("axis_one", 1)
     c.tensor_combine('concat', "generated_ids", ["generated_ids", "next_token_2d"], axis_var="axis_one")
 
-    # Стриминг токена в консоль
+    # Stream token to console
     c.preproc_decode("tokenizer_runtime", "next_token_id", "new_token_text")
-    c.io_write("new_token_text", dest_type=0, write_mode=2)  # write_mode=2: без переноса строки
+    c.io_write("new_token_text", dest_type=0, write_mode=2)  # write_mode=2: no newline
 
-    # Выход по EOS
+    # Exit on EOS
     c.logic_compare('eq', "is_eos", "next_token_id", "eos_id")
     c.flow_break_loop_if("is_eos")
 
     c.flow_loop_end()
 
-    # Шаг 4: Завершение
-    c.src_constant("done_msg", "\n--- Генерация завершена ---")
+    # Step 4: Finalize
+    c.src_constant("done_msg", "\n--- Generation complete ---")
     c.io_write("done_msg", dest_type=0, write_mode=0)
     c.exec_return(["generated_ids"])
 
     mep_program = c.get_program()
-    print("--- MEP план скомпилирован ---")
+    print("--- MEP plan compiled ---")
 
     generate_artifacts(
         model_name=model_name,
@@ -420,7 +420,7 @@ def process_gpt2():
 
 
 # ============================================================
-# process_gpt2_streaming
+# process_gpt2_streaming — final MEP plan
 # ============================================================
 
 def process_gpt2_streaming():
@@ -438,41 +438,40 @@ def process_gpt2_streaming():
     dummy_input_ids = torch.ones(1, FIXED_SEQ_LEN, dtype=torch.long)
     dummy_mask = torch.tril(torch.ones(FIXED_SEQ_LEN, FIXED_SEQ_LEN)).bool()[None, None, :, :]
 
-    # Переиспользуем маску из process_gpt2 (или создаём заново)
     if not os.path.exists("gpt2_causal_mask.npy"):
         causal_mask_np = np.tril(np.ones((FIXED_SEQ_LEN, FIXED_SEQ_LEN), dtype=bool))[np.newaxis, np.newaxis, :, :]
         np.save("gpt2_causal_mask.npy", causal_mask_np)
 
-    print("--- Компиляция MEP плана для GPT-2 Streaming ---")
+    print("--- Compiling MEP plan for GPT-2 Streaming ---")
     c = MEPCompiler()
 
-    # Шаг 1: Загрузка ресурсов
+    # ── Step 1: Load resources ────────────────────────────────
     c.res_load_model(MODEL_ID, MODEL_PATH)
     c.res_load_extern("tokenizer_runtime", 0, MODEL_ID)
     c.res_load_datafile("static_causal_mask", "gpt2_causal_mask.npy", file_type=2)
 
-    # Константы
-    c.src_constant("max_tokens", 50)
-    c.src_constant("model_len",  FIXED_SEQ_LEN)
-    c.src_constant("const_one",  1)
-    c.src_constant("const_zero", 0)
-    c.src_constant("axis_one",   1)
+    # ── Constants ─────────────────────────────────────────────
+    c.src_constant("max_tokens",  50)
+    c.src_constant("model_len",   FIXED_SEQ_LEN)
+    c.src_constant("const_one",   1)
+    c.src_constant("const_zero",  0)
+    c.src_constant("axis_one",    1)
+    c.src_constant("temperature", 0.4)
+    c.src_constant("top_k",       40)
 
     c.preproc_get_id("tokenizer_runtime", "<|endoftext|>", "eos_id")
     c.sys_copy("pad_id", "eos_id")
 
-    # Шаг 2: Ввод
-    c.src_user_prompt("prompt", "Введите начало текста (streaming): ")
+    # ── Step 2: Input ─────────────────────────────────────────
+    c.src_user_prompt("prompt", "Enter the beginning of the text (streaming): ")
     c.io_write("prompt", dest_type=0, write_mode=0)
     c.preproc_encode("tokenizer_runtime", "prompt", "prompt_ids_list")
     c.tensor_create(from_py={'out_var': "generated_ids", 'in_var': "prompt_ids_list", 'dtype_code': 5})
 
-    # Шаг 3: Цикл генерации
+    # ── Step 3: Generation loop ───────────────────────────────
     c.flow_loop_start("max_tokens")
 
-    # Используем правильное имя переменной: "generated_ids"
     c.tensor_info('dim', "current_seq_len", "generated_ids", dim_idx_var="const_one")
-    
     c.math_binary('sub', "pad_len", "model_len", "current_seq_len")
     c.tensor_create(arange={'out_var': "pad_range", 'end_var': "pad_len", 'dtype_code': 5})
     c.math_binary('mul', "pad_zeros",  "pad_range", "const_zero")
@@ -480,21 +479,19 @@ def process_gpt2_streaming():
     c.tensor_combine('concat', "padded_input_ids",
                      ["generated_ids", "pad_tokens"], axis_var="axis_one")
 
-    c.logic_compare('neq', "attention_mask", "padded_input_ids", "pad_id")
-    c.math_binary('mul', "final_mask", "static_causal_mask", "attention_mask")
-
+    # Static causal mask — identical to legacy run_streaming_generation
     c.model_run_static(MODEL_ID,
-                       in_vars=["padded_input_ids", "final_mask"],
+                       in_vars=["padded_input_ids", "static_causal_mask"],
                        out_vars=["logits"])
 
     c.math_binary('sub', "last_token_idx", "current_seq_len", "const_one")
     c.tensor_extract("next_token_logits", "logits", "last_token_idx")
 
-    c.math_aggregate('argmax', "next_token_id_tensor", "next_token_logits")
-    c.tensor_info('to_py', 'next_token_id', 'next_token_id_tensor')
-    c.tensor_create(from_py={'out_var': "next_token_2d", 'in_var': "next_token_id", 'dtype_code': 5})
+    # Sampling
+    c.analysis_top_k("next_token_logits", "top_k", "topk_indices", "topk_vals")
+    c.analysis_sample("next_token_logits", "temperature", "top_k", "next_token_id")
 
-    # Обновляем "generated_ids", а не создаем новую переменную "input_ids"
+    c.tensor_create(from_py={'out_var': "next_token_2d", 'in_var': "next_token_id", 'dtype_code': 5})
     c.tensor_combine('concat', "generated_ids", ["generated_ids", "next_token_2d"], axis_var="axis_one")
 
     c.preproc_decode("tokenizer_runtime", "next_token_id", "new_token_text")
@@ -505,14 +502,12 @@ def process_gpt2_streaming():
 
     c.flow_loop_end()
 
-    c.src_constant("done_msg", "\n--- Стриминг завершён ---")
+    c.src_constant("done_msg", "\n--- Streaming complete ---")
     c.io_write("done_msg", dest_type=0, write_mode=0)
-    
-    # Возвращаем "generated_ids"
     c.exec_return(["generated_ids"])
 
     mep_program = c.get_program()
-    print("--- MEP план скомпилирован ---")
+    print("--- MEP plan compiled ---")
 
     generate_artifacts(
         model_name=model_name,
@@ -577,7 +572,7 @@ def process_t5_translation():
     original_compute_bias = model.encoder.block[0].layer[0].SelfAttention.compute_bias
     dummy_bias = original_compute_bias(seq_len, seq_len)
 
-    # Сохраняем предвычисленное позиционное смещение T5 как .npy
+    # Save precomputed T5 positional bias as .npy
     np.save("t5_bias.npy", dummy_bias.detach().numpy())
 
     seq_dim = torch.export.Dim("sequence", min=1, max=512)
@@ -588,7 +583,7 @@ def process_t5_translation():
     }
     clean_encoder_wrapper = T5EncoderWrapper(model.get_encoder(), model)
 
-    print("\n--- Экспорт T5 Encoder (без MEP плана — вложенный компонент) ---")
+    print("\n--- Exporting T5 Encoder (no MEP plan — nested component) ---")
     generate_artifacts(
         model_name="t5-encoder",
         model=clean_encoder_wrapper,
@@ -627,81 +622,81 @@ def process_t5_translation():
     }
 
     # ----------------------------------------------------------------
-    # MEP план для ВСЕГО пайплайна T5 encoder → decoder
-    # Хранится в артефакте decoder'а как точки входа
+    # MEP plan for the ENTIRE T5 encoder → decoder pipeline
+    # Stored in the decoder artifact as entry points
     # ----------------------------------------------------------------
-    print("--- Компиляция MEP плана для T5 (encoder → decoder пайплайн) ---")
+    print("--- Compiling MEP plan for T5 (encoder → decoder pipeline) ---")
     c = MEPCompiler()
     ENCODER_ID = 0
     DECODER_ID = 1
 
-    # Шаг 1: Загрузка обеих моделей и токенизатора
+    # Step 1: Load both models and tokenizer
     c.res_load_model(ENCODER_ID, "t5-encoder.nac")
     c.res_load_model(DECODER_ID, "t5-decoder.nac")
-    c.res_load_extern("tokenizer_runtime", 0, ENCODER_ID)  # токенизатор из encoder-артефакта
+    c.res_load_extern("tokenizer_runtime", 0, ENCODER_ID)  # tokenizer from encoder artifact
 
-    # Предвычисленное позиционное смещение T5
+    # Precomputed T5 positional bias
     c.res_load_datafile("precomputed_bias", "t5_bias.npy", file_type=2)
 
-    # Константы
+    # Constants
     c.src_constant("max_decode_steps", 64)
     c.src_constant("const_one", 1)
     c.preproc_get_id("tokenizer_runtime", "</s>", "eos_id")
     c.preproc_get_id("tokenizer_runtime", "<pad>", "pad_id")
 
-    # Шаг 2: Ввод и препроцессинг
+    # Step 2: Input and preprocessing
     c.src_user_prompt("source_text",
-        "Введите текст для перевода (например: 'translate English to German: Hello'): ")
+        "Enter text for translation (e.g.: 'translate English to German: Hello'): ")
     c.preproc_encode("tokenizer_runtime", "source_text", "enc_ids_list")
     c.tensor_create(from_py={'out_var': "encoder_input_ids", 'in_var': "enc_ids_list", 'dtype_code': 5})
 
-    # Encoder attention mask (единицы)
+    # Encoder attention mask (ones)
     c.tensor_info('shape', "enc_shape", "encoder_input_ids")
     c.tensor_create(ones={'out_var': "encoder_attention_mask", 'shape_var': "enc_shape", 'dtype_code': 5})
 
-    # Шаг 3: Запуск энкодера (один раз)
+    # Step 3: Run encoder (once)
     c.model_run_static(ENCODER_ID,
                        in_vars=["encoder_input_ids", "encoder_attention_mask", "precomputed_bias"],
                        out_vars=["encoder_hidden_states"])
 
-    # Инициализация декодера с <pad> токеном
+    # Initialize decoder with <pad> token
     c.tensor_create(from_py={'out_var': "decoder_ids", 'in_var': "pad_id", 'dtype_code': 5})
 
-    # Шаг 4: Авторегрессивный цикл декодирования
+    # Step 4: Autoregressive decoding loop
     c.flow_loop_start("max_decode_steps")
 
     c.model_run_static(DECODER_ID,
                        in_vars=["decoder_ids", "encoder_hidden_states", "encoder_attention_mask"],
                        out_vars=["decoder_logits"])
 
-    # Жадная выборка на последней позиции
+    # Greedy sampling at last position
     c.tensor_info('dim', "dec_seq_len", "decoder_ids", dim_idx_var="const_one")
     c.math_binary('sub', "last_dec_idx", "dec_seq_len", "const_one")
     c.tensor_extract("last_logits", "decoder_logits", "last_dec_idx")
     c.math_aggregate('argmax', "next_id_tensor", "last_logits")
     c.tensor_info('to_py', 'next_id', 'next_id_tensor')
 
-    # Присоединить к decoder_ids
+    # Append to decoder_ids
     c.tensor_create(from_py={'out_var': "next_id_2d", 'in_var': "next_id", 'dtype_code': 5})
     c.src_constant("axis_one", 1)
     c.tensor_combine('concat', "decoder_ids", ["decoder_ids", "next_id_2d"], axis_var="axis_one")
 
-    # Прерывание по EOS
+    # Break on EOS
     c.logic_compare('eq', "is_eos", "next_id", "eos_id")
     c.flow_break_loop_if("is_eos")
 
     c.flow_loop_end()
 
-    # Шаг 5: Декодирование и вывод результата
+    # Step 5: Decode and output result
     c.preproc_decode("tokenizer_runtime", "decoder_ids", "output_text")
-    c.string_format("final_output", "\n--- Результат перевода ---\n  {}", ["output_text"])
+    c.string_format("final_output", "\n--- Translation Result ---\n  {}", ["output_text"])
     c.io_write("final_output", dest_type=0, write_mode=0)
     c.exec_return(["output_text"])
 
     mep_program = c.get_program()
-    print("--- MEP план скомпилирован ---")
+    print("--- MEP plan compiled ---")
 
-    print("\n--- Экспорт T5 Decoder + MEP пайплайн-оркестратор ---")
+    print("\n--- Exporting T5 Decoder + MEP pipeline orchestrator ---")
     generate_artifacts(
         model_name="t5-decoder",
         model=T5DecoderWrapper(model),
@@ -739,7 +734,7 @@ def process_sd_unet_vae():
     dummy_text_embed = torch.randn(2, 77, 768)
     dummy_timestep = torch.tensor([999, 999], dtype=torch.float32)
 
-    print("--- Экспорт SD UNet (без MEP плана — вложенный компонент) ---")
+    print("--- Exporting SD UNet (no MEP plan — nested component) ---")
     generate_artifacts(
         model_name="sd-unet-256",
         model=UNetWrapper(pipe.unet.eval()),
@@ -755,73 +750,73 @@ def process_sd_unet_vae():
     dummy_vae_latent = torch.randn(1, 4, latent_res, latent_res)
 
     # ----------------------------------------------------------------
-    # MEP план для всего диффузионного пайплайна
-    # Хранится в артефакте VAE как точки входа
-    # Ожидаемые внешние файлы (подготовить заранее):
+    # MEP plan for the entire diffusion pipeline
+    # Stored in the VAE artifact as entry points
+    # Expected external files (prepare in advance):
     #   sd_noise_latent.npy  — (2, 4, latent_res, latent_res) float32
     #   sd_text_embeds.npy   — (2, 77, 768) float32
     #   sd_timesteps.npy     — (NUM_INFERENCE_STEPS,) float32
     # ----------------------------------------------------------------
-    print("--- Компиляция MEP плана для Stable Diffusion (UNet денойзинг + VAE декод) ---")
+    print("--- Compiling MEP plan for Stable Diffusion (UNet denoising + VAE decode) ---")
     c = MEPCompiler()
     UNET_ID = 0
     VAE_ID = 1
 
-    # Шаг 1: Загрузка обеих моделей
+    # Step 1: Load both models
     c.res_load_model(UNET_ID, "sd-unet-256.nac")
     c.res_load_model(VAE_ID, "sd-vae-decoder-256.nac")
 
-    # Загрузка входных данных из файлов
+    # Load input data from files
     c.res_load_datafile("latents",         "sd_noise_latent.npy", file_type=2)
     c.res_load_datafile("text_embeds",     "sd_text_embeds.npy",  file_type=2)
     c.res_load_datafile("timesteps_array", "sd_timesteps.npy",    file_type=2)
 
-    # Константы
+    # Constants
     c.src_constant("num_steps",      NUM_INFERENCE_STEPS)
     c.src_constant("const_one",      1)
     c.src_constant("guidance_scale", 7.5)
     c.src_constant("step_size",      0.05)
 
-    # Прогресс-заголовок
-    c.src_constant("header_msg", f"Начало диффузии ({NUM_INFERENCE_STEPS} шагов)...")
+    # Progress header
+    c.src_constant("header_msg", f"Starting diffusion ({NUM_INFERENCE_STEPS} steps)...")
     c.io_write("header_msg", dest_type=0, write_mode=0)
 
-    # Шаг 2: Денойзинговый цикл
+    # Step 2: Denoising loop
     c.flow_loop_start("num_steps")
 
-    # Текущий шаг = num_steps - remaining
+    # Current step = num_steps - remaining
     c.tensor_info('dim', "remaining", "timesteps_array", dim_idx_var="const_one")
     c.math_binary('sub', "step_idx", "num_steps", "remaining")
     c.tensor_extract("current_timestep", "timesteps_array", "step_idx")
 
-    # UNet: предсказание шума (classifier-free guidance: батч 2)
+    # UNet: noise prediction (classifier-free guidance: batch 2)
     c.model_run_static(UNET_ID,
                        in_vars=["latents", "current_timestep", "text_embeds"],
                        out_vars=["noise_pred"])
 
-    # Применяем guidance scale
+    # Apply guidance scale
     c.math_binary('mul', "noise_pred_scaled", "noise_pred", "guidance_scale")
 
-    # Упрощённый шаг планировщика: latents -= step_size * noise_pred_scaled
+    # Simplified scheduler step: latents -= step_size * noise_pred_scaled
     c.math_binary('mul', "noise_delta", "noise_pred_scaled", "step_size")
     c.math_binary('sub', "latents", "latents", "noise_delta")
 
     c.flow_loop_end()
 
-    # Шаг 3: Декодирование латентного пространства → пиксельное изображение
+    # Step 3: Decode latent space → pixel image
     c.model_run_static(VAE_ID, in_vars=["latents"], out_vars=["decoded_image"])
 
-    # Шаг 4: Финальный вывод
+    # Step 4: Final output
     c.src_constant("done_format",
-        "\n--- Диффузия завершена ---\n"
-        "  Изображение доступно в контексте (decoded_image)\n"
-        "  Для сохранения используйте serialize_object + io_write."
+        "\n--- Diffusion complete ---\n"
+        "  Image available in context (decoded_image)\n"
+        "  To save, use serialize_object + io_write."
     )
     c.io_write("done_format", dest_type=0, write_mode=0)
     c.exec_return(["decoded_image"])
 
     mep_program = c.get_program()
-    print("--- MEP план скомпилирован ---")
+    print("--- MEP plan compiled ---")
 
     generate_artifacts(
         model_name="sd-vae-decoder-256",
