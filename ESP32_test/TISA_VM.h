@@ -78,7 +78,11 @@ class TISAVM {
 public:
     TISAVM(VM_Resources& res);
     std::vector<int32_t> run(const std::vector<uint8_t>& manifest_data, const std::string& text);
-    std::string decode(const std::vector<int32_t>& ids, bool skip_special_tokens = true);
+    // NOTE: signature uses `int` (not int32_t) to avoid ABI mismatch across TUs.
+    // On xtensa-esp-elf gcc 14, int32_t resolves to `long` in some TUs and `int`
+    // in others depending on include order. `int` is always `int` on all ESP32
+    // variants (guaranteed 32-bit by Xtensa ABI) and produces a stable mangled name.
+    std::string decode(const std::vector<int>& ids, bool skip_special_tokens = true);
 private:
     enum class ModelType { UNKNOWN, BPE, WORDPIECE, UNIGRAM };
     ModelType _detect_model_type();

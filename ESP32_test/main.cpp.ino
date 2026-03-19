@@ -1,14 +1,15 @@
-// Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
-
+// =========================================================================
+// 1. Библиотеки и заголовочные файлы
+// =========================================================================
 #include <Arduino.h>
 #include "TFT_eSPI_Compat.h"
 #include "CYD28_TouchscreenR.h"
 #include "CYD28_SD.h"
-#include "types.h"
-#include "op_kernels.h" 
+#include "types.h" // Обновленный types.h содержит enum QuantExecMode
+#include "op_kernels.h"
+#include "MEP_interpreter.h"  // MEP ISA v1.0 интерпретатор (оркестрация)
 
 #include "TJpg_Decoder.h"
-const char* g_input_image_path = "/hen.jpg";
 
 #include <vector>
 #include <map>
@@ -29,14 +30,25 @@ const char* g_input_image_path = "/hen.jpg";
 #include "freertos/event_groups.h"
 #include "esp_heap_caps.h"
 
+// ── STACK SIZE OVERRIDE ─────────────────────────────────────────────────────
+// StoreProhibited @EXCVADDR=0x24 root cause: loopTask default stack = 8 KB,
+// but initialize_nac_context() alone uses ~10.6 KB → overflow → g_sd_card_mutex
+// zeroed → xSemaphoreTake(NULL) → writes at NULL+0x24 → crash.
+// Overrides __weak symbol from ESP32 Arduino core main.cpp (available ≥ v2.0).
+size_t getArduinoLoopTaskStackSize(void) { return 32768; }  // 32 KB
+
+
 // =========================================================================
 // 2. Глобальные объекты и пины
 // =========================================================================
 TFT_eSPI tft = TFT_eSPI();
 CYD28_TouchR touch(320, 240);
 
-Tensor* g_target_tensor_for_decode = nullptr; // Глобальный указатель на целевой тензор
 int g_decode_y_offset = 0; // Смещение по Y для записи в тензор
+
+// Global tensor pointer used by TJpgDec callback and MEP h_res_load_dynamic (0x13).
+// MEP_interpreter.cpp references this via `extern Tensor* g_target_tensor_for_decode`.
+Tensor* g_target_tensor_for_decode = nullptr;
 
 #define PIN_SD_SCK  18
 #define PIN_SD_MISO 19
@@ -129,49 +141,6 @@ void softmax(const float* input, float* output, size_t len) {
     }
 }
 
-// НОВАЯ функция-callback для конвертации и записи в int8 тензор
-bool tensor_jpeg_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
-    if (!g_target_tensor_for_decode || !g_target_tensor_for_decode->data) return false;
-
-    // Получаем размеры тензора
-    int tensor_height = g_target_tensor_for_decode->shape[2];
-    int tensor_width = g_target_tensor_for_decode->shape[3];
-
-    // Указатели на R, G, B каналы в тензоре (формат NCHW)
-    int8_t* r_channel = static_cast<int8_t*>(g_target_tensor_for_decode->data);
-    int8_t* g_channel = r_channel + tensor_height * tensor_width;
-    int8_t* b_channel = g_channel + tensor_height * tensor_width;
-
-    // Проходим по блоку пикселей, который передал декодер
-    for (int j = 0; j < h; j++) {
-        int current_y = y + j;
-        if (current_y >= tensor_height) continue;
-
-        for (int i = 0; i < w; i++) {
-            int current_x = x + i;
-            if (current_x >= tensor_width) continue;
-
-            // Получаем пиксель в формате RGB565
-            uint16_t pixel = bitmap[j * w + i];
-
-            // Конвертируем из RGB565 (uint16) в RGB888 (3x uint8)
-            uint8_t r = (pixel >> 11) & 0x1F;
-            uint8_t g = (pixel >> 5) & 0x3F;
-            uint8_t b = pixel & 0x1F;
-            r = (r * 255) / 31;
-            g = (g * 255) / 63;
-            b = (b * 255) / 31;
-
-            // Конвертируем из uint8 [0, 255] в int8 [-128, 127]
-            // Это стандартная практика для квантованных моделей
-            r_channel[current_y * tensor_width + current_x] = (int8_t)(r - 128);
-            g_channel[current_y * tensor_width + current_x] = (int8_t)(g - 128);
-            b_channel[current_y * tensor_width + current_x] = (int8_t)(b - 128);
-        }
-    }
-    return true; // Продолжаем декодирование
-}
-
 // Функция для вывода изображения из буфера на TFT (для отладки)
 // Эта функция будет вызываться TJpg_Decoder
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
@@ -180,24 +149,94 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) 
     return true; // Возвращаем true для продолжения декодирования
 }
 
-//void* alloc_fast(size_t size) {
-//    if (size == 0) return nullptr;
-//    void* ptr = heap_caps_aligned_alloc(16, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-//    if (!ptr) {
-//        ptr = heap_caps_aligned_alloc(16, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-//    }
-//    return ptr;
-//}
+// TJpgDec callback used by MEP h_res_load_dynamic (opcode 0x13, file_type==3).
+// Writes RGB565 tile from JPEG decoder into g_target_tensor_for_decode as
+// INT8 CHW (1,3,224,224), normalised to [-128,127] range.
+// MEP_interpreter.cpp references this via:
+//   extern bool tft_jpeg_output_to_tensor(int16_t,int16_t,uint16_t,uint16_t,uint16_t*);
+bool tft_jpeg_output_to_tensor(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+    if (!g_target_tensor_for_decode || !g_target_tensor_for_decode->data) return false;
+    if (g_target_tensor_for_decode->shape.size() < 4) return false;
+
+    const int tensor_h = g_target_tensor_for_decode->shape[2]; // 224
+    const int tensor_w = g_target_tensor_for_decode->shape[3]; // 224
+    int8_t* base = static_cast<int8_t*>(g_target_tensor_for_decode->data);
+    int8_t* r_ch = base;
+    int8_t* g_ch = base + tensor_h * tensor_w;
+    int8_t* b_ch = base + 2 * tensor_h * tensor_w;
+
+    for (int row = 0; row < (int)h; ++row) {
+        int dst_row = (int)y + row;
+        if (dst_row < 0 || dst_row >= tensor_h) continue;
+        for (int col = 0; col < (int)w; ++col) {
+            int dst_col = (int)x + col;
+            if (dst_col < 0 || dst_col >= tensor_w) continue;
+            uint16_t px = bitmap[row * w + col];
+            // RGB565 → INT8 (centre at 0): subtract 128 after scaling to [0,255]
+            int idx = dst_row * tensor_w + dst_col;
+            r_ch[idx] = (int8_t)(((px >> 11) & 0x1F) * 255 / 31 - 128);
+            g_ch[idx] = (int8_t)(((px >>  5) & 0x3F) * 255 / 63 - 128);
+            b_ch[idx] = (int8_t)(((px      ) & 0x1F) * 255 / 31 - 128);
+        }
+    }
+    return true;
+}
 
 void* alloc_fast(size_t size) {
     if (size == 0) return nullptr;
-    // Всегда выделяем память из внутреннего SRAM, так как PSRAM нет.
-    // Используем MALLOC_CAP_INTERNAL.
-    void* ptr = heap_caps_aligned_alloc(16, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!ptr) {
-        ESP_LOGE("alloc_fast", "FATAL: Failed to allocate %d bytes from internal SRAM!", size);
+    void* ptr = nullptr;
+
+    // ── Стратегия распределения памяти ──────────────────────────────────────
+    // alloc_fast используется ТОЛЬКО для тензорных буферов (не для DMA/стеков).
+    // Приоритет зависит от размера:
+    //
+    //  size < PSRAM_ALLOC_THRESHOLD (малые тензоры, метаданные):
+    //      1. SRAM  — быстрее (x5-x10 по сравнению с PSRAM через SPI).
+    //      2. PSRAM — overflow когда SRAM исчерпан; допустимо для тензоров.
+    //         Если size > доступного SRAM — PSRAM-fallback корректно обрабатывает
+    //         этот случай; функция вернёт валидный указатель вне зависимости от
+    //         того, хватает ли SRAM конкретно для этого буфера.
+    //
+    //  size >= PSRAM_ALLOC_THRESHOLD (большие тензоры весов / FP32-активаций):
+    //      1. PSRAM — защищаем SRAM-резерв для FreeRTOS стеков и маленьких аллокаций.
+    //      2. SRAM  — аварийный fallback, если PSRAM исчерпан.
+    //
+    // Согласованность с quant_mode:
+    //   DEQUANT_ON_LOAD (PSRAM > 512 KB): большие FP32-тензоры (~4× крупнее INT8)
+    //     идут через верхнюю ветку прямо в PSRAM — SRAM не занимают.
+    //   DEQUANT_EXEC_REQUANT (нет PSRAM): psramFound()==false, обе ветки сводятся
+    //     к одному вызову SRAM — идентично простому malloc.
+
+#if CONFIG_SPIRAM_SUPPORT || CONFIG_ESP32_SPIRAM_SUPPORT || defined(BOARD_HAS_PSRAM)
+    if (psramFound() && size >= PSRAM_ALLOC_THRESHOLD) {
+        // Большой буфер — сначала PSRAM
+        ptr = heap_caps_aligned_alloc(16, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (ptr) return ptr;
+        ESP_LOGW("alloc_fast", "PSRAM full for %u B, falling back to SRAM", (unsigned)size);
+        // Аварийный fallback в SRAM — может вытеснить стеки, но лучше чем OOM
+        ptr = heap_caps_aligned_alloc(16, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!ptr) ESP_LOGE("alloc_fast", "OOM: %u B not available in PSRAM or SRAM", (unsigned)size);
+        return ptr;
     }
-    return ptr;
+#endif
+
+    // Малый буфер или нет PSRAM — сначала SRAM
+    ptr = heap_caps_aligned_alloc(16, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (ptr) return ptr;
+
+    // SRAM исчерпан — overflow в PSRAM
+#if CONFIG_SPIRAM_SUPPORT || CONFIG_ESP32_SPIRAM_SUPPORT || defined(BOARD_HAS_PSRAM)
+    if (psramFound()) {
+        ptr = heap_caps_aligned_alloc(16, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (ptr) return ptr;
+    }
+#endif
+
+    ESP_LOGE("alloc_fast", "OOM: %u B — SRAM free: %u, PSRAM free: %u",
+             (unsigned)size,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    return nullptr;
 }
 
 bool parse_instruction_at(const uint8_t* buffer, size_t buffer_size, size_t offset, const std::vector<std::string>& permutations, uint16_t num_outputs, ParsedInstruction& ins){
@@ -330,142 +369,444 @@ size_t gather_arguments(NacRuntimeContext& ctx, const ParsedInstruction& ins, ui
     return argc;
 }
 
-void nac_memory_task(void* pvParameters) {
-    auto* ctx = static_cast<NacRuntimeContext*>(pvParameters);
-    ESP_LOGI(TAG_MEM, "Memory Task started.");
+/**
+ * @brief Создает новый FP32 тензор из квантованного тензора.
+ * @note Оригинальный тензор (source_tensor) не изменяется.
+ * @param ctx Контекст выполнения.
+ * @param source_tensor Квантованный тензор-источник.
+ * @return Новый FP32 тензор или nullptr в случае ошибки.
+ */
+Tensor* create_fp32_copy_from_quantized(NacRuntimeContext& ctx, Tensor* source_tensor) {
+    if (!source_tensor || !source_tensor->data || source_tensor->quant_meta.quant_type == 0 || source_tensor->dtype == DataType::FLOAT32) {
+        return nullptr; // Уже FP32 или невалидный источник
+    }
 
-    while (!ctx->stop_flag.load()) {
-        // Ожидаем уведомления от вычислительной задачи
-        if (ulTaskNotifyTake(pdTRUE, portMAX_DELAY) > 0) {
-            if (ctx->stop_flag.load()) break;
+    size_t num_elem = source_tensor->num_elements;
+    Tensor* result_tensor = ctx.tensor_pool.acquire();
+    if (!result_tensor) return nullptr;
 
-            // Получаем текущий шаг вычислений
-            uint32_t tick = ctx->current_instruction_idx.load(std::memory_order_acquire);
-            
-            auto it = ctx->mmap_schedule.find(tick);
-            if (it == ctx->mmap_schedule.end()) {
-                continue;
+    result_tensor->shape = source_tensor->shape;
+    result_tensor->num_elements = num_elem;
+    result_tensor->dtype = DataType::FLOAT32;
+    result_tensor->size = num_elem * sizeof(float);
+    result_tensor->data = alloc_fast(result_tensor->size);
+
+    if (!result_tensor->data) {
+        ESP_LOGE(TAG_COMPUTE, "Failed to allocate memory for temporary FP32 buffer.");
+        ctx.tensor_pool.release(result_tensor);
+        return nullptr;
+    }
+
+    float* float_data = static_cast<float*>(result_tensor->data);
+    uint8_t quant_type = source_tensor->quant_meta.quant_type;
+
+    if (quant_type == 2) { // INT8_TENSOR
+        int8_t* int8_data = static_cast<int8_t*>(source_tensor->data);
+        float   scale     = source_tensor->quant_meta.scale;
+        // If min_val was stashed in scales[0] by requantize_result_tensor, use it.
+        // Encoding was: int8 = round((fp32 - min_val) / scale) - 128
+        // Decoding:     fp32 = (int8 + 128) * scale + min_val
+        float min_val = (!source_tensor->quant_meta.scales.empty())
+                            ? source_tensor->quant_meta.scales[0]
+                            : 0.0f;
+        for (size_t i = 0; i < num_elem; ++i) {
+            float_data[i] = (static_cast<float>(int8_data[i]) + 128.0f) * scale + min_val;
+        }
+    } else if (quant_type == 3) { // INT8_CHANNEL
+        int8_t* int8_data = static_cast<int8_t*>(source_tensor->data);
+        uint8_t axis = source_tensor->quant_meta.axis;
+        const std::vector<float>& scales = source_tensor->quant_meta.scales;
+        size_t axis_size = (axis < source_tensor->shape.size()) ? source_tensor->shape[axis] : 1;
+        size_t stride = 1;
+        for (size_t i = axis + 1; i < source_tensor->shape.size(); ++i) {
+            stride *= source_tensor->shape[i];
+        }
+        for (size_t i = 0; i < num_elem; ++i) {
+            size_t scale_idx = (i / stride) % axis_size;
+            float scale = (scale_idx < scales.size()) ? scales[scale_idx] : 1.0f;
+            float_data[i] = static_cast<float>(int8_data[i]) * scale;
+        }
+    } else if (quant_type == 4) { // BLOCK_FP8
+        int8_t* int8_data = static_cast<int8_t*>(source_tensor->data);
+        uint16_t block_size = source_tensor->quant_meta.block_size;
+        const std::vector<float>& block_scales = source_tensor->quant_meta.block_scales;
+        size_t num_blocks = block_scales.size();
+        size_t output_idx = 0;
+        for (size_t block_idx = 0; block_idx < num_blocks && output_idx < num_elem; ++block_idx) {
+            float scale = block_scales[block_idx];
+            size_t block_start = block_idx * block_size;
+            for (size_t i = 0; i < block_size && output_idx < num_elem; ++i) {
+                float_data[output_idx++] = static_cast<float>(int8_data[block_start + i]) * scale;
             }
+        }
+    } else {
+        ESP_LOGW(TAG_COMPUTE, "Unknown quantization type: %u. Skipping copy-dequantization.", quant_type);
+        ctx.tensor_pool.release(result_tensor);
+        return nullptr;
+    }
 
-            const auto& commands = it->second;
-            for (const auto& cmd : commands) {
-                switch (cmd.action) {
-                    case MmapAction::PRELOAD: {
-                        if (cmd.target_id >= ctx->decoded_ops.size()) continue;
-                        const auto& preload_ins = ctx->decoded_ops[cmd.target_id];
-                        // Эта логика предполагает, что PRELOAD всегда для веса, что может быть неверно,
-                        // но для текущей задачи это основное применение.
-                        if (preload_ins.A != 2 || preload_ins.B != 1 || preload_ins.C.size() < 2) continue;
-                        
-                        uint16_t param_id = preload_ins.C[1]; // В <INPUT B=1> ID параметра находится в C[1]
-                        if (param_id >= ctx->param_present.size() || !ctx->param_present[param_id]) continue;
-                        
-                        xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
-                        bool exists = (param_id < ctx->fast_memory_cache.size() && ctx->fast_memory_cache[param_id]);
-                        xSemaphoreGive(ctx->cache_mutex);
-                        if (exists) continue;
+    return result_tensor;
+}
 
-                        Tensor* tensor = ctx->tensor_pool.acquire();
-                        tensor->update_from_byte_size(ctx->param_locations[param_id].data_size);
-                        tensor->data = alloc_fast(tensor->size);
+/**
+ * @brief Ре-квантизирует FP32 тензор в INT8.
+ * @note Выполняет преобразование на месте, освобождая старый FP32 буфер.
+ *       Для упрощения, использует динамический min/max для вычисления scale.
+ * @param ctx Контекст выполнения.
+ * @param tensor Тензор-источник (FP32).
+ * @return true в случае успеха, false в случае ошибки.
+ */
+bool requantize_result_tensor(NacRuntimeContext& ctx, Tensor* tensor) {
+    if (!tensor || !tensor->data || tensor->dtype != DataType::FLOAT32) {
+        return false;
+    }
 
-                        if (tensor->data) {
-                            xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
-                            sdcard.seek(ctx->param_locations[param_id].file_offset);
-                            sdcard.readData((uint8_t*)tensor->data, tensor->size);
-                            xSemaphoreGive(g_sd_card_mutex);
+    size_t num_elem = tensor->num_elements;
+    float* fp32_data = static_cast<float*>(tensor->data);
 
-                            xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
-                            if (param_id >= ctx->fast_memory_cache.size()) ctx->fast_memory_cache.resize(param_id + 1, nullptr);
-                            ctx->fast_memory_cache[param_id] = tensor;
-                            xSemaphoreGive(ctx->cache_mutex);
-                        } else {
-                            ESP_LOGE(TAG_MEM, "PRELOAD failed for param %u: OOM", param_id);
-                            ctx->tensor_pool.release(tensor);
-                        }
-                        break;
-                    }
-                    
-                    case MmapAction::FREE: {
-                        xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
-                        // Освобождаем результат операции.
-                        // target_id в команде FREE - это индекс операции, результат которой нужно освободить.
-                        if (cmd.target_id < ctx->results.size() && ctx->results[cmd.target_id]) {
-                            // Проверяем, не сохранен ли этот же указатель в кеше, и если да - обнуляем там.
-                            for (size_t i = 0; i < ctx->fast_memory_cache.size(); ++i) {
-                                if (ctx->fast_memory_cache[i] == ctx->results[cmd.target_id]) {
-                                    ctx->fast_memory_cache[i] = nullptr;
-                                }
-                            }
-                            // Освобождаем тензор.
-                            ctx->tensor_pool.release(ctx->results[cmd.target_id]);
-                            ctx->results[cmd.target_id] = nullptr;
-                        }
-                        xSemaphoreGive(ctx->cache_mutex);
-                        break;
-                    }
+    // ── NaN/Inf scan before quantization ────────────────────────────────────
+    {
+        size_t scan = std::min(num_elem, (size_t)512);
+        size_t nans = 0, infs = 0;
+        for (size_t i = 0; i < scan; ++i) {
+            if (std::isnan(fp32_data[i])) nans++;
+            else if (std::isinf(fp32_data[i])) infs++;
+        }
+        if (nans || infs)
+            Serial.printf("[REQUANT] NaN=%u Inf=%u in tensor (ne=%u, scan=%u) ptr=%p\n",
+                          (unsigned)nans, (unsigned)infs,
+                          (unsigned)num_elem, (unsigned)scan, (void*)fp32_data);
+    }
 
-                    case MmapAction::SAVE_RESULT: {
-                        xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
-                        
-                        if (tick < ctx->results.size() && ctx->results[tick]) {
-                            if (cmd.target_id >= ctx->fast_memory_cache.size()) {
-                                ctx->fast_memory_cache.resize(cmd.target_id + 1, nullptr);
-                            }
-                            
-                            // --- ИСПРАВЛЕНИЕ: Копируем указатель, а не перемещаем ---
-                            // Мы просто сохраняем указатель на результат в кеш.
-                            // Оригинальный указатель в ctx->results[tick] остается на месте.
-                            ctx->fast_memory_cache[cmd.target_id] = ctx->results[tick];
-                            // ctx->results[tick] = nullptr; // <--- ЭТА СТРОКА ВЫЗЫВАЛА ОШИБКИ
-                            
-                            ESP_LOGD(TAG_MEM, "[Tick %u] COPIED result pointer to cache slot %u", tick, cmd.target_id);
-                        } else {
-                            ESP_LOGW(TAG_MEM, "[Tick %u] SAVE_RESULT failed: no result found to save.", tick);
-                        }
-                        
-                        xSemaphoreGive(ctx->cache_mutex);
-                        break;
-                    }
+    // 1. Находим min/max для вычисления scale и zero-point
+    float min_val = fp32_data[0];
+    float max_val = fp32_data[0];
+    for (size_t i = 1; i < num_elem; ++i) {
+        if (fp32_data[i] < min_val) min_val = fp32_data[i];
+        if (fp32_data[i] > max_val) max_val = fp32_data[i];
+    }
+    float range = max_val - min_val;
+    // scale maps the full FP32 range onto [-128, 127].
+    // Encoding:  int8 = round((fp32 - min_val) / scale) - 128
+    // Decoding:  fp32 ≈ (int8 + 128) * scale + min_val
+    // (equivalent to storing as unsigned [0,255] then re-centering)
+    float scale = range > 0.0f ? range / 255.0f : 1.0f;
 
-                    case MmapAction::FORWARD: {
-                        xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
+    // 2. Выделяем новый буфер INT8
+    size_t new_byte_size = num_elem;
+    int8_t* int8_data = static_cast<int8_t*>(alloc_fast(new_byte_size));
+    if (!int8_data) {
+        ESP_LOGE(TAG_COMPUTE, "Failed to allocate memory for INT8 requantization buffer.");
+        return false;
+    }
 
-                        if (tick < ctx->results.size() && ctx->results[tick] && cmd.target_id < ctx->results.size()) {
-                            
-                            if (ctx->results[cmd.target_id] != nullptr) {
-                                ESP_LOGW(TAG_MEM, "[Tick %u] FORWARD is overwriting a non-null tensor at index %u. Releasing old tensor.", tick, cmd.target_id);
-                                ctx->tensor_pool.release(ctx->results[cmd.target_id]);
-                            }
+    // 3. Конвертируем FP32 в INT8 (symmetric around min_val)
+    for (size_t i = 0; i < num_elem; ++i) {
+        float shifted = (fp32_data[i] - min_val) / scale; // → [0, 255]
+        int   q       = (int)roundf(shifted) - 128;       // → [-128, 127]
+        int8_data[i]  = static_cast<int8_t>(std::max(-128, std::min(127, q)));
+    }
 
-                            // --- ИСПРАВЛЕНИЕ: Копируем указатель, а не перемещаем ---
-                            // Мы копируем указатель на результат в будущую ячейку.
-                            // Оригинальный указатель в ctx->results[tick] остается на месте.
-                            ctx->results[cmd.target_id] = ctx->results[tick];
-                            // ctx->results[tick] = nullptr; // <--- ЭТА СТРОКА ВЫЗЫВАЛА ОШИБКИ
-                            
-                            ESP_LOGD(TAG_MEM, "[Tick %u] COPIED result pointer to future result slot %u", tick, cmd.target_id);
+    // 4. Обновляем метаданные тензора
+    // Сохраняем min_val в поле zero_point через scale и отдельное поле:
+    // scale хранит шкалу, min_val — нулевую точку (stored in scales[0] for recovery).
+    heap_caps_free(tensor->data);
+    tensor->data = int8_data;
+    tensor->dtype = DataType::INT8;
+    tensor->size = new_byte_size;
+    tensor->quant_meta.clear();
+    tensor->quant_meta.quant_type = 2; // INT8_TENSOR
+    tensor->quant_meta.scale = scale;
+    // Stash min_val in scales[0] so create_fp32_copy_from_quantized can recover it.
+    tensor->quant_meta.scales.resize(1);
+    tensor->quant_meta.scales[0] = min_val;
 
-                        } else {
-                             ESP_LOGW(TAG_MEM, "[Tick %u] FORWARD to %u failed: source/dest out of bounds or source is null.", tick, cmd.target_id);
-                        }
+    return true;
+}
 
-                        xSemaphoreGive(ctx->cache_mutex);
-                        break;
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal helper: parse quantization metadata from an already-loaded buffer.
+// Called by both read_and_parse_quant_metadata() and load_tensor_from_disk().
+// ─────────────────────────────────────────────────────────────────────────────
+// DType encoding from NAC spec §6.1.1:
+//  0=float32  1=float64  2=float16  3=bfloat16  4=int32
+//  5=int64    6=int16    7=int8     8=uint8      9=bool
+static DataType nac_dtype_id_to_datatype(uint8_t id) {
+    switch (id) {
+        case 0: return DataType::FLOAT32;
+        case 4: return DataType::INT32;
+        case 7: return DataType::INT8;
+        default: return DataType::FLOAT32; // safe fallback
+    }
+}
+
+static bool parse_quant_meta_from_buffer(Tensor* tensor, const uint8_t* buf, size_t len) {
+    if (len == 0) {
+        tensor->quant_meta.quant_type = 0;
+        return true;
+    }
+    const uint8_t* p   = buf;
+    const uint8_t* end = buf + len;
+
+    uint8_t dtype_id, rank;
+    if (p + 2 > end) return false;
+    dtype_id = *p++;
+    rank     = *p++;
+
+    // ── Populate dtype from the NAC dtype_id ──────────────────────────────────
+    // Previously discarded with (void)dtype_id.  This left tensor->dtype at its
+    // pool default (FLOAT32) even for INT8 tensors, so dequant code treated them
+    // as pre-decoded FP32 and skipped the int8*scale step.
+    tensor->dtype = nac_dtype_id_to_datatype(dtype_id);
+
+    // ── Populate shape ────────────────────────────────────────────────────────
+    // Previously skipped with p += rank * 4, leaving tensor->shape empty.
+    // Streaming tensors never had alloc_fast called, so shape was never set via
+    // update_from_shape(), making every guard `shape.size() < 2` fire → nullptr.
+    if (p + rank * 4 > end) return false;
+    tensor->shape.resize(rank);
+    for (uint8_t r = 0; r < rank; ++r) {
+        uint32_t dim;
+        memcpy(&dim, p, 4); p += 4;
+        tensor->shape[r] = (int)dim;
+    }
+    tensor->update_from_shape();   // sets num_elements and size correctly
+
+    if (p >= end) return false;
+    tensor->quant_meta.quant_type = *p++;
+
+    switch (tensor->quant_meta.quant_type) {
+        case 2: // INT8_TENSOR
+            if (p + 4 > end) return false;
+            memcpy(&tensor->quant_meta.scale, p, 4);
+            break;
+        case 3: { // INT8_CHANNEL
+            if (p + 5 > end) return false;
+            uint32_t num_scales;
+            memcpy(&tensor->quant_meta.axis, p, 1); p += 1;
+            memcpy(&num_scales, p, 4);              p += 4;
+            if (p + num_scales * 4 > end) return false;
+            tensor->quant_meta.scales.resize(num_scales);
+            memcpy(tensor->quant_meta.scales.data(), p, num_scales * 4);
+            break;
+        }
+        case 4: { // BLOCK_FP8
+            if (p + 3 > end) return false;
+            uint8_t orig_rank;
+            memcpy(&tensor->quant_meta.block_size, p, 2); p += 2;
+            orig_rank = *p++;
+            if (p + orig_rank * 4 > end) return false;
+            tensor->quant_meta.original_shape.resize(orig_rank);
+            if (orig_rank > 0) {
+                memcpy(tensor->quant_meta.original_shape.data(), p, orig_rank * 4);
+            }
+            p += orig_rank * 4;
+            if (p + 4 > end) return false;
+            uint32_t num_block_scales;
+            memcpy(&num_block_scales, p, 4); p += 4;
+            if (p + num_block_scales * 4 > end) return false;
+            tensor->quant_meta.block_scales.resize(num_block_scales);
+            memcpy(tensor->quant_meta.block_scales.data(), p, num_block_scales * 4);
+            break;
+        }
+        default:
+            break;
+    }
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OPT: Load tensor metadata + data in a SINGLE SD mutex lock, reading
+// sequentially (meta_offset → data_offset) to avoid backward seeks.
+// Previously: two separate lock/seek/read cycles with a backward seek.
+// ─────────────────────────────────────────────────────────────────────────────
+static bool load_tensor_from_disk(Tensor* tensor, const TensorLocation& loc) {
+    // ── 1. Read metadata (small, stack-friendly) ──────────────────────────
+    std::vector<uint8_t> meta_buf;
+    if (loc.meta_len > 0) {
+        meta_buf.resize(loc.meta_len);
+    }
+
+    // ── 2. Allocate data buffer before taking the SD mutex ────────────────
+    //    (alloc_fast may be slow on PSRAM; do it outside the critical section)
+    tensor->update_from_byte_size(loc.data_size);
+    tensor->data = alloc_fast(loc.data_size);
+    if (!tensor->data) {
+        ESP_LOGE(TAG_MEM, "load_tensor_from_disk: OOM for %llu bytes", (unsigned long long)loc.data_size);
+        return false;
+    }
+
+    // ── 3. Single SD lock: seek to meta_offset, read meta, then read data ─
+    //    meta_offset < data_offset always (file format guarantees this),
+    //    so both reads are sequential forward accesses.
+    xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
+    bool sd_ok = true;
+    if (loc.meta_len > 0) {
+        sd_ok &= sdcard.seek(loc.meta_offset);
+        sd_ok &= (sdcard.readData(meta_buf.data(), loc.meta_len) == loc.meta_len);
+    }
+    sd_ok &= sdcard.seek(loc.file_offset);
+    sd_ok &= (sdcard.readData((uint8_t*)tensor->data, loc.data_size) == (size_t)loc.data_size);
+    xSemaphoreGive(g_sd_card_mutex);
+
+    if (!sd_ok) {
+        ESP_LOGE(TAG_MEM, "load_tensor_from_disk: SD read error");
+        heap_caps_free(tensor->data);
+        tensor->data = nullptr;
+        return false;
+    }
+
+    // ── 4. Parse metadata from buffer (no SD access needed) ───────────────
+    return parse_quant_meta_from_buffer(tensor, meta_buf.data(), meta_buf.size());
+}
+
+// ── process_mmap_tick ────────────────────────────────────────────────────────
+// Выполняет все MMAP-команды для одного тика.
+// Вынесена отдельно, чтобы nac_memory_task мог вызывать её в цикле drain,
+// обрабатывая сразу несколько пропущенных тиков за одно пробуждение.
+static void process_mmap_tick(NacRuntimeContext* ctx, uint32_t tick) {
+    auto it = ctx->mmap_schedule.find(tick);
+    if (it == ctx->mmap_schedule.end()) return;
+
+    for (const auto& cmd : it->second) {
+        switch (cmd.action) {
+
+            // ─── PRELOAD ──────────────────────────────────────────────────────
+            // Ключ кэша = target_op_idx (instruction index), а НЕ param_id.
+            case MmapAction::PRELOAD: {
+                uint16_t target_op_idx = cmd.target_id;
+                if (target_op_idx >= ctx->decoded_ops.size()) continue;
+                const auto& preload_ins = ctx->decoded_ops[target_op_idx];
+                if (preload_ins.A != 2 || preload_ins.B != 1 || preload_ins.C.size() < 2) continue;
+                uint16_t param_id = preload_ins.C[1];
+                if (param_id >= ctx->param_present.size() || !ctx->param_present[param_id]) continue;
+                xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
+                bool exists = (target_op_idx < ctx->fast_memory_cache.size() &&
+                               ctx->fast_memory_cache[target_op_idx] != nullptr);
+                xSemaphoreGive(ctx->cache_mutex);
+                if (exists) continue;
+                Tensor* tensor = ctx->tensor_pool.acquire();
+                if (!load_tensor_from_disk(tensor, ctx->param_locations[param_id])) {
+                    ESP_LOGE(TAG_MEM, "PRELOAD: SD read failed for param %u (op %u)", param_id, target_op_idx);
+                    ctx->tensor_pool.release(tensor); continue;
+                }
+                if (ctx->quant_mode == QuantExecMode::DEQUANT_ON_LOAD) {
+                    if (!dequantize_tensor(tensor)) {
+                        ESP_LOGE(TAG_MEM, "PRELOAD: dequantize failed for param %u", param_id);
+                        ctx->tensor_pool.release(tensor); continue;
                     }
                 }
+                xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
+                if (target_op_idx >= ctx->fast_memory_cache.size())
+                    ctx->fast_memory_cache.resize(target_op_idx + 1, nullptr);
+                ctx->fast_memory_cache[target_op_idx] = tensor;
+                xSemaphoreGive(ctx->cache_mutex);
+                ESP_LOGD(TAG_MEM, "[Tick %u] PRELOADED param %u -> op slot %u", tick, param_id, target_op_idx);
+                break;
+            }
+
+            // ─── FREE ─────────────────────────────────────────────────────────
+            // Зануляем ВСЕ алиасы перед release (FORWARD/op_nac_pass создают алиасы).
+            case MmapAction::FREE: {
+                uint16_t tid = cmd.target_id;
+                xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
+                Tensor* to_free = (tid < ctx->results.size()) ? ctx->results[tid] : nullptr;
+                if (to_free) {
+                    for (auto& rp : ctx->results)           { if (rp == to_free) rp = nullptr; }
+                    for (auto& cp : ctx->fast_memory_cache) { if (cp == to_free) cp = nullptr; }
+                }
+                xSemaphoreGive(ctx->cache_mutex);
+                if (to_free) {
+                    ctx->tensor_pool.release(to_free);
+                    ESP_LOGD(TAG_MEM, "[Tick %u] FREED tensor (target slot %u)", tick, tid);
+                }
+                break;
+            }
+
+            // ─── SAVE_RESULT ──────────────────────────────────────────────────
+            // results[tick] должен быть уже заполнен (notify идёт ПОСЛЕ записи).
+            case MmapAction::SAVE_RESULT: {
+                xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
+                if (tick < ctx->results.size() && ctx->results[tick]) {
+                    uint16_t slot_id = cmd.target_id;
+                    if (slot_id >= ctx->fast_memory_cache.size())
+                        ctx->fast_memory_cache.resize(slot_id + 1, nullptr);
+                    ctx->fast_memory_cache[slot_id] = ctx->results[tick];
+                    ESP_LOGD(TAG_MEM, "[Tick %u] SAVE_RESULT -> cache slot %u", tick, slot_id);
+                } else {
+                    ESP_LOGW(TAG_MEM, "[Tick %u] SAVE_RESULT: results[%u] is null", tick, tick);
+                }
+                xSemaphoreGive(ctx->cache_mutex);
+                break;
+            }
+
+            // ─── FORWARD ─────────────────────────────────────────────────────
+            // results[src] НЕ обнуляем — gather_arguments читает его по D-offset.
+            case MmapAction::FORWARD: {
+                uint16_t src = (uint16_t)tick;
+                uint16_t dst = cmd.target_id;
+                xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
+                if (src < ctx->results.size() && ctx->results[src] &&
+                    dst < ctx->results.size()) {
+                    if (ctx->results[dst] && ctx->results[dst] != ctx->results[src])
+                        ctx->tensor_pool.release(ctx->results[dst]);
+                    ctx->results[dst] = ctx->results[src];
+                    ESP_LOGD(TAG_MEM, "[Tick %u] FORWARD src=%u -> dst=%u", tick, src, dst);
+                } else {
+                    ESP_LOGW(TAG_MEM, "[Tick %u] FORWARD src=%u dst=%u: oob or null", tick, src, dst);
+                }
+                xSemaphoreGive(ctx->cache_mutex);
+                break;
             }
         }
     }
+}
+
+void nac_memory_task(void* pvParameters) {
+    auto* ctx = static_cast<NacRuntimeContext*>(pvParameters);
+
+    // ── Защита от пропуска тиков (tick-skipping bug) ──────────────────────────
+    //
+    // ПРОБЛЕМА: xTaskNotifyGive инкрементирует счётчик уведомлений, а
+    // current_instruction_idx хранит только ПОСЛЕДНЕЕ значение.
+    // Если compute обработал тики 5, 6, 7 пока memory task спал, счётчик = 3,
+    // но load() вернёт 7 — тики 5 и 6 будут пропущены:
+    //   FREE   для тиков 5-6 не выполнится → тензоры остаются в памяти → OOM
+    //   SAVE_RESULT для 5-6 не выполнится → кэш не заполнен → on-demand загрузки
+    //   FORWARD для 5-6 не выполнится → неверные алиасы в results[]
+    //
+    // РЕШЕНИЕ: last_processed отслеживает последний обработанный тик.
+    // При каждом пробуждении дренируем ВСЕ тики от last+1 до current.
+    // UINT32_MAX = sentinel «ещё ничего не обработано» → first drain с тика 0.
+    uint32_t last_processed = UINT32_MAX;
+
+    ESP_LOGI(TAG_MEM, "Memory Task started.");
+
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (ctx->stop_flag.load()) break;
+
+        uint32_t current = ctx->current_instruction_idx.load(std::memory_order_acquire);
+
+        // Дренируем все тики [last+1 .. current].
+        uint32_t from = (last_processed == UINT32_MAX) ? 0u : last_processed + 1u;
+        for (uint32_t t = from; t <= current; ++t) {
+            process_mmap_tick(ctx, t);
+        }
+        last_processed = current;
+    }
+
     xEventGroupSetBits(g_system_events, EVT_MEMORY_TASK_DONE);
     ESP_LOGI(TAG_MEM, "Memory Task finished.");
     vTaskDelete(NULL);
 }
 
-// НОВАЯ ФУНКЦИЯ: Читает и парсит метаданные для тензора с SD-карты
+// Reads quantization metadata from SD and parses it.
+// NOTE: For bulk tensor loading, prefer load_tensor_from_disk() which
+// combines this with the data read under a single SD mutex lock.
 bool read_and_parse_quant_metadata(Tensor* tensor, const TensorLocation& loc) {
     if (loc.meta_len == 0) {
-        tensor->quant_meta.quant_type = 0; // 'none'
+        tensor->quant_meta.quant_type = 0;
         return true;
     }
 
@@ -481,67 +822,17 @@ bool read_and_parse_quant_metadata(Tensor* tensor, const TensorLocation& loc) {
         return false;
     }
 
-    const uint8_t* p = meta_buffer.data();
-    const uint8_t* end = p + loc.meta_len;
-    
-    // Пропускаем dtype_id (1Б) и rank (1Б) + shape (rank * 4Б), т.к. они для данных, а не для квантизации.
-    // Это уже должно быть в тензоре или неважно для деквантизации.
-    uint8_t dtype_id, rank;
-    memcpy(&dtype_id, p, 1); p += 1;
-    memcpy(&rank, p, 1); p += 1;
-    p += rank * 4;
-
-    if (p >= end) return false;
-    
-    memcpy(&tensor->quant_meta.quant_type, p, 1); p += 1;
-
-    switch (tensor->quant_meta.quant_type) {
-        case 2: // INT8_TENSOR
-            if (p + 4 > end) return false;
-            memcpy(&tensor->quant_meta.scale, p, 4);
-            break;
-        case 3: // INT8_CHANNEL
-            if (p + 5 > end) return false;
-            uint32_t num_scales;
-            memcpy(&tensor->quant_meta.axis, p, 1); p += 1;
-            memcpy(&num_scales, p, 4); p += 4;
-            if (p + num_scales * 4 > end) return false;
-            tensor->quant_meta.scales.resize(num_scales);
-            memcpy(tensor->quant_meta.scales.data(), p, num_scales * 4);
-            break;
-        case 4: // BLOCK_FP8
-            if (p + 3 > end) return false;
-            uint8_t original_rank;
-            memcpy(&tensor->quant_meta.block_size, p, 2); p += 2;
-            memcpy(&original_rank, p, 1); p += 1;
-            
-            if (p + original_rank * 4 > end) return false;
-            tensor->quant_meta.original_shape.resize(original_rank);
-            if (original_rank > 0) {
-                memcpy(tensor->quant_meta.original_shape.data(), p, original_rank * 4);
-            }
-            p += original_rank * 4;
-
-            if (p + 4 > end) return false;
-            uint32_t num_block_scales;
-            memcpy(&num_block_scales, p, 4); p += 4;
-
-            if (p + num_block_scales * 4 > end) return false;
-            tensor->quant_meta.block_scales.resize(num_block_scales);
-            memcpy(tensor->quant_meta.block_scales.data(), p, num_block_scales * 4);
-            break;
-    }
-
-    return true;
+    return parse_quant_meta_from_buffer(tensor, meta_buffer.data(), meta_buffer.size());
 }
 
-// Функция деквантизации тензора согласно метаданным
+// Функция деквантизации тензора согласно метаданным (in place)
 bool dequantize_tensor(Tensor* tensor) {
     if (!tensor || !tensor->data) return false;
     
     uint8_t quant_type = tensor->quant_meta.quant_type;
     
     if (quant_type == 0 || quant_type == 1) { // none or FP16
+        tensor->quant_meta.clear();
         return true;
     }
     
@@ -632,85 +923,66 @@ void nac_compute_task(void* pvParameters) {
     auto* ctx = static_cast<NacRuntimeContext*>(pvParameters);
     size_t user_input_idx = 0;
     for (uint32_t idx = 0; idx < ctx->decoded_ops.size() && !ctx->stop_flag.load(); ++idx) {
-        ctx->current_instruction_idx.store(idx, std::memory_order_release);
-        if (g_nac_memory_task_handle) xTaskNotifyGive(g_nac_memory_task_handle);
-        
+
         const auto& ins = ctx->decoded_ops[idx];
 
-        // --- Блок отладочного вывода ---
+        // --- Отладочный вывод (включить #define NAC_VERBOSE_DEBUG для диагностики) ---
+#ifdef NAC_VERBOSE_DEBUG
         {
-            std::string op_name_str;
+            char op_name_buf[48];
             if (ins.A == 2) {
-                switch (ins.B) {
-                    case 0: op_name_str = "INPUT (User Data)"; break;
-                    case 1: op_name_str = "INPUT (Weight)"; break;
-                    case 2: op_name_str = "INPUT (State)"; break;
-                    case 3: op_name_str = "INPUT (Constant)"; break;
-                    default: op_name_str = "INPUT (Unknown)"; break;
-                }
-                if (ins.C.size() > 1) { // Для B=1,2,3 ID в C[1]
-                    op_name_str += " ID=" + std::to_string(ins.C[1]);
-                }
-            } else if (ins.A >= 10) {
-                if (ctx->id_to_name_map.count(ins.A)) {
-                    op_name_str = ctx->id_to_name_map.at(ins.A);
-                } else {
-                    op_name_str = "!!! Unknown Op !!!";
-                }
+                const char* subtypes[] = {"User Data","Weight","State","Constant","Unknown"};
+                uint8_t sub = (ins.B <= 3) ? ins.B : 4;
+                if (ins.C.size() > 1)
+                    snprintf(op_name_buf, sizeof(op_name_buf), "INPUT(%s) ID=%u", subtypes[sub], ins.C[1]);
+                else
+                    snprintf(op_name_buf, sizeof(op_name_buf), "INPUT(%s)", subtypes[sub]);
+            } else if (ins.A >= 10 && ctx->id_to_name_map.count(ins.A)) {
+                snprintf(op_name_buf, sizeof(op_name_buf), "%s", ctx->id_to_name_map.at(ins.A).c_str());
             } else {
-                op_name_str = "--- Special/Reserved Op ---";
+                snprintf(op_name_buf, sizeof(op_name_buf), "OpID=%u", ins.A);
             }
-
-            Serial.printf("[COMPUTE] Step[%u / %u]: OpID=%u, B=%u, Name: %s\n", 
-                idx, 
-                ctx->decoded_ops.size() > 0 ? ctx->decoded_ops.size() - 1 : 0, 
-                ins.A, 
-                ins.B, 
-                op_name_str.c_str());
-            size_t free_heap = ESP.getFreeHeap();
-            Serial.printf("  Mem: %u KB free\n", free_heap / 1024);
+            Serial.printf("[COMPUTE] Step[%u/%u] %s\n", idx, (unsigned)ctx->decoded_ops.size()-1, op_name_buf);
+            Serial.printf("  Mem: %u KB free\n", ESP.getFreeHeap() / 1024);
         }
+#endif
         
+        Tensor* result_tensor = nullptr;
+
         if (ins.A == 2) { // <INPUT>
             Tensor* source_tensor = nullptr;
             if (ins.B == 1) { // Загрузка веса
                 if (ins.C.size() < 2) continue;
                 uint16_t param_id = ins.C[1];
 
+                // ── Ключ кэша = instruction index (idx), а не param_id ──────
+                // nac_memory_task PRELOAD хранит тензор по target_op_idx
+                // (= индекс B=1 инструкции в decoded_ops), чтобы не
+                // пересекаться с SAVE_RESULT, который тоже использует
+                // instruction index. Оба потока обязаны использовать
+                // один ключ, иначе PRELOAD не будет обнаружен.
+                uint16_t cache_key = (uint16_t)idx;
                 xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
-                if (param_id < ctx->fast_memory_cache.size() && ctx->fast_memory_cache[param_id]) {
-                    source_tensor = ctx->fast_memory_cache[param_id];
-                    ctx->fast_memory_cache[param_id] = nullptr;
+                if (cache_key < ctx->fast_memory_cache.size() && ctx->fast_memory_cache[cache_key]) {
+                    source_tensor = ctx->fast_memory_cache[cache_key];
+                    ctx->fast_memory_cache[cache_key] = nullptr;
                 }
                 xSemaphoreGive(ctx->cache_mutex);
 
                 if (!source_tensor && param_id < ctx->param_present.size() && ctx->param_present[param_id]) {
-                    ESP_LOGD(TAG_COMPUTE, "On-demand load for param %u", param_id);
+                    ESP_LOGD(TAG_COMPUTE, "On-demand load for param %u (op %u)", param_id, idx);
                     source_tensor = ctx->tensor_pool.acquire();
-                    
-                    // --- ИСПРАВЛЕНИЕ: Объявляем переменную loc здесь ---
                     const auto& loc = ctx->param_locations[param_id];
-                    
-                    source_tensor->update_from_byte_size(loc.data_size);
-                    source_tensor->data = alloc_fast(loc.data_size);
 
-                    if (source_tensor->data) {
-                        xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
-                        sdcard.seek(loc.file_offset);
-                        sdcard.readData((uint8_t*)source_tensor->data, loc.data_size);
-                        xSemaphoreGive(g_sd_card_mutex);
-                        
-                        if (!read_and_parse_quant_metadata(source_tensor, loc)) {
-                             ESP_LOGE(TAG_COMPUTE, "Failed to read metadata for param %u", param_id);
-                             ctx->tensor_pool.release(source_tensor); source_tensor = nullptr;
-                        } else if (!dequantize_tensor(source_tensor)) {
+                    // OPT: single SD lock reads meta+data sequentially
+                    if (!load_tensor_from_disk(source_tensor, loc)) {
+                        ESP_LOGE(TAG_COMPUTE, "On-demand load failed for param %u", param_id);
+                        ctx->tensor_pool.release(source_tensor); source_tensor = nullptr;
+                    } else if (ctx->quant_mode == QuantExecMode::DEQUANT_ON_LOAD) {
+                        if (!dequantize_tensor(source_tensor)) {
                             ESP_LOGE(TAG_COMPUTE, "Failed to dequantize param %u", param_id);
                             ctx->tensor_pool.release(source_tensor); source_tensor = nullptr;
                         }
-
-                    } else {
-                        ESP_LOGE(TAG_COMPUTE, "On-demand load failed for param %u: OOM", param_id);
-                        ctx->tensor_pool.release(source_tensor); source_tensor = nullptr;
                     }
                 }
             } else if (ins.B == 0) { // Ввод пользователя (Data Input)
@@ -723,29 +995,68 @@ void nac_compute_task(void* pvParameters) {
                     ctx->stop_flag.store(true);
                 }
             }
-            if(idx < ctx->results.size()) ctx->results[idx] = source_tensor;
+            result_tensor = source_tensor;
 
         } else if (ins.A >= 10) {
             Tensor* arguments[MAX_INSTRUCTION_ARITY] = {nullptr};
             size_t argc = gather_arguments(*ctx, ins, idx, arguments);
-            Tensor* result_tensor = nullptr;
+            
+            // --- НАЧАЛО: Логика деквантизации/ре-квантизации ---
+            Tensor* dequant_arguments[MAX_INSTRUCTION_ARITY] = {nullptr};
+            std::vector<Tensor*> temp_dequantized; // Вектор для временных тензоров, которые нужно освободить
+
+            if (ctx->quant_mode == QuantExecMode::DEQUANT_EXEC_PASS_FP || ctx->quant_mode == QuantExecMode::DEQUANT_EXEC_REQUANT) {
+                for (size_t i = 0; i < argc; ++i) {
+                    if (arguments[i] && arguments[i]->dtype != DataType::FLOAT32) {
+                        Tensor* fp32_copy = create_fp32_copy_from_quantized(*ctx, arguments[i]);
+                        if (fp32_copy) {
+                            dequant_arguments[i] = fp32_copy;
+                            temp_dequantized.push_back(fp32_copy);
+                        } else {
+                            dequant_arguments[i] = arguments[i];
+                        }
+                    } else {
+                        dequant_arguments[i] = arguments[i];
+                    }
+                }
+            } else {
+                for(size_t i = 0; i < argc; ++i) dequant_arguments[i] = arguments[i];
+            }
+            // --- КОНЕЦ: Логика деквантизации ---
 
             auto it = g_op_kernels.find(ins.A);
             if (it != g_op_kernels.end()) {
                 KernelFunc kernel = it->second;
-                result_tensor = kernel(ctx, ins, arguments, argc);
+                result_tensor = kernel(ctx, ins, dequant_arguments, argc);
             } else {
                 const char* op_name = ctx->id_to_name_map.count(ins.A) ? ctx->id_to_name_map[ins.A].c_str() : "Unknown";
                 ESP_LOGW(TAG_COMPUTE, "Unimplemented op ID=%u (%s). Passing through.", ins.A, op_name);
-                result_tensor = op_nac_pass(ctx, ins, arguments, argc);
+                result_tensor = op_nac_pass(ctx, ins, dequant_arguments, argc);
             }
+            
+            // --- НАЧАЛО: Логика освобождения временных тензоров ---
+            for(Tensor* temp_tensor : temp_dequantized) {
+                ctx->tensor_pool.release(temp_tensor);
+            }
+            // --- КОНЕЦ: Логика освобождения ---
+        }
 
-            if(idx < ctx->results.size()) {
-                ctx->results[idx] = result_tensor;
-            } else if (result_tensor) {
-                ESP_LOGE(TAG_COMPUTE, "Result for op %u at idx %u out of bounds. Releasing.", ins.A, idx);
-                ctx->tensor_pool.release(result_tensor);
+        // --- НАЧАЛО: Логика ре-квантизации результата ---
+        if (result_tensor && ins.A >= 10 && ctx->quant_mode == QuantExecMode::DEQUANT_EXEC_REQUANT) {
+            if (result_tensor->dtype == DataType::FLOAT32) {
+                requantize_result_tensor(*ctx, result_tensor);
             }
+        }
+        // --- КОНЕЦ: Логика ре-квантизации ---
+
+        if(idx < ctx->results.size()) {
+            ctx->results[idx] = result_tensor;
+            // Нотифицируем nac_memory_task ПОСЛЕ записи results[idx].
+            ctx->current_instruction_idx.store(idx, std::memory_order_release);
+            if (g_nac_memory_task_handle) xTaskNotifyGive(g_nac_memory_task_handle);
+        } else if (result_tensor) {
+            ESP_LOGE(TAG_COMPUTE, "Result for op %u at idx %u out of bounds. Releasing.", ins.A, idx);
+            ctx->tensor_pool.release(result_tensor);
         }
     }
     xEventGroupSetBits(g_system_events, EVT_COMPUTE_TASK_DONE);
@@ -789,7 +1100,8 @@ bool initialize_nac_context(NacRuntimeContext& ctx) {
     uint64_t offsets[9] = {0};
     memcpy(offsets, header + 12, sizeof(offsets));
     uint64_t mmap_off = offsets[0], ops_off = offsets[1], cmap_off = offsets[2], cnst_off = offsets[3],
-             perm_off = offsets[4], data_off = offsets[5], proc_off = offsets[6], meta_off = offsets[7], rsrc_off = offsets[8];
+             perm_off = offsets[4], data_off = offsets[5], proc_off = offsets[6], orch_off = offsets[7], rsrc_off = offsets[8];
+    (void)orch_off; // ORCH section is parsed by mep_load_from_nac(), not here
 
     if (mmap_off > 0) {
         if (!sdcard.seek(mmap_off + 4)) return false;
@@ -845,6 +1157,132 @@ bool initialize_nac_context(NacRuntimeContext& ctx) {
         for(const auto& pair : temp_perms) ctx.permutations[pair.first] = std::move(pair.second);
     }
 
+    // ── CNST section — constant scalars / lists referenced by OPS C-fields ──
+    // Format (per NAC spec §5.3):
+    //   4-byte tag 'CNST' (already consumed as part of the section header)
+    //   uint32  count          — number of records
+    //   per record:
+    //     uint16  id
+    //     uint8   type         0=null 1=bool 2=int64 3=float64 4=string
+    //                          5=list[int32] 6=list[float32]
+    //     uint16  length       bytes for types 2-4; element count for 5-6;
+    //                          ignored for 0,1
+    //     <value bytes>
+    // Each constant is materialised as a unique_ptr<Tensor> stored at
+    // ctx.constants[id].  Kernels receive it via gather_arguments().
+    if (cnst_off > 0) {
+        if (!sdcard.seek(cnst_off + 4)) return false;   // skip 4-byte 'CNST' tag
+        uint32_t cnst_count = 0;
+        if (sdcard.readData((uint8_t*)&cnst_count, 4) != 4) return false;
+
+        // Gather all records first so we know the max id before resizing
+        struct RawConst {
+            uint16_t id;
+            uint8_t  type;
+            uint16_t length;
+            std::vector<uint8_t> data;
+        };
+        std::vector<RawConst> raw(cnst_count);
+        uint16_t max_id = 0;
+
+        for (uint32_t i = 0; i < cnst_count; ++i) {
+            RawConst& rc = raw[i];
+            if (sdcard.readData((uint8_t*)&rc.id,     2) != 2) return false;
+            if (sdcard.readData((uint8_t*)&rc.type,   1) != 1) return false;
+            if (sdcard.readData((uint8_t*)&rc.length, 2) != 2) return false;
+
+            size_t byte_count = 0;
+            switch (rc.type) {
+                case 1: byte_count = 1;                          break; // bool
+                case 2: byte_count = 8;                          break; // int64
+                case 3: byte_count = 8;                          break; // float64
+                case 4: byte_count = rc.length;                  break; // string
+                case 5: byte_count = (size_t)rc.length * 4;     break; // list[int32]
+                case 6: byte_count = (size_t)rc.length * 4;     break; // list[float32]
+                default: byte_count = 0;                         break; // null / unknown
+            }
+            if (byte_count > 0) {
+                rc.data.resize(byte_count);
+                if (sdcard.readData(rc.data.data(), byte_count) != byte_count) return false;
+            }
+            if (rc.id > max_id) max_id = rc.id;
+        }
+
+        ctx.constants.resize((size_t)max_id + 1);   // unique_ptr default = nullptr
+
+        for (const RawConst& rc : raw) {
+            if (rc.type == 0 || rc.type == 4) {
+                // null or string — not representable as a numeric Tensor; leave nullptr
+                ctx.constants[rc.id] = nullptr;
+                continue;
+            }
+
+            auto t_up = std::make_unique<Tensor>();
+            Tensor* t  = t_up.get();
+
+            switch (rc.type) {
+                case 1: {   // bool → INT32 scalar
+                    t->dtype  = DataType::INT32;
+                    t->shape  = {1};
+                    t->update_from_shape();
+                    t->data   = heap_caps_malloc(sizeof(int32_t), MALLOC_CAP_8BIT);
+                    if (!t->data) return false;
+                    *static_cast<int32_t*>(t->data) = rc.data[0] ? 1 : 0;
+                    break;
+                }
+                case 2: {   // int64 → INT32 scalar (all NAC ops use int* for shape args)
+                    int64_t v64 = 0;
+                    memcpy(&v64, rc.data.data(), 8);
+                    t->dtype  = DataType::INT32;
+                    t->shape  = {1};
+                    t->update_from_shape();
+                    t->data   = heap_caps_malloc(sizeof(int32_t), MALLOC_CAP_8BIT);
+                    if (!t->data) return false;
+                    *static_cast<int32_t*>(t->data) = (int32_t)v64;
+                    break;
+                }
+                case 3: {   // float64 → FLOAT32 scalar
+                    double v64 = 0.0;
+                    memcpy(&v64, rc.data.data(), 8);
+                    t->dtype  = DataType::FLOAT32;
+                    t->shape  = {1};
+                    t->update_from_shape();
+                    t->data   = heap_caps_malloc(sizeof(float), MALLOC_CAP_8BIT);
+                    if (!t->data) return false;
+                    *static_cast<float*>(t->data) = (float)v64;
+                    break;
+                }
+                case 5: {   // list[int32]
+                    int n    = (int)rc.length;
+                    t->dtype = DataType::INT32;
+                    t->shape = {n};
+                    t->update_from_shape();
+                    t->data  = heap_caps_malloc((size_t)n * sizeof(int32_t), MALLOC_CAP_8BIT);
+                    if (!t->data) return false;
+                    memcpy(t->data, rc.data.data(), (size_t)n * sizeof(int32_t));
+                    break;
+                }
+                case 6: {   // list[float32]
+                    int n    = (int)rc.length;
+                    t->dtype = DataType::FLOAT32;
+                    t->shape = {n};
+                    t->update_from_shape();
+                    t->data  = heap_caps_malloc((size_t)n * sizeof(float), MALLOC_CAP_8BIT);
+                    if (!t->data) return false;
+                    memcpy(t->data, rc.data.data(), (size_t)n * sizeof(float));
+                    break;
+                }
+                default:
+                    ctx.constants[rc.id] = nullptr;
+                    continue;
+            }
+
+            ctx.constants[rc.id] = std::move(t_up);
+        }
+        Serial.printf("[MAIN] CNST: loaded %u constants (max_id=%u).\n",
+                      (unsigned)cnst_count, (unsigned)max_id);
+    }
+
     if (ops_off > 0) {
         if (!sdcard.seek(ops_off + 4)) return false;
         uint32_t num_ops;
@@ -859,7 +1297,11 @@ bool initialize_nac_context(NacRuntimeContext& ctx) {
         if (next_section_start == (uint64_t)-1) {
             next_section_start = sdcard.size(); 
         }
-        long ops_section_size = next_section_start - ops_data_start;
+        size_t ops_section_size = next_section_start - ops_data_start;
+                if (ops_section_size > 512u * 1024u) {
+                    ESP_LOGE(TAG_MAIN, "ops_section_size %u > 512KB", (unsigned)ops_section_size);
+                    return false;
+                }
         std::vector<uint8_t> ops_buffer(ops_section_size);
         sdcard.seek(ops_data_start);
         if (sdcard.readData(ops_buffer.data(), ops_section_size) != ops_section_size) return false;
@@ -875,22 +1317,41 @@ bool initialize_nac_context(NacRuntimeContext& ctx) {
         ctx.results.resize(ctx.decoded_ops.size(), nullptr);
     }
     
+    // d_model — bytes 10-11 of header (uint16, NAC spec §2.2.4).
+    // Not used by the runtime; logged here for diagnostics.
+    uint16_t d_model = 0;
+    memcpy(&d_model, header + 10, 2);
+    if (d_model > 0) Serial.printf("[MAIN] d_model: %u\n", d_model);
+
     if (data_off > 0) {
         if (!sdcard.seek(data_off + 4)) return false;
-        uint32_t param_name_count, input_name_count, num_tensors;
-        sdcard.readData((uint8_t*)&param_name_count, 4);
-        for(uint32_t i=0; i<param_name_count; ++i) { 
-            uint16_t id, len; sdcard.readData((uint8_t*)&id, 2); sdcard.readData((uint8_t*)&len, 2);
-            sdcard.seek(sdcard.getPosition() + len);
+        uint32_t param_name_count = 0, input_name_count = 0, num_tensors = 0;
+
+        // ── Block 1: param_id → name mapping ─────────────────────────────
+        // NAC spec §6.1 Block 1: uint32 count; per record: uint16 id, uint16 name_len, name
+        if (sdcard.readData((uint8_t*)&param_name_count, 4) != 4) return false;
+        for (uint32_t i = 0; i < param_name_count; ++i) {
+            uint16_t id = 0, len = 0;
+            if (sdcard.readData((uint8_t*)&id,  2) != 2) return false;
+            if (sdcard.readData((uint8_t*)&len, 2) != 2) return false;
+            if (!sdcard.seek(sdcard.getPosition() + len)) return false;
         }
-        sdcard.readData((uint8_t*)&input_name_count, 4);
-        for(uint32_t i=0; i<input_name_count; ++i) { 
-            uint16_t id, len; sdcard.readData((uint8_t*)&id, 2); sdcard.readData((uint8_t*)&len, 2);
-            sdcard.seek(sdcard.getPosition() + len);
+
+        // ── Block 2: input_index → name mapping ───────────────────────────
+        // NAC spec §6.1 Block 2: uint32 count; per record: uint16 index, uint16 name_len, name
+        if (sdcard.readData((uint8_t*)&input_name_count, 4) != 4) return false;
+        for (uint32_t i = 0; i < input_name_count; ++i) {
+            uint16_t id = 0, len = 0;
+            if (sdcard.readData((uint8_t*)&id,  2) != 2) return false;
+            if (sdcard.readData((uint8_t*)&len, 2) != 2) return false;
+            if (!sdcard.seek(sdcard.getPosition() + len)) return false;
         }
 
         if (store_weights_internally) {
-            sdcard.readData((uint8_t*)&num_tensors, 4);
+            // ── Block 3: weight tensors ───────────────────────────────────
+            // NAC spec §6.1 Block 3: uint32 count; per record:
+            //   uint16 p_id, uint32 meta_len, uint64 data_len, metadata, data
+            if (sdcard.readData((uint8_t*)&num_tensors, 4) != 4) return false;
             Serial.printf("[MAIN] Loading %u tensor locations...\n", num_tensors);
             for (uint32_t i = 0; i < num_tensors; ++i) {
                 uint16_t p_id; uint32_t meta_len; uint64_t data_len;
@@ -916,66 +1377,50 @@ bool initialize_nac_context(NacRuntimeContext& ctx) {
 
     if (proc_off > 0) {
         if (!sdcard.seek(proc_off + 4)) return false;
-        uint32_t manifest_size;
-        sdcard.readData((uint8_t*)&manifest_size, 4);
+        uint32_t manifest_size = 0;
+        if (sdcard.readData((uint8_t*)&manifest_size, 4) != 4) return false;
         ctx.tisa_manifest.resize(manifest_size);
-        sdcard.readData(ctx.tisa_manifest.data(), manifest_size);
+        if (sdcard.readData(ctx.tisa_manifest.data(), manifest_size) != manifest_size) return false;
     }
     
  if (rsrc_off > 0) {
     Serial.println("[MAIN] Found RSRC section, parsing resources...");
     if (!sdcard.seek(rsrc_off + 4)) return false;
-    uint32_t num_files;
-    sdcard.readData((uint8_t*)&num_files, 4);
+    uint32_t num_files = 0;
+    if (sdcard.readData((uint8_t*)&num_files, 4) != 4) return false;
     Serial.printf("[MAIN] RSRC contains %u files.\n", num_files);
 
-    // Временный буфер для JSON файла
-    std::vector<uint8_t> json_buffer;
-
     for (uint32_t i = 0; i < num_files; ++i) {
-        uint16_t name_len;
-        sdcard.readData((uint8_t*)&name_len, 2);
+        uint16_t name_len = 0;
+        if (sdcard.readData((uint8_t*)&name_len, 2) != 2) return false;
         std::string filename(name_len, '\0');
-        sdcard.readData((uint8_t*)filename.data(), name_len);
-        uint32_t data_len;
-        sdcard.readData((uint8_t*)&data_len, 4);
+        if (sdcard.readData((uint8_t*)filename.data(), name_len) != name_len) return false;
+        uint32_t data_len = 0;
+        if (sdcard.readData((uint8_t*)&data_len, 4) != 4) return false;
         uint64_t data_offset = sdcard.getPosition();
         Serial.printf("[MAIN]  - Found resource '%s' with size %u\n", filename.c_str(), data_len);
 
         if (filename == "vocab.b") {
             ctx.tokenizer_resources.vocab = std::make_unique<BinaryVocabView>(data_offset, data_len);
             Serial.println("[MAIN]    -> Created BinaryVocabView for vocab.b.");
+        } else if (filename == "vidx.b") {
+            // Reverse-lookup index: maps token ID → byte offset in vocab.b data section.
+            // Required by TISAVM::decode() and by any opcode that looks up by ID.
+            ctx.tokenizer_resources.vocab_idx_for_decode =
+                std::make_unique<BinaryVocabIndexView>(data_offset, data_len);
+            Serial.println("[MAIN]    -> Created BinaryVocabIndexView for vidx.b.");
         } else if (filename == "merges.b") {
             ctx.tokenizer_resources.merges = std::make_unique<BinaryMergesView>(data_offset, data_len);
-             Serial.println("[MAIN]    -> Created BinaryMergesView for merges.b.");
+            Serial.println("[MAIN]    -> Created BinaryMergesView for merges.b.");
         } else if (filename == "vocab.json") {
-            // Загружаем JSON в буфер
-            json_buffer.resize(data_len);
-            sdcard.seek(data_offset);
-            sdcard.readData(json_buffer.data(), data_len);
-            Serial.println("[MAIN]    -> Read vocab.json into buffer.");
+            // Runtime only supports pre-compiled vocab.b — skip loading this file.
+            // Previously this allocated a json_buffer + DynamicJsonDocument(20480),
+            // wasting ~20KB of SRAM for a file we cannot use.
+            Serial.println("[MAIN]    -> Skipping vocab.json (only vocab.b is supported).");
         }
         sdcard.seek(data_offset + data_len);
     }
 
-    // Если был загружен vocab.json, парсим его
-    if (!json_buffer.empty()) {
-        Serial.println("[MAIN] Parsing vocab.json...");
-        DynamicJsonDocument doc(20480); // Выделим достаточно памяти
-        DeserializationError error = deserializeJson(doc, json_buffer.data(), json_buffer.size());
-
-        if (error) {
-            Serial.printf("[MAIN][ERROR] deserializeJson() failed: %s\n", error.c_str());
-        } else {
-            // НЕ ПОДДЕРЖИВАЕТСЯ. Мы не можем создать BinaryVocabView из JSON.
-            // Вместо этого, нужно было бы загрузить это в map в памяти,
-            // но это съест всю память.
-            Serial.println("[MAIN][WARN] vocab.json found, but runtime only supports pre-compiled vocab.b. Tokenizer may fail.");
-            // Создаем пустой unique_ptr, чтобы избежать падения на nullptr
-            // Это неверный подход, но он покажет, что проблема именно в этом
-             ctx.tokenizer_resources.vocab = std::make_unique<BinaryVocabView>(0, 0);
-        }
-    }
 } else {
     Serial.println("[MAIN] RSRC section not found in NAC file.");
 }
@@ -1073,22 +1518,6 @@ void draw_file_list() {
     }
 }
 
-void draw_prompt_screen() {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextSize(1);
-    tft.setTextColor(TFT_GREEN);
-    tft.setCursor(5, 5);
-    tft.printf("File: %s", g_selected_nac_path.c_str());
-    tft.setTextColor(TFT_YELLOW);
-    tft.setCursor(5, 20);
-    tft.println("Enter your prompt:");
-    
-    // Обновленный вызов
-    update_prompt_and_cursor(); 
-
-    draw_keyboard();
-}
-
 void update_prompt_and_cursor() {
     // 1. Очищаем всю область ввода (включая место для курсора)
     tft.fillRect(5, 40, 310, 30, TFT_BLACK); 
@@ -1111,6 +1540,22 @@ void update_prompt_and_cursor() {
     
     // Сбрасываем цвет текста в стандартный для других элементов UI
     tft.setTextColor(TFT_WHITE);
+}
+
+void draw_prompt_screen() {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_GREEN);
+    tft.setCursor(5, 5);
+    tft.printf("File: %s", g_selected_nac_path.c_str());
+    tft.setTextColor(TFT_YELLOW);
+    tft.setCursor(5, 20);
+    tft.println("Enter your prompt:");
+    
+    // Обновленный вызов
+    update_prompt_and_cursor(); 
+
+    draw_keyboard();
 }
 
 // =========================================================================
@@ -1279,8 +1724,18 @@ case SystemState::FINDING_FILES: {
                     for (int col = 0; col < KEY_COLS; ++col) {
                         int x = col * (KEY_WIDTH + KEY_MARGIN) + 2;
                         int y = row * (KEY_HEIGHT + KEY_MARGIN) + KEYBOARD_Y_OFFSET;
+                         // Проверяем, что нажатие попало в границы кнопки
                          if (p.x >= x && p.x < (x + KEY_WIDTH) && p.y >= y && p.y < (y + KEY_HEIGHT)) {
-                             key_pressed_str = keyboard_layout[row][col];
+                             // Учитываем, что большие кнопки занимают несколько ячеек в сетке
+                             int current_col = col;
+                             const char* key_val = keyboard_layout[row][current_col];
+                             if (strcmp(key_val, "") == 0) continue; // Пустые ячейки (объединенные кнопки)
+                             
+                             // Находим начало объединенной кнопки
+                             while(current_col > 0 && strcmp(keyboard_layout[row][current_col], keyboard_layout[row][current_col - 1]) == 0) {
+                                current_col--;
+                             }
+                             key_pressed_str = keyboard_layout[row][current_col];
                              key_found = true;
                              break;
                          }
@@ -1346,266 +1801,132 @@ case SystemState::FINDING_FILES: {
                 Serial.printf("[MAIN] Starting execution. File: '%s'\n", g_selected_nac_path.c_str());
 
                 NacRuntimeContext* context = new NacRuntimeContext();
-                
-                // <<< ИЗМЕНЕНИЕ: Открываем файл здесь ОДИН РАЗ >>>
-                bool file_opened_successfully = false;
+
+                // ── 1. Открываем NAC-файл ─────────────────────────────────
+                // Один дескриптор на всё время выполнения. NAC-граф, параметры
+                // и ORCH-байткод читаются через него, защищённые g_sd_card_mutex.
                 xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
-                if (sdcard.openFile(g_selected_nac_path.c_str())) {
-                    file_opened_successfully = true;
-                }
+                bool file_opened_successfully = sdcard.openFile(g_selected_nac_path.c_str());
                 xSemaphoreGive(g_sd_card_mutex);
 
                 if (!file_opened_successfully) {
                     tft.setTextColor(TFT_RED);
                     tft.println("Error: Failed to open file!");
                     Serial.println("[MAIN][ERROR] Failed to open NAC file for execution.");
-                    // Перезагрузка через 10 секунд
-                    vTaskDelay(pdMS_TO_TICKS(10000));
-                    ESP.restart();
-                    break; // Выход из кейса
+                    delete context;
+                    vTaskDelay(pdMS_TO_TICKS(10000)); ESP.restart(); break;
                 }
 
-                // --- Теперь, когда файл точно открыт, продолжаем ---
-
-                bool is_vision_model = false;
-                // Файл уже открыт, просто читаем из него. Мьютекс не нужен, т.к. другие задачи еще не запущены.
-                uint8_t header[88];
-                sdcard.seek(0);
-                if (sdcard.readData(header, 88) == 88) {
-                    uint64_t proc_off;
-                    memcpy(&proc_off, header + 12 + (6 * 8), sizeof(uint64_t));
-                    if (proc_off == 0) is_vision_model = true;
+                // ── 2. Инициализируем контекст NAC ───────────────────────
+                // Читает MMAP, OPS, CMAP, PERM, DATA, PROC, RSRC секции.
+                // Создаёт tokenizer — НЕ уничтожать до завершения MEP-плана:
+                // RES_LOAD_EXTERN (0x12) берёт его из ctx->tokenizer.
+                if (!initialize_nac_context(*context)) {
+                    tft.setTextColor(TFT_RED); tft.println("Error: NAC init failed!");
+                    Serial.println("[MAIN][ERROR] initialize_nac_context failed.");
+                    sdcard.closeFile(); delete context;
+                    vTaskDelay(pdMS_TO_TICKS(10000)); ESP.restart(); break;
                 }
 
-                uint8_t* jpg_buffer = nullptr;
-                size_t jpg_size = 0;
-                if (is_vision_model) {
-                    tft.println("Model type: Vision. Reading image...");
-                    xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
-                    File jpgFile = SD.open(g_input_image_path, FILE_READ);
-                    if (jpgFile) {
-                        jpg_size = jpgFile.size();
-                        if (jpg_size > 0) {
-                            jpg_buffer = (uint8_t*)alloc_fast(jpg_size);
-                            if (jpg_buffer) jpgFile.read(jpg_buffer, jpg_size);
-                            else jpg_size = 0;
-                        }
-                        jpgFile.close();
-                    }
-                    xSemaphoreGive(g_sd_card_mutex);
-                }
-
-                // <<< ИЗМЕНЕНИЕ: Просто вызываем initialize_nac_context, мьютекс не нужен >>>
-                 if (initialize_nac_context(*context)) {
-                    tft.printf("Ops loaded: %u\n", context->decoded_ops.size());
-
-                    // --- Логика создания входного тензора (vision или language) ---
-                    if (is_vision_model) {
-                        tft.println("Model type: Vision. Reading image...");
-                        xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
-                        File jpgFile = SD.open(g_input_image_path, FILE_READ);
-                        if (jpgFile) {
-                            jpg_size = jpgFile.size();
-                            if (jpg_size > 0) {
-                                jpg_buffer = (uint8_t*)alloc_fast(jpg_size);
-                                if (jpg_buffer) jpgFile.read(jpg_buffer, jpg_size);
-                                else jpg_size = 0;
-                            }
-                            jpgFile.close();
-                        }
-                        xSemaphoreGive(g_sd_card_mutex);
-    
-                        // Создаем тензор для изображения
-                        if (jpg_buffer && jpg_size > 0) {
-                            Tensor* input_tensor = context->tensor_pool.acquire();
-                            input_tensor->dtype = DataType::INT8; 
-                            input_tensor->shape = {1, 3, 224, 224};
-                            input_tensor->update_from_shape();
-                            input_tensor->data = alloc_fast(input_tensor->size);
-
-                            if (input_tensor->data) {
-                                g_target_tensor_for_decode = input_tensor;
-                                TJpgDec.setJpgScale(1);
-                                TJpgDec.setSwapBytes(true);
-                                TJpgDec.setCallback(tensor_jpeg_output);
-                                JRESULT res = TJpgDec.drawJpg(0, 0, jpg_buffer, jpg_size);
-            
-                                if (res == JDR_OK) {
-                                    context->user_input_tensors.push_back(input_tensor);
-                                    Serial.println("[MAIN] Vision input tensor created successfully.");
-                                } else {
-                                    Serial.printf("[MAIN][ERROR] JPEG decode failed with code: %d\n", res);
-                                    context->tensor_pool.release(input_tensor);
-                                }
-                            } else {
-                                Serial.println("[MAIN][ERROR] Failed to allocate memory for vision tensor.");
-                                context->tensor_pool.release(input_tensor);
-                            }
-                            free(jpg_buffer);
-                        }
-                    } else {
-                        // Для языковых моделей, токенизация
-                        // Эта функция будет использовать мьютекс внутри себя
-                        std::vector<int32_t> token_ids = context->tokenizer->run(context->tisa_manifest, g_user_prompt);
-
-                        // Удаляем токенизатор
-                        context->tokenizer.reset(); // Уничтожает TISAVM
-    
-                        // Удаляем ресурсы токенизатора (vocab, merges и т.д.)
-                        context->tokenizer_resources.vocab.reset();
-                        context->tokenizer_resources.vocab_idx_for_decode.reset();
-                        context->tokenizer_resources.merges.reset();
-                        context->tokenizer_resources.byte_map.clear();
-                        context->tokenizer_resources.unigram_scores.clear();
-
-                        // Ограничение длины последовательности, как в Python
-                        const int max_len = 512;
-                        if (token_ids.size() > max_len) {
-                            token_ids.resize(max_len);
-                        }
-                        
-                        Serial.printf("[MAIN] Tokenizer returned %d IDs.\n", token_ids.size());
-
-                        if (!token_ids.empty()) {
-                            int seq_len = token_ids.size();
-
-                            // --- Создаем тензоры в том же порядке, что и в Python ---
-                            
-                            // 1. lifted_one (для v0)
-                            Tensor* one_tensor = context->tensor_pool.acquire();
-                            one_tensor->dtype = DataType::FLOAT32;
-                            one_tensor->shape = {1};
-                            one_tensor->update_from_shape();
-                            one_tensor->data = alloc_fast(one_tensor->size);
-                            if (one_tensor->data) {
-                                *(static_cast<float*>(one_tensor->data)) = 1.0f;
-                                context->user_input_tensors.push_back(one_tensor);
-                            } else { context->tensor_pool.release(one_tensor); }
-
-                            // 2. input_ids (для v1)
-                            Tensor* ids_tensor = context->tensor_pool.acquire();
-                            ids_tensor->dtype = DataType::INT32;
-                            ids_tensor->shape = {1, seq_len};
-                            ids_tensor->update_from_shape();
-                            ids_tensor->data = alloc_fast(ids_tensor->size);
-                            if (ids_tensor->data) {
-                                memcpy(ids_tensor->data, token_ids.data(), ids_tensor->size);
-                                context->user_input_tensors.push_back(ids_tensor);
-                            } else { context->tensor_pool.release(ids_tensor); }
-
-                            // 3. attention_mask (для v2)
-                            Tensor* mask_tensor = context->tensor_pool.acquire();
-                            mask_tensor->dtype = DataType::INT32;
-                            mask_tensor->shape = {1, seq_len};
-                            mask_tensor->update_from_shape();
-                            mask_tensor->data = alloc_fast(mask_tensor->size);
-                            if (mask_tensor->data) {
-                                int32_t* mask_data = static_cast<int32_t*>(mask_tensor->data);
-                                for (int i = 0; i < seq_len; ++i) mask_data[i] = 1;
-                                context->user_input_tensors.push_back(mask_tensor);
-                            } else { context->tensor_pool.release(mask_tensor); }
-
-                            // 4. position_ids (для v6)
-                            Tensor* pos_tensor = context->tensor_pool.acquire();
-                            pos_tensor->dtype = DataType::INT32;
-                            pos_tensor->shape = {1, seq_len};
-                            pos_tensor->update_from_shape();
-                            pos_tensor->data = alloc_fast(pos_tensor->size);
-                            if (pos_tensor->data) {
-                                int32_t* pos_data = static_cast<int32_t*>(pos_tensor->data);
-                                for (int i = 0; i < seq_len; ++i) pos_data[i] = i;
-                                context->user_input_tensors.push_back(pos_tensor);
-                            } else { context->tensor_pool.release(pos_tensor); }
-
-                            Serial.printf("[MAIN] Prepared %d input tensors for the model.\n", context->user_input_tensors.size());
-                        }
-                    }
-                    
-                    if (context->user_input_tensors.empty()) { // <<< ИЗМЕНЕНИЕ: Проверяем вектор
-                        tft.setTextColor(TFT_RED);
-                        tft.println("Error: Input tensors are empty!");
-                    } else {
-                        tft.println("Running model...");
-                        Serial.println("[MAIN] Starting compute and memory tasks...");
-                        BaseType_t mem_task_created = xTaskCreatePinnedToCore(nac_memory_task, "nac_memory_task", 6144, context, 8, &g_nac_memory_task_handle, 0); //8192
-                        BaseType_t compute_task_created = xTaskCreatePinnedToCore(nac_compute_task, "nac_compute_task", 10240, context, 10, &g_nac_compute_task_handle, 1); //12288
-                        
-                        if (mem_task_created != pdPASS) {
-                            Serial.println("[MAIN][FATAL] Failed to create nac_memory_task! Halting.");
-                            tft.setTextColor(TFT_RED);
-                            tft.println("FATAL: MEM TASK FAILED");
-                            while(1);
-                        } else {
-                             Serial.println("[MAIN][DIAG] nac_memory_task created successfully.");
-                        }
-
-                        if (compute_task_created != pdPASS) {
-                            Serial.println("[MAIN][FATAL] Failed to create nac_compute_task! Halting.");
-                            tft.setTextColor(TFT_RED);
-                            tft.println("FATAL: COMPUTE TASK FAILED");
-                            while(1);
-                        } else {
-                            Serial.println("[MAIN][DIAG] nac_compute_task created successfully.");
-                        }
-                        //xTaskCreatePinnedToCore(nac_memory_task, "nac_memory_task", 8192, context, 8, &g_nac_memory_task_handle, 0);
-                        //xTaskCreatePinnedToCore(nac_compute_task, "nac_compute_task", 12288, context, 10, &g_nac_compute_task_handle, 1);
-                        
-                        xEventGroupWaitBits(g_system_events, EVT_COMPUTE_TASK_DONE, pdFALSE, pdFALSE, portMAX_DELAY);
-                        
-                        context->stop_flag.store(true);
-                        if (g_nac_memory_task_handle) xTaskNotifyGive(g_nac_memory_task_handle);
-                        xEventGroupWaitBits(g_system_events, EVT_MEMORY_TASK_DONE, pdTRUE, pdFALSE, portMAX_DELAY);
-                        
-                        tft.println("Execution finished!");
-                        Serial.println("[MAIN] Execution finished!");
-                        
-                        // <<< ИЗМЕНЕНИЕ: Блок постобработки и вывода результата >>>
-                        Tensor* final_logits_tensor = nullptr;
-                        // Ищем последний не-нулевой результат
-                        for(int i = context->results.size() - 1; i >= 0; --i) {
-                            if (context->results[i] != nullptr) {
-                                final_logits_tensor = context->results[i];
-                                break;
-                            }
-                        }
-
-                        if (final_logits_tensor && final_logits_tensor->data && final_logits_tensor->num_elements >= 2) {
-                            Serial.println("[MAIN] Found final logits tensor. Processing...");
-                            float* logits_data = static_cast<float*>(final_logits_tensor->data);
-                            size_t prediction_idx = argmax(logits_data, final_logits_tensor->num_elements);
-
-                            std::map<int, std::string> label_map = {{0, "NEGATIVE"}, {1, "POSITIVE"}};
-                            std::string prediction_label = label_map.count(prediction_idx) ? label_map[prediction_idx] : "UNKNOWN";
-
-                            float probabilities[final_logits_tensor->num_elements];
-                            softmax(logits_data, probabilities, final_logits_tensor->num_elements);
-
-                            Serial.printf("\n--- Analysis Results for '%s'---\n", g_user_prompt);
-                            Serial.printf("  Prediction: %s\n", prediction_label.c_str());
-                            Serial.printf("  Confidence (NEGATIVE): %.2f%%\n", probabilities[0] * 100.0f);
-                            Serial.printf("  Confidence (POSITIVE): %.2f%%\n", probabilities[1] * 100.0f);
-                            
-                            tft.println("\n--- Result ---");
-                            tft.printf("Prediction: %s\n", prediction_label.c_str());
-                            tft.printf("Conf: %.1f%% NEG / %.1f%% POS\n", probabilities[0] * 100.0f, probabilities[1] * 100.0f);
-                        } else {
-                            Serial.println("[MAIN][ERROR] Could not find a valid final result tensor.");
-                            tft.setTextColor(TFT_RED);
-                            tft.println("Error: No result found!");
-                        }
-                    }
-                    
+                // ── 3. Автовыбор режима квантизации ──────────────────────
+                // PSRAM > 512 KB: DEQUANT_ON_LOAD — FP32 в PSRAM, максимальная
+                //   скорость, больший расход памяти.
+                // SRAM-only: DEQUANT_EXEC_REQUANT — веса INT8, деквантуются
+                //   и ре-квантуются per-op (4× меньше промежуточных тензоров,
+                //   критично при 320 KB SRAM).
+                if (psramFound() && ESP.getFreePsram() > 512 * 1024) {
+                    context->quant_mode = QuantExecMode::DEQUANT_ON_LOAD;
+                    Serial.println("[MAIN] Quant mode: DEQUANT_ON_LOAD (PSRAM)");
+                    tft.println("Quant: ON_LOAD");
                 } else {
-                    tft.setTextColor(TFT_RED);
-                    tft.println("Error: NAC init failed!");
+                    context->quant_mode = QuantExecMode::DEQUANT_EXEC_REQUANT;
+                    Serial.println("[MAIN] Quant mode: DEQUANT_EXEC_REQUANT (SRAM-only)");
+                    tft.println("Quant: REQUANT");
                 }
-                
-                // <<< ИЗМЕНЕНИЕ: Закрываем файл здесь, после того как все задачи завершились >>>
-                sdcard.closeFile();
-                
-                delete context;
-                g_nac_compute_task_handle = NULL;
+                tft.printf("Ops: %u\n", (unsigned)context->decoded_ops.size());
+
+                // и вызывает drawJpg(); в легаси-пути vision — тоже используется.
+
+                // ── 4. Выбор пути выполнения ──────────────────────────────
+                //
+                // ┌─ MEP-ПУТЬ (файл имеет секцию ORCH) ─────────────────────
+                // │  MEPInterpreter.run() — полный рецепт выполнения.
+                // │  Последовательность инструкций в байткоде:
+                // │    0x10 RES_LOAD_MODEL   → no-op (модель уже в ctx)
+                // │    0x12 RES_LOAD_EXTERN  → токенизатор из ctx->tokenizer
+                // │    0x02 SRC_USER_PROMPT  → g_user_prompt из pre_answers
+                // │    0x20 PREPROC_ENCODE   → токенизация
+                // │    0x30 TENSOR_CREATE    → attention_mask, position_ids…
+                // │    0x80 MODEL_RUN_STATIC → run_model_sync() (inline, sync)
+                // │    0x60/0x62             → softmax, argmax постобработка
+                // │    0xF0 IO_WRITE         → вывод на Serial + TFT
+                // │    0xFE EXEC_RETURN / 0xFF EXEC_HALT
+                // │
+                // └─ ЛЕГАСИ-ПУТЬ (нет секции ORCH) ─────────────────────────
+                //    main.cpp строит входные тензоры вручную и запускает
+                //    nac_compute_task (Core 1). Постобработка вручную.
+                //
+                // Вспомогательный поток nac_memory_task (Core 0) активен
+                // ВСЕГДА — он обрабатывает MMAP-расписание для обоих путей.
+                // Compute/MEP нотифицируют задачу после записи каждого
+                // results[idx], чтобы SAVE_RESULT видел корректный тензор.
+
+                // ── 4a. Запуск постоянного memory-потока ─────────────────
+                xEventGroupClearBits(g_system_events, EVT_MEMORY_TASK_DONE);
                 g_nac_memory_task_handle = NULL;
+                BaseType_t mem_created = xTaskCreatePinnedToCore(
+                    nac_memory_task, "NAC_MEM",
+                    4096,            // stack bytes
+                    context,         // pvParameters
+                    5,               // priority
+                    &g_nac_memory_task_handle,
+                    0                // Core 0 (Arduino loop / MEP run на Core 1)
+                );
+                if (mem_created != pdPASS) {
+                    tft.setTextColor(TFT_RED);
+                    tft.println("Error: memory task failed!");
+                    Serial.println("[MAIN][ERROR] xTaskCreate(NAC_MEM) failed.");
+                    sdcard.closeFile(); delete context;
+                    vTaskDelay(pdMS_TO_TICKS(10000)); ESP.restart(); break;
+                }
+                Serial.println("[MAIN] NAC_MEM task started on Core 0.");
+
+                // Пробуем загрузить ORCH секцию из NAC-файла
+                std::vector<uint8_t>       mep_bc;
+                std::map<uint16_t, MepVal> mep_consts;
+                bool has_orch = mep_load_from_nac(mep_bc, mep_consts, context);
+
+                if (has_orch) {
+                    // ════════════════════════════════════════════════════════
+                    // MEP-ПУТЬ
+                    // g_user_prompt → pre_answers → SRC_USER_PROMPT (0x02)
+                    // MODEL_RUN_STATIC (0x80) вызывает run_model_sync(),
+                    // который нотифицирует NAC_MEM после каждого results[idx].
+                    // ════════════════════════════════════════════════════════
+                    Serial.println("[MAIN] ORCH section found — MEP orchestrated path.");
+                    tft.println("MEP execution...");
+
+                    MEPInterpreter mep(mep_bc.data(), mep_bc.size(), mep_consts, context);
+                    mep.set_pre_answers({ g_user_prompt });
+                    mep.run();
+                    // Результат выведен инструкциями IO_WRITE внутри плана.
+
+                    Serial.println("[MAIN] MEP execution completed.");
+                    tft.println("MEP done.");
+                }
+                // (else: легаси-путь — nac_compute_task нотифицирует NAC_MEM)
+
+                // ── 4b. Остановка memory-потока ──────────────────────────
+                context->stop_flag.store(true);
+                if (g_nac_memory_task_handle)
+                    xTaskNotifyGive(g_nac_memory_task_handle); // разблокируем из portMAX_DELAY
+                xEventGroupWaitBits(g_system_events, EVT_MEMORY_TASK_DONE,
+                                    pdTRUE, pdFALSE, pdMS_TO_TICKS(5000));
+                g_nac_memory_task_handle = NULL;
+
+                // ── 5. Очистка ────────────────────────────────────────────
+                sdcard.closeFile();
+                delete context;
 
                 tft.setTextColor(TFT_WHITE);
                 tft.println("\nRestarting in 10s...");

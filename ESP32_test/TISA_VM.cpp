@@ -173,8 +173,20 @@ ResourceView::ResourceView(uint64_t off, uint32_t sz) : _offset(off), _size(sz) 
 }
 
 std::string ResourceView::_internal_read_string_from_current_pos() {
-    uint16_t len; if (sdcard.readData((uint8_t*)&len, 2) != 2) return "";
-    std::string s(len, '\0'); if (len > 0 && sdcard.readData((uint8_t*)s.data(), len) != len) return "";
+    uint16_t len;
+    if (sdcard.readData((uint8_t*)&len, 2) != 2) return "";
+    // Guard: token strings in any supported vocab are at most a few hundred bytes.
+    // If len is garbage (e.g. 0xFFFF from a failed seek landing at wrong data),
+    // std::string(len) would try to allocate up to 65535 bytes. On ESP32 with
+    // exceptions disabled, operator new returns NULL on OOM, and the string ctor
+    // then writes the null terminator at address 0 → LoadProhibited crash.
+    // 512 bytes is ultra-conservative (longest real BPE tokens are ~20 chars).
+    if (len > 512) {
+        ESP_LOGE("ResourceView", "_internal_read_string: len=%u > 512 — bad seek? Skipping.", len);
+        return "";
+    }
+    std::string s(len, '\0');
+    if (len > 0 && sdcard.readData((uint8_t*)s.data(), len) != len) return "";
     return s;
 }
 
@@ -186,16 +198,21 @@ uint32_t BinaryVocabView::_get_offset_at(uint32_t idx) {
 
     xSemaphoreTake(g_sd_card_mutex, portMAX_DELAY);
     _cached_block_index = -1;
-    // БЕЗ openFile/closeFile. ИСПОЛЬЗУЕМ СМЕЩЕНИЕ +4 для пропуска заголовка с кол-вом записей
-    if (sdcard.seek(_offset + 4 + (uint64_t)(idx/OFFSETS_PER_CACHE) * CACHE_SIZE_BYTES)) {
+    uint64_t seek_target = _offset + 4 + (uint64_t)(idx/OFFSETS_PER_CACHE) * CACHE_SIZE_BYTES;
+    if (sdcard.seek(seek_target)) {
         uint32_t entries = std::min(OFFSETS_PER_CACHE, _entry_count-(idx/OFFSETS_PER_CACHE)*OFFSETS_PER_CACHE);
         _offset_cache.resize(entries);
         if (sdcard.readData((uint8_t*)_offset_cache.data(), entries * sizeof(uint32_t)) == entries * sizeof(uint32_t)) {
             _cached_block_index = idx / OFFSETS_PER_CACHE;
+        } else {
+            ESP_LOGE("VocabView", "_get_offset_at: readData failed at %llu", (unsigned long long)seek_target);
         }
+    } else {
+        ESP_LOGE("VocabView", "_get_offset_at: seek failed to %llu (offset=%llu entry_count=%u)",
+                 (unsigned long long)seek_target, (unsigned long long)_offset, _entry_count);
     }
     xSemaphoreGive(g_sd_card_mutex);
-    return (_cached_block_index == idx/OFFSETS_PER_CACHE) ? _offset_cache[idx % OFFSETS_PER_CACHE] : 0xFFFFFFFF;
+    return (_cached_block_index == (int32_t)(idx/OFFSETS_PER_CACHE)) ? _offset_cache[idx % OFFSETS_PER_CACHE] : 0xFFFFFFFF;
 }
 
 BinaryVocabView::VocabEntry BinaryVocabView::_read_entry_at_index(uint32_t idx) {
@@ -230,7 +247,12 @@ std::string BinaryVocabView::read_token_by_data_offset(uint32_t off) {
 }
 
 bool BinaryVocabView::find(const std::string& tok, int32_t& id, float& score) {
-    if (_entry_count==0) return false; int32_t l=0, h=_entry_count-1;
+    if (_entry_count==0) return false;
+    ESP_LOGI("VocabView", "find('%s') entry_count=%u heap=%u largest_block=%u",
+             tok.c_str(), _entry_count,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    int32_t l=0, h=_entry_count-1;
     while(l<=h) {
         int32_t m=l+(h-l)/2; VocabEntry e=_read_entry_at_index(m); if(e.key.empty())return false;
         int cmp=tok.compare(e.key);
@@ -327,11 +349,24 @@ std::vector<int32_t> TISAVM::run(const std::vector<uint8_t>& mf, const std::stri
     // Execute all operations from the manifest
     size_t offset = 5;
     while (offset < mf.size()) {
+        if (offset + 5 > mf.size()) {
+            ESP_LOGE("TISA", "run: truncated opcode header at offset %u (mf.size=%u)",
+                     (unsigned)offset, (unsigned)mf.size());
+            break;
+        }
         uint8_t op = mf[offset++];
         uint32_t len;
         memcpy(&len, &mf[offset], 4);
         offset += 4;
-        
+
+        if (len > mf.size() - offset) {
+            ESP_LOGE("TISA", "run: opcode 0x%02X payload len=%u exceeds manifest (offset=%u mf.size=%u) — aborting",
+                     op, (unsigned)len, (unsigned)offset, (unsigned)mf.size());
+            break;
+        }
+
+        ESP_LOGD("TISA", "run: op=0x%02X len=%u heap=%u", op, (unsigned)len,
+                 (unsigned)esp_get_free_heap_size());
         _dispatch_opcode(op, &mf[offset], len, s);
         offset += len;
     }
@@ -457,7 +492,17 @@ case 0x15: { // BYTE_ENCODE
     break;
 }
         case 0x20: _primitive_bpe_encode(s); break;
-        case 0x21: { std::string marker((char*)&p[1],p[0]); _primitive_wordpiece_encode(s, marker); break; }
+        case 0x21: {
+            // p[0] = marker_len, p[1..marker_len] = marker bytes (e.g. "##" for BERT).
+            // Guard: if payload is too short or marker_len > remaining payload, skip.
+            if (len < 1 || p[0] > len - 1) {
+                ESP_LOGE("TISA", "opcode 0x21: bad payload len=%u p[0]=%u", (unsigned)len, (unsigned)p[0]);
+                break;
+            }
+            std::string marker((char*)&p[1], p[0]);
+            _primitive_wordpiece_encode(s, marker);
+            break;
+        }
         case 0x22: _primitive_unigram_encode(s); break;
         case 0x30: { 
             std::vector<int32_t> out;
@@ -473,7 +518,7 @@ case 0x15: { // BYTE_ENCODE
                         ptr++;
                         std::string tok((char*)&ptr[1],ptr[0]);ptr+=1+tok.length();
                         int32_t id=2; // default unk
-                        m_res.vocab->find(tok,id);
+                        if (m_res.vocab) m_res.vocab->find(tok,id);
                         out.push_back(id);
                     }
                 }else{ // is_slot
@@ -872,7 +917,13 @@ void TISAVM::_primitive_bpe_encode(TISA_State& state) {
 }
 
 void TISAVM::_primitive_wordpiece_encode(TISA_State& state, const std::string& marker) {
-    if (!m_res.vocab) return;
+    if (!m_res.vocab) {
+        ESP_LOGE("TISA", "_primitive_wordpiece_encode: vocab is null — cannot tokenize.");
+        return;
+    }
+    ESP_LOGI("TISA", "wordpiece_encode: entry_count=%u marker='%s' fragments=%u heap=%u",
+             m_res.vocab->get_entry_count(), marker.c_str(),
+             (unsigned)state.fragments.size(), (unsigned)esp_get_free_heap_size());
     int32_t unk_id = 100; m_res.vocab->find("[UNK]", unk_id);
     state.ids.clear();
     for (const auto& frag : state.fragments) {
@@ -979,4 +1030,73 @@ void TISAVM::_primitive_unigram_encode(TISA_State& state) {
             state.ids.insert(state.ids.end(), ids.begin(), ids.end());
         }
     }
+}
+
+std::string TISAVM::decode(const std::vector<int>& ids, bool skip_special_tokens) {
+    if (!m_res.vocab_idx_for_decode || !m_res.vocab) {
+        ESP_LOGE("TISAVM", "decode: vocab_idx_for_decode not loaded");
+        return "";
+    }
+
+    // Build reverse byte_map for GPT2-style byte-level tokens
+    std::map<std::string, uint8_t> reverse_byte_map;
+    for (auto& kv : m_res.byte_map) reverse_byte_map[kv.second] = kv.first;
+    bool has_byte_map = !reverse_byte_map.empty();
+
+    std::vector<std::string> tokens;
+    tokens.reserve(ids.size());
+    for (int id : ids) {
+        uint32_t off;
+        if (!m_res.vocab_idx_for_decode->get_offset_for_id(static_cast<int32_t>(id), off))
+            { tokens.push_back(""); continue; }
+        tokens.push_back(m_res.vocab->read_token_by_data_offset(off));
+    }
+
+    // Auto-detect encoding style
+    bool has_sentencepiece = false, has_wordpiece = false;
+    for (auto& t : tokens) {
+        if (t.size()>=3 && (uint8_t)t[0]==0xe2 && (uint8_t)t[1]==0x96 && (uint8_t)t[2]==0x81)
+            { has_sentencepiece = true; break; }
+        if (t.size()>=2 && t[0]=='#' && t[1]=='#')
+            { has_wordpiece = true; break; }
+    }
+
+    std::string result;
+    result.reserve(ids.size() * 4);
+    bool first = true;
+
+    for (auto& tok : tokens) {
+        if (tok.empty()) continue;
+        if (skip_special_tokens &&
+            ((tok.front()=='<' && tok.back()=='>') ||
+             (tok.front()=='[' && tok.back()==']'))) continue;
+
+        if (has_sentencepiece) {
+            std::string piece;
+            for (size_t p = 0; p < tok.size(); ) {
+                if (p+3 <= tok.size() &&
+                    (uint8_t)tok[p]==0xe2 && (uint8_t)tok[p+1]==0x96 && (uint8_t)tok[p+2]==0x81)
+                    { piece += ' '; p += 3; }
+                else { piece += tok[p++]; }
+            }
+            if (first && !piece.empty() && piece[0]==' ') piece = piece.substr(1);
+            result += piece;
+        } else if (has_wordpiece) {
+            result += (tok.size()>=2 && tok[0]=='#' && tok[1]=='#') ? tok.substr(2) : tok;
+        } else if (has_byte_map) {
+            for (size_t p = 0; p < tok.size(); ) {
+                unsigned char c = (unsigned char)tok[p];
+                size_t cl = (c<0x80)?1:(c<0xE0)?2:(c<0xF0)?3:4;
+                if (p+cl > tok.size()) break;
+                auto it = reverse_byte_map.find(tok.substr(p, cl));
+                if (it != reverse_byte_map.end()) result += (char)it->second;
+                else result += tok.substr(p, cl);
+                p += cl;
+            }
+        } else {
+            result += tok;
+        }
+        first = false;
+    }
+    return result;
 }

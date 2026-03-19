@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
+// op_kernels.cpp
 
 #include "op_kernels.h"
 #include <cmath>
@@ -53,20 +53,34 @@ Tensor* create_result_tensor(NacRuntimeContext* ctx, const std::vector<int>& sha
 
 // ID 10: nac.pass
 Tensor* op_nac_pass(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    // Эта функция НЕ ДОЛЖНА создавать копию.
-    // Она просто "пробрасывает" первый входной тензор дальше по графу.
-    // Система управления памятью (mmap) позаботится об освобождении.
-    if (argc > 0 && args[0]) {
-        return args[0]; // Просто возвращаем указатель на первый аргумент
+    // ── IMPORTANT: must NOT return args[0] directly ──────────────────────────
+    // Returning a borrowed pointer creates an alias: results[this_op] and
+    // results[ancestor_op] both point to the same Tensor*.  When the MMAP
+    // FREE action later releases results[ancestor_op], results[this_op]
+    // becomes a dangling pointer.  The pool reuses the slot → subsequent
+    // reads produce garbage/NaN.  At teardown the destructor double-frees
+    // it → CORRUPT HEAP.
+    //
+    // Solution: always make a shallow copy (new Tensor struct, shared data
+    // buffer is NOT copied — but we DO copy the data to avoid write aliasing).
+    if (argc > 0 && args[0] && args[0]->data) {
+        Tensor* x = args[0];
+        Tensor* result = create_result_tensor(ctx, x->shape, x->dtype);
+        if (result && result->data)
+            memcpy(result->data, x->data, x->size);
+        return result;
     }
-    return nullptr; // Если аргументов нет, возвращаем null
+    return nullptr;
 }
 
 // ============================================================
 // nac.neg
 // ============================================================
 Tensor* op_nac_neg(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 1 || !args[0]) return nullptr;
+    if (argc < 1 || !args[0]){
+        ESP_LOGE("op_nac_neg", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
 
     Tensor* result = create_result_tensor(ctx, x->shape, x->dtype);
@@ -99,8 +113,10 @@ Tensor* op_nac_neg(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor*
 // Вспомогательная шаблонная функция для сравнений, чтобы избежать дублирования кода
 template <typename Op>
 Tensor* op_nac_comparison(NacRuntimeContext* ctx, Tensor** args, size_t argc, Op op) {
-    if (argc < 2 || !args[0] || !args[1]) return nullptr;
-
+    if (argc < 2 || !args[0] || !args[1]){
+        ESP_LOGE("op_nac_comparison", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* a = args[0];
     Tensor* b = args[1];
 
@@ -153,7 +169,10 @@ Tensor* op_nac_le(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor**
 
 // ID 17: nac.view
 Tensor* op_nac_view(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 1 || !args[0]) return nullptr;
+    if (argc < 1 || !args[0]){
+        ESP_LOGE("op_nac_view", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* input = args[0];
     std::vector<int> new_shape;
     size_t c_idx = 1; 
@@ -194,7 +213,10 @@ Tensor* op_nac_view(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor
 // nac.clone
 // ============================================================
 Tensor* op_nac_clone(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 1 || !args[0]) return nullptr;
+    if (argc < 1 || !args[0]){
+        ESP_LOGE("op_nac_clone", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
 
     Tensor* result = create_result_tensor(ctx, x->shape, x->dtype);
@@ -210,7 +232,10 @@ Tensor* op_nac_clone(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tenso
 // nac.where
 // ============================================================
 Tensor* op_nac_where(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 3 || !args[0] || !args[1] || !args[2]) return nullptr;
+    if (argc < 3 || !args[0] || !args[1] || !args[2]){
+        ESP_LOGE("op_nac_where", "Invalid arguments.");
+        return nullptr;
+    }
 
     Tensor* cond = args[0];
     Tensor* x = args[1];
@@ -341,7 +366,10 @@ Tensor* op_nac_arange(
 
 // aten.linear_default
 Tensor* op_aten_linear_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 2 || !args[0] || !args[1]) return nullptr;
+    if (argc < 2 || !args[0] || !args[1]){
+        ESP_LOGE("op_aten_linear_default", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0]; // Shape: (..., M, K)
     Tensor* w = args[1]; // Shape: (N, K)
     Tensor* b = (argc > 2 && args[2]) ? args[2] : nullptr;
@@ -400,7 +428,10 @@ Tensor* op_aten_linear_default(NacRuntimeContext* ctx, const ParsedInstruction& 
 
 // aten.layer_norm_default
 Tensor* op_aten_layer_norm_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 3 || !args[0] || !args[1] || !args[2]) return nullptr;
+    if (argc < 3 || !args[0] || !args[1] || !args[2]){
+        ESP_LOGE("op_aten_layer_norm_default", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
     Tensor* w = args[1];
     Tensor* b = args[2];
@@ -434,7 +465,10 @@ Tensor* op_aten_layer_norm_default(NacRuntimeContext* ctx, const ParsedInstructi
 // aten.softmax_int
 Tensor* op_aten_softmax_int(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
     // Усиленная проверка
-    if (argc < 2 || !args[0] || !args[0]->data || !args[1] || !args[1]->data) return nullptr;
+    if (argc < 2 || !args[0] || !args[0]->data || !args[1] || !args[1]->data){
+        ESP_LOGE("op_aten_softmax_int", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
     Tensor* dim_tensor = args[1];
     int dim = *(static_cast<int*>(dim_tensor->data));
@@ -470,7 +504,10 @@ Tensor* op_aten_softmax_int(NacRuntimeContext* ctx, const ParsedInstruction& ins
 
 template<typename Func>
 Tensor* elementwise_binary_op(NacRuntimeContext* ctx, Tensor** args, size_t argc, Func op) {
-    if (argc < 2 || !args[0] || !args[1]) return nullptr;
+    if (argc < 2 || !args[0] || !args[1]){
+        ESP_LOGE("elementwise_binary_op", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* a = args[0];
     Tensor* b = args[1];
     
@@ -508,7 +545,10 @@ Tensor* op_aten_div_Tensor(NacRuntimeContext* ctx, const ParsedInstruction& ins,
 }
 
 Tensor* op_aten_relu_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 1 || !args[0]) return nullptr;
+    if (argc < 1 || !args[0]){
+        ESP_LOGE("op_aten_relu_default", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
     Tensor* result = create_result_tensor(ctx, x->shape, x->dtype);
     if (!result) return nullptr;
@@ -521,7 +561,10 @@ Tensor* op_aten_relu_default(NacRuntimeContext* ctx, const ParsedInstruction& in
 }
 
 Tensor* op_aten_silu_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 1 || !args[0]) return nullptr;
+    if (argc < 1 || !args[0]){
+        ESP_LOGE("op_aten_silu_default", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
     Tensor* result = create_result_tensor(ctx, x->shape, x->dtype);
     if (!result) return nullptr;
@@ -535,7 +578,10 @@ Tensor* op_aten_silu_default(NacRuntimeContext* ctx, const ParsedInstruction& in
 }
 
 Tensor* op_aten_gelu_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 1 || !args[0]) return nullptr;
+    if (argc < 1 || !args[0]){
+        ESP_LOGE("op_aten_gelu_default", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
     Tensor* result = create_result_tensor(ctx, x->shape, x->dtype);
     if (!result) return nullptr;
@@ -551,14 +597,23 @@ Tensor* op_aten_gelu_default(NacRuntimeContext* ctx, const ParsedInstruction& in
 }
 
 Tensor* op_aten_rsqrt_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 1 || !args[0]) return nullptr;
+    if (argc < 1 || !args[0]){
+        ESP_LOGE("op_aten_rsqrt_default", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
     Tensor* result = create_result_tensor(ctx, x->shape, x->dtype);
     if (!result) return nullptr;
     float* x_data = static_cast<float*>(x->data);
     float* res_data = static_cast<float*>(result->data);
-    for(size_t i=0; i<x->num_elements; ++i) {
-        res_data[i] = 1.0f / sqrtf(x_data[i]);
+    // Guard against zero/negative inputs: 1/sqrt(x) = NaN for x<0, +inf for x=0.
+    // Both propagate as NaN through the computation graph.  Clamp to a small
+    // positive epsilon before rsqrt to produce a large-but-finite value instead.
+    // This is numerically equivalent for all valid (positive) inputs.
+    const float kEps = 1e-12f;
+    for (size_t i = 0; i < x->num_elements; ++i) {
+        float v = x_data[i] < kEps ? kEps : x_data[i];
+        res_data[i] = 1.0f / sqrtf(v);
     }
     return result;
 }
@@ -566,7 +621,10 @@ Tensor* op_aten_rsqrt_default(NacRuntimeContext* ctx, const ParsedInstruction& i
 // aten.transpose.int
 Tensor* op_aten_transpose_int(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
     // Усиленная проверка
-    if (argc < 3 || !args[0] || !args[0]->data || !args[1] || !args[1]->data || !args[2] || !args[2]->data) return nullptr;
+    if (argc < 3 || !args[0] || !args[0]->data || !args[1] || !args[1]->data || !args[2] || !args[2]->data){
+        ESP_LOGE("op_aten_transpose_int", "Invalid arguments.");
+        return nullptr;
+    }
 
     Tensor* x = args[0];
     int dim0 = *(int*)args[1]->data;
@@ -617,10 +675,12 @@ Tensor* op_aten_transpose_int(NacRuntimeContext* ctx, const ParsedInstruction& i
 // aten.unsqueeze.default
 Tensor* op_aten_unsqueeze_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
     // Усиленная проверка
-    if (argc < 2 || !args[0] || !args[0]->data || !args[1] || !args[1]->data) return nullptr;
+    if (argc < 2 || !args[0] || !args[0]->data || !args[1] || !args[1]->data){
+        ESP_LOGE("op_aten_unsqueeze_default", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
     int dim = *(int*)args[1]->data;
-    // ... остальной код функции без изменений ...
     int ndim = x->shape.size();
     if (dim < 0) dim += ndim + 1;
 
@@ -637,7 +697,10 @@ Tensor* op_aten_unsqueeze_default(NacRuntimeContext* ctx, const ParsedInstructio
 // aten.sym_size.int
 Tensor* op_aten_sym_size_int(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
     // Усиленная проверка
-    if (argc < 2 || !args[0] || !args[1] || !args[1]->data) return nullptr;
+    if (argc < 2 || !args[0] || !args[1] || !args[1]->data){
+        ESP_LOGE("op_aten_sym_size_int", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
     int dim = *(int*)args[1]->data;
     if (dim < 0) dim += x->shape.size();
@@ -669,7 +732,10 @@ Tensor* op_aten_sym_size_int(NacRuntimeContext* ctx, const ParsedInstruction& in
 // aten.ne.Scalar
 Tensor* op_aten_ne_Scalar(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
     // Усиленная проверка
-    if (argc < 2 || !args[0] || !args[0]->data || !args[1] || !args[1]->data) return nullptr;
+    if (argc < 2 || !args[0] || !args[0]->data || !args[1] || !args[1]->data){
+        ESP_LOGE("op_aten_ne_Scalar", "Invalid arguments.");
+        return nullptr;
+    }
 
     Tensor* x = args[0];
     float scalar = *(float*)args[1]->data;
@@ -688,7 +754,10 @@ Tensor* op_aten_ne_Scalar(NacRuntimeContext* ctx, const ParsedInstruction& ins, 
 
 // aten._to_copy.default
 Tensor* op_aten_to_copy_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 1 || !args[0]) return nullptr;
+    if (argc < 1 || !args[0]){
+        ESP_LOGE("op_aten_to_copy_default", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
 
     DataType target = x->dtype;
@@ -714,7 +783,10 @@ Tensor* op_aten_to_copy_default(NacRuntimeContext* ctx, const ParsedInstruction&
 
 // aten.cumsum.default (1D or last-dim)
 Tensor* op_aten_cumsum_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 2 || !args[0] || !args[1]) return nullptr;
+    if (argc < 2 || !args[0] || !args[1]){
+        ESP_LOGE("op_aten_cumsum_default", "Invalid arguments.");
+        return nullptr;
+    }
 
     Tensor* x = args[0];
     int dim = *(int*)args[1]->data;
@@ -748,7 +820,10 @@ Tensor* op_aten_cumsum_default(NacRuntimeContext* ctx, const ParsedInstruction& 
 
 // aten.type_as.default
 Tensor* op_aten_type_as_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 2 || !args[0] || !args[1]) return nullptr;
+    if (argc < 2 || !args[0] || !args[1]){
+        ESP_LOGE("op_aten_type_as_default", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
     Tensor* ref = args[1];
 
@@ -774,7 +849,11 @@ Tensor* op_aten_zeros_default(NacRuntimeContext* ctx, const ParsedInstruction& i
 
 // aten.slice.Tensor (basic)
 Tensor* op_aten_slice_Tensor(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 4 || !args[0]) return nullptr;
+    //if (argc < 4 || !args[0]) return nullptr;
+    if (argc < 4 || !args[0] || !args[1] || !args[1]->data || !args[2] || !args[2]->data || !args[3] || !args[3]->data){
+        ESP_LOGE("op_aten_slice_Tensor", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* x = args[0];
     int dim = *(int*)args[1]->data;
     int start = *(int*)args[2]->data;
@@ -811,7 +890,10 @@ Tensor* op_aten_slice_Tensor(NacRuntimeContext* ctx, const ParsedInstruction& in
 // aten.expand.default (broadcast-only)
 Tensor* op_aten_embedding_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
     // Усиленная проверка
-    if (argc < 2 || !args[0] || !args[0]->data || !args[1] || !args[1]->data) return nullptr;
+    if (argc < 2 || !args[0] || !args[0]->data || !args[1] || !args[1]->data){
+        ESP_LOGE("op_aten_embedding_default", "Invalid arguments.");
+        return nullptr;
+    }
     Tensor* weight = args[0];
     Tensor* indices = args[1];
     
@@ -849,7 +931,10 @@ Tensor* op_aten_scaled_dot_product_attention_default(
     Tensor** args,
     size_t argc
 ) {
-    if (argc < 3 || !args[0] || !args[1] || !args[2]) return nullptr;
+    if (argc < 3 || !args[0] || !args[1] || !args[2]){
+        ESP_LOGE("op_aten_scaled_dot_product_attention_default", "Invalid arguments.");
+        return nullptr;
+    }
 
     Tensor* Q = args[0];  // (..., T, D)
     Tensor* K = args[1];  // (..., T_k, D)
@@ -936,13 +1021,16 @@ Tensor* op_aten_scaled_dot_product_attention_default(
         }
     }
 
-    free(row_scores);
+    heap_caps_free(row_scores);  // Must match heap_caps_aligned_alloc used by alloc_fast
     return output;
 }
 
 // aten.conv2d.default
 Tensor* op_aten_conv2d_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
-    if (argc < 7 || !args[0] || !args[1] || !args[3] || !args[4] || !args[5] || !args[6]) return nullptr;
+    if (argc < 7 || !args[0] || !args[1] || !args[3] || !args[4] || !args[5] || !args[6]){
+        ESP_LOGE("op_aten_conv2d_default", "Invalid arguments.");
+        return nullptr;
+    }
 
     Tensor* input = args[0];    // (N, C_in, H_in, W_in)
     Tensor* weight = args[1];   // (C_out, C_in/groups, kH, kW)
@@ -1010,7 +1098,10 @@ Tensor* op_aten_conv2d_default(NacRuntimeContext* ctx, const ParsedInstruction& 
 Tensor* op_aten_native_batch_norm_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
     // Аргументы: input, weight, bias, running_mean, running_var, training, momentum, eps
     // В режиме inference (no_training) training, momentum не используются
-    if (argc < 8 || !args[0] || !args[3] || !args[4] || !args[7]) return nullptr;
+    if (argc < 8 || !args[0] || !args[3] || !args[4] || !args[7]){
+        ESP_LOGE("op_aten_native_batch_norm_default", "Invalid arguments.");
+        return nullptr;
+    }
 
     Tensor* input = args[0];        // (N, C, H, W)
     Tensor* weight = args[1];       // (gamma) (C) - может быть nullptr
@@ -1062,7 +1153,10 @@ Tensor* op_aten_native_batch_norm_default(NacRuntimeContext* ctx, const ParsedIn
 // aten.max_pool2d.default
 Tensor* op_aten_max_pool2d_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
     // Аргументы: input, kernel_size, stride, padding, dilation
-    if (argc < 5 || !args[0] || !args[1] || !args[2] || !args[3] || !args[4]) return nullptr;
+    if (argc < 5 || !args[0] || !args[1] || !args[2] || !args[3] || !args[4]){
+        ESP_LOGE("op_aten_max_pool2d_default", "Invalid arguments.");
+        return nullptr;
+    }
 
     Tensor* input = args[0];
     Param2D kernel_size(args[1]);
@@ -1117,7 +1211,10 @@ Tensor* op_aten_max_pool2d_default(NacRuntimeContext* ctx, const ParsedInstructi
 // aten.adaptive_avg_pool2d.default
 Tensor* op_aten_adaptive_avg_pool2d_default(NacRuntimeContext* ctx, const ParsedInstruction& ins, Tensor** args, size_t argc) {
     // Аргументы: input, output_size
-    if (argc < 2 || !args[0] || !args[1]) return nullptr;
+    if (argc < 2 || !args[0] || !args[1]){
+        ESP_LOGE("op_aten_adaptive_avg_pool2d_default", "Invalid arguments.");
+        return nullptr;
+    }
 
     Tensor* input = args[0];
     Param2D output_size(args[1]);
@@ -1213,5 +1310,4 @@ void register_kernels() {
     g_kernel_string_map["aten.adaptive_avg_pool2d.default"] = &op_aten_adaptive_avg_pool2d_default;
 
     Serial.printf("[KERNELS] Registered %d custom kernels by name for dynamic mapping.\n", g_kernel_string_map.size());
-
 }
