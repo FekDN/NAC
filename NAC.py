@@ -1,6 +1,11 @@
 # Copyright (c) 2025 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 ## torch==2.5.1
+## torchvision==0.20.1
 ## transformers==4.57.3
+## sympy==1.13.1
+## pip install torch==2.5.1 torchvision==0.20.1 transformers==4.57.3 sympy==1.13.1 --index-url https://download.pytorch.org/whl/cpu
+## pip install torch==2.5.1 torchvision==0.20.1 transformers==4.57.3 sympy==1.13.1 --index-url https://download.pytorch.org/whl/cu121
+## pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 transformers==4.57.3 sympy==1.13.1 --index-url https://download.pytorch.org/whl/cu121
 
 import os
 import json
@@ -51,7 +56,6 @@ class ResultManager:
         print(f"Output data will be saved to: {os.path.abspath(self.output_path)}")
 
     def save_registry(self, op_string_to_id: Dict[str, int], const_to_id: Dict[Any, int], perm_tuple_to_id: Dict[Tuple[str, ...], int]):
-        """Save FULL GLOBAL maps in registry.json."""
         try:
             sorted_op_items = sorted(op_string_to_id.items(), key=lambda item: item[1])
             canonical_map = {str(op_id): op_name for op_name, op_id in sorted_op_items}
@@ -79,7 +83,6 @@ class ResultManager:
 
     @staticmethod
     def _serialize_mep_constant(const_id: int, val) -> bytes:
-        """Serializes one MEP constant in NAC CNST-compatible binary format."""
         type_code, length, value_bytes = 0, 0, b''
         if val is None:
             type_code = 0
@@ -127,7 +130,7 @@ class ResultManager:
                 
                 offsets = {}
 
-                # 1. MMAP Section (Memory Map)
+                # 1. MMAP Section
                 offsets['mmap'] = f.tell()
                 f.write(b'MMAP')
                 memory_map = memory_map or []
@@ -162,7 +165,7 @@ class ResultManager:
                     if len(name_bytes) > 255: raise ValueError(f"Op name too long: {op_name}")
                     f.write(struct.pack('<HB', op_id, len(name_bytes))); f.write(name_bytes)
                 
-                # 4. CNST Section (Constants)
+                # 4. CNST Section
                 offsets['cnst'] = f.tell()
                 f.write(b'CNST')
                 constants = used_mappings['constants']
@@ -217,40 +220,34 @@ class ResultManager:
                         tensor, meta = (data_tuple, {}) if isinstance(data_tuple, torch.Tensor) else data_tuple
                         
                         meta_binary = b''
-                        # 1. Dtype and Rank
                         dtype_enum = self._map_dtype_to_enum(tensor.dtype)
                         shape = list(tensor.shape)
                         rank = len(shape)
                         meta_binary += struct.pack('<BB', dtype_enum, rank)
                         
-                        # 2. Dimensions (Shape)
                         if rank > 0:
                             meta_binary += struct.pack(f'<{rank}I', *shape)
                             
-                        # 3. Quantization Info
                         quant_type_str = meta.get('quant_type', 'none')
                         quant_type_map = {'none': 0, 'FP16': 1, 'INT8_TENSOR': 2, 'INT8_CHANNEL': 3, 'BLOCK_FP8': 4}
                         quant_type_code = quant_type_map.get(quant_type_str, 0)
                         meta_binary += struct.pack('<B', quant_type_code)
 
-                        if quant_type_code == 2: # INT8_TENSOR
+                        if quant_type_code == 2:
                             scale = meta['scale']
                             meta_binary += struct.pack('<f', scale)
-                        elif quant_type_code == 3: # INT8_CHANNEL
+                        elif quant_type_code == 3:
                             axis = meta['axis']
                             scales = meta['scales']
-                            if isinstance(scales, (float, int)):
-                                scales = [float(scales)]
+                            if isinstance(scales, (float, int)): scales = [float(scales)]
                             num_scales = len(scales)
                             meta_binary += struct.pack('<BI', axis, num_scales)
                             meta_binary += struct.pack(f'<{num_scales}f', *scales)
-                        elif quant_type_code == 4: # BLOCK_FP8
+                        elif quant_type_code == 4:
                             original_shape = meta['original_shape']
                             original_rank = len(original_shape)
                             scales = meta['scales']
-                            # Защита от scalar
-                            if isinstance(scales, (float, int)):
-                                scales = [float(scales)]
+                            if isinstance(scales, (float, int)): scales = [float(scales)]
                             num_scales = len(scales)
                             meta_binary += struct.pack('<HB', meta.get('block_size', 64), original_rank)
                             if original_rank > 0:
@@ -260,7 +257,7 @@ class ResultManager:
 
                         data_bytes = tensor.numpy(force=True).tobytes()
 
-                        f.write(struct.pack('<HIQ', p_id, len(meta_binary), len(data_bytes))) #'<HHQ', ...)  # uint16
+                        f.write(struct.pack('<HIQ', p_id, len(meta_binary), len(data_bytes)))
                         f.write(meta_binary)
                         f.write(data_bytes)
 
@@ -295,13 +292,8 @@ class ResultManager:
                         f.write(name_bytes)
                         f.write(struct.pack('<I', len(content)))
                         f.write(content)
-                    print(f"Saved {num_files} resource files internally.")
 
-                # 9. ORCH Section — MEP orchestration bytecode
-                # Stored at slot 7 (formerly 'meta', always unused).
-                # Format: b'ORCH' + uint32 bytecode_len + uint32 constants_count
-                #         + bytecode[bytecode_len]
-                #         + constants[]: (uint16 id, uint8 type, uint16 len, bytes data)
+                # 9. ORCH Section (MEP)
                 if mep_program is not None:
                     mep_bytecode, mep_constants = mep_program
                     offsets['orch'] = f.tell()
@@ -310,40 +302,26 @@ class ResultManager:
                     f.write(mep_bytecode)
                     for cid, cval in sorted(mep_constants.items()):
                         f.write(ResultManager._serialize_mep_constant(cid, cval))
-                    print(f"ORCH section written: {len(mep_bytecode)} bytes bytecode, "
-                          f"{len(mep_constants)} constants.")
                 else:
-                    # Always write an empty ORCH section to keep slot 7 non-zero
-                    # and signal to the runtime that MEP is not configured.
                     offsets['orch'] = f.tell()
                     f.write(b'ORCH')
-                    f.write(struct.pack('<II', 0, 0))  # empty bytecode + empty constants
+                    f.write(struct.pack('<II', 0, 0))
 
                 f.seek(10)
-
                 all_offsets = [
-                    offsets.get('mmap', 0),
-                    offsets.get('ops',  0),
-                    offsets.get('cmap', 0),
-                    offsets.get('cnst', 0),
-                    offsets.get('perm', 0),
-                    offsets.get('data', 0),
-                    offsets.get('proc', 0),
-                    offsets.get('orch', 0),  # slot 7: MEP orchestrator (formerly 'meta')
-                    offsets.get('rsrc', 0),
+                    offsets.get('mmap', 0), offsets.get('ops',  0), offsets.get('cmap', 0),
+                    offsets.get('cnst', 0), offsets.get('perm', 0), offsets.get('data', 0),
+                    offsets.get('proc', 0), offsets.get('orch', 0), offsets.get('rsrc', 0),
                 ]
                 f.write(struct.pack(offsets_header_format, d_model, *all_offsets))
 
             storage_method = "internally" if store_weights_internally else "externally"
-            print(f"NAC for '{model_name}' saved successfully (Format: Full Binary, Quant: {quant_method}, Weights: {storage_method}).")
+            print(f"NAC for '{model_name}' saved successfully (Quant: {quant_method}, Weights: {storage_method}).")
         except Exception as e:
             print(f"!!!!! ERROR saving NAC for {model_name}: {e}"); traceback.print_exc()
 
 class ModelProcessor:
     const_to_id: Dict[Any, int] = {}
-
-    # Format: "original.name.op"->"name": ("nac.name", (optional_argument_index_reorder))
-    # The permutation (1, 0) for op(a, b) means that the canonical call is op(b, a).
     CANONICAL_OP_MAP: Dict[str, Tuple[str, Optional[Tuple[int, ...]]]] = {
         "detach": ("nac.pass", None),
         "dropout": ("nac.pass", None),
@@ -352,17 +330,14 @@ class ModelProcessor:
         "true_divide": ("nac.div", None),
         "unsafe_view": ("nac.view", None),
         "squeeze": ("nac.view", None),
-        "rsub": ("nac.sub", (1, 0)),  # rsub(a, b) -> b - a -> sub(b, a)
+        "rsub": ("nac.sub", (1, 0)),
         "masked_fill": ("nac.where", (1, 2, 0)),
     }
     
-    # Mappings for semantic argument codes.
-    # From argument name to code
     NAME_TO_OFFSET_CODE: Dict[str, str] = {
         'query': 'Q', 'key': 'K', 'value': 'V',
         'attn_mask': 'M', 'mask': 'M',
         'bias': 'B', 'weight': 'W',
-        # Let's add common names to make it easier to catch them.
         'input': 'T', 'self': 'T', 'other': 'T', 'tensor': 'T',
     }
     NAME_TO_CONST_CODE: Dict[str, str] = {
@@ -371,18 +346,14 @@ class ModelProcessor:
     }
 
     def __init__(self, existing_registry: Optional[Dict] = None):
-        # Local sets for the CURRENT model. Start empty.
         self.canonical_operations: Set[str] = set()
         self.unique_constants: Set[Any] = set()
         self.unique_permutations: Set[Tuple[str, ...]] = set()
-        
-        # Other instance variables
         self.param_data_map: Dict[int, Any] = {}
         self.param_id_to_name: Dict[int, str] = {}
         self.input_node_idx_to_name: Dict[int, str] = {}
         self.precomputed_nodes: List[Dict] = []
         self.global_node_map: Dict[fx.Node, int] = {}
-        self.op_string_to_id: Dict[str, int] = {}
         self.perm_tuple_to_id: Dict[Tuple[str, ...], int] = {}
         self.param_to_id: Dict[str, int] = {}
         self.data_input_nodes: Set[fx.Node] = set()
@@ -392,108 +363,59 @@ class ModelProcessor:
         self.op_string_to_id = NAC_OPS_REVERSED.copy()
         self._initialize_special_ops()
 
-        # Initializing global maps (done once)
-        if not ModelProcessor.const_to_id:
-            ModelProcessor.const_to_id[None] = 1
-
-        # Loading the registry
-        if existing_registry:
-            self._load_from_registry(existing_registry)
+        if not ModelProcessor.const_to_id: ModelProcessor.const_to_id[None] = 1
+        if existing_registry: self._load_from_registry(existing_registry)
 
     def _initialize_special_ops(self):
         special_ops = {2:"<INPUT>", 3:"<OUTPUT>", 6:"<CONTROL_FLOW>", 7:"<CONVERGENCE>"}
         for id_val, name in special_ops.items():
-            # Сheck that special IDs do not conflict with standard ones.
-            if id_val >= 10 and id_val in NAC_OPS:
-                raise ValueError(f"Special OP ID {id_val} for '{name}' conflicts with standard NAC_OPS. Please re-assign.")
             self.op_string_to_id[name] = id_val
 
     def _load_from_registry(self, registry: Dict):
-        """
-        Loads data from the registry.
-        Fixed IDs cannot be overridden. 
-        Only user-defined operations are loaded.
-        """
-        loaded_custom_ops = 0
         if 'canonical' in registry:
             for id_str, op_name in registry['canonical'].items():
                 op_id = int(id_str)
-                # Load only custom operations, avoiding the standard range
-                if op_id >= CUSTOM_OP_ID_START:
-                    # Сheck for conflicts with those already loaded (including those from NAC_OPS)
-                    if op_name in self.op_string_to_id and self.op_string_to_id[op_name] != op_id:
-                         print(f"Warning: Registry tried to remap op '{op_name}' to {op_id}, but it's already {self.op_string_to_id[op_name]}. Keeping existing.")
-                         continue
-                    self.op_string_to_id[op_name] = op_id
-                    loaded_custom_ops += 1
+                if op_id >= CUSTOM_OP_ID_START: self.op_string_to_id[op_name] = op_id
         if 'constants' in registry:
             for id_str, const_val in registry['constants'].items():
-                hashable_const = self._get_hashable_const(const_val)
-                ModelProcessor.const_to_id[hashable_const] = int(id_str)
+                ModelProcessor.const_to_id[self._get_hashable_const(const_val)] = int(id_str)
         if 'permutations' in registry:
             for id_str, p_val_str in registry['permutations'].items():
                  self.perm_tuple_to_id[tuple(p_val_str)] = int(id_str)
-        print(f"Loaded {len(self.op_string_to_id)} total ops ({loaded_custom_ops} custom), {len(ModelProcessor.const_to_id)} consts, {len(self.perm_tuple_to_id)} perms from existing registry.")
 
     def _get_hashable_const(self, const: Any) -> Any:
         if isinstance(const, (fx.Node, torch.SymInt)): return None
         if isinstance(const, (torch.dtype, torch.device, torch.memory_format, torch.layout)):
-            # Convert to a string and remove the 'torch.' prefix.
-            s = str(const)
-            return s[6:] if s.startswith("torch.") else s
+            s = str(const); return s[6:] if s.startswith("torch.") else s
         if isinstance(const, torch.Tensor): return f"Tensor_{const.shape}_{const.dtype}"
         if isinstance(const, (list, tuple)): return tuple(self._get_hashable_const(item) for item in const)
         return const
 
     def _get_raw_signature(self, node: fx.Node) -> str:
-        """Gets the raw name of the operation before canonicalization."""
         if node.op != 'call_function': return ""
         target = node.target
         return str(target).replace('::', '.') if isinstance(target, torch._ops.OpOverload) else getattr(target, '__name__', str(target))
 
     def _get_canonical_signature(self, node: fx.Node) -> str:
-        """
-        Gets the canonical name of the nac.* operation.
-        1. Clears the original operation name (removes prefixes, suffixes).
-        2. Looks up the cleaned name in CANONICAL_OP_MAP (for aliases and permutations).
-        3. If not found, attempts to match it directly with an operation from NAC_OPS.
-        4. If nothing matches, returns the FULL ORIGINAL name for registration as a custom operation in CMAP.
-        """
         if node.op == 'placeholder': return "<INPUT>"
         if node.op == 'output': return "<OUTPUT>"
         if node.op != 'call_function': return "<NONE>"
 
         raw_sig = self._get_raw_signature(node)
         if not raw_sig: return "<NONE>"
-        
-        # Special case for skipping dynamic forms that are not operations
-        if "aten.sym_size" in raw_sig:
-            return raw_sig
+        if "aten.sym_size" in raw_sig: return raw_sig
 
-        # Step 1: Clear the operation name for searching
-        # Remove the prefix 'aten.'
         search_sig = raw_sig.replace("aten.", "")
-        # Removing standard suffixes
         search_sig = re.sub(r'\.(default|Tensor|Scalar|int|dim|dim_IntList|using_ints|start|self)$', '', search_sig)
-        # Remove underscores at the beginning/end (for _unsafe_view, add_, relu_, _softmax)
         search_sig = search_sig.strip('_')
 
-        # Step 2: Search CANONICAL_OP_MAP (for special cases)
-        if search_sig in self.CANONICAL_OP_MAP:
-            return self.CANONICAL_OP_MAP[search_sig][0]
-        
-        # Step 3: Direct mapping to NAC_OPS
+        if search_sig in self.CANONICAL_OP_MAP: return self.CANONICAL_OP_MAP[search_sig][0]
         potential_nac_name = f"nac.{search_sig}"
-        if potential_nac_name in NAC_OPS_REVERSED:
-            return potential_nac_name
-            
-        # Step 4: If the operation isn't found in the standard ones, return its
-        # FULL name so it's registered as a user operation in CMAP.
+        if potential_nac_name in NAC_OPS_REVERSED: return potential_nac_name
         return raw_sig
 
     def _get_argument_details(self, node: fx.Node) -> List[Tuple[str, Any, Optional[fx.Node]]]:
         details = []
-    
         def _extract_val(v):
             if isinstance(v, torch.SymInt): return v.node.meta.get("val", v)
             if isinstance(v, (list, tuple)): return type(v)(_extract_val(i) for i in v)
@@ -521,23 +443,16 @@ class ModelProcessor:
             try:
                 bound_args = node.target.schema().bind(*node.args, **node.kwargs)
                 bound_args.apply_defaults()
-            
                 for arg in bound_args.arguments:
                     if arg.arg.is_out: continue 
-                
                     name = arg.arg.name
                     val = _extract_val(arg.value)
-                
                     items_to_process = val if isinstance(val, (list, tuple)) and any(isinstance(x, fx.Node) for x in val) else [val]
-                
                     for item in items_to_process:
-                        if isinstance(item, fx.Node):
-                            details.append((_get_code_from_node(item, name), None, item))
-                        else:
-                            details.append((_get_const_code(item, name), item, None))
+                        if isinstance(item, fx.Node): details.append((_get_code_from_node(item, name), None, item))
+                        else: details.append((_get_const_code(item, name), item, None))
                 return details 
-            except Exception as e:
-                pass
+            except Exception: pass
 
         all_args = list(node.args) + list(node.kwargs.values())
         if node.op == 'output':
@@ -552,23 +467,17 @@ class ModelProcessor:
         return details
 
     def _get_canonical_argument_details(self, node: fx.Node) -> List[Tuple[str, Any, Optional[fx.Node]]]:
-        """Gets the argument details and applies a permutation to them, if defined.."""
         arg_details = self._get_argument_details(node) 
-
         raw_sig = self._get_raw_signature(node)
         if raw_sig:
             search_sig = raw_sig.replace("aten.", "")
             search_sig = re.sub(r'\.(default|Tensor|Scalar|int|dim|dim_IntList|using_ints|start|self)$', '', search_sig)
             search_sig = search_sig.strip('_')
-            
             if search_sig in self.CANONICAL_OP_MAP:
                 _, permutation = self.CANONICAL_OP_MAP[search_sig]
                 if permutation:
-                    try:
-                        return [arg_details[i] for i in permutation]
-                    except IndexError:
-                        print(f"Warning: Could not apply permutation {permutation} for op '{raw_sig}'. Arg count mismatch. Using original order.")
-        
+                    try: return [arg_details[i] for i in permutation]
+                    except IndexError: pass
         return arg_details
 
     def _process_graph(self, graph: fx.Graph) -> List[Dict]:
@@ -580,72 +489,55 @@ class ModelProcessor:
             B, C, D = 0, [], []
 
             if sig == "<INPUT>":
-                if node in self.data_input_nodes: B = 0; self.input_node_idx_to_name[i] = node.target
-                elif node in self.param_nodes: B = 1; C = [1, self.param_to_id.get(node.target, 0)]
-                elif node in self.lifted_const_nodes: B = 3; C = [1, ModelProcessor.const_to_id.get(self._get_hashable_const(self.lifted_const_nodes[node]), 0)]
+                if node in self.data_input_nodes: 
+                    B = 0
+                    self.input_node_idx_to_name[i] = node.name
+                elif node in self.param_nodes: 
+                    B = 1
+                    C = [1, self.param_to_id.get(node.name, 0)]
+                elif node in self.lifted_const_nodes: 
+                    B = 3
+                    const_hash = self._get_hashable_const(self.lifted_const_nodes[node])
+                    C = [1, ModelProcessor.const_to_id.get(const_hash, 0)]
             
             elif sig == "<OUTPUT>":
                 B = 0
                 arg_details = self._get_argument_details(node)
                 D = [self.global_node_map.get(arg_node) - i for _, _, arg_node in arg_details if arg_node]
                 num_outputs = len(D)
-                self.io_counts = (self.io_counts[0], num_outputs)
                 C = [num_outputs] + ([0] * num_outputs)
 
             elif node.op == 'call_function':
                 arg_details = self._get_canonical_argument_details(node)
                 parts = tuple(code for code, _, _ in arg_details)
-                
                 if parts:
                     B = self.perm_tuple_to_id.get(parts, 0)
-                    
-                    # 1. Collect IDs only for constants
                     consts = [self._get_hashable_const(val) for _, val, arg_node in arg_details if arg_node is None]
                     const_ids = [ModelProcessor.const_to_id.get(c, 0) for c in consts]
-                    if const_ids:
-                        C = [len(const_ids)] + const_ids
+                    if const_ids: C = [len(const_ids)] + const_ids
                     
-                    # 2. Collect the field D, which corresponds to the permutation.
-                    #    Insert an offset for a tensor or 0 for a constant.
                     D = []
                     for _, _, arg_node in arg_details:
-                        if arg_node is not None:
-                            D.append(self.global_node_map.get(arg_node, -1) - i)
-                        else:
-                            D.append(0)
+                        if arg_node is not None: D.append(self.global_node_map.get(arg_node, -1) - i)
+                        else: D.append(0)
 
             nodes.append({'A': A, 'B': B, 'C': C, 'D': D})
         return nodes
 
     def _quantize_to_block_fp8(self, tensor: torch.Tensor, block_size: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Квантует тензор в формат Block-FP8."""
-        # Убедимся, что тензор одномерный
         original_shape = tensor.shape
         tensor_flat = tensor.flatten().to(torch.float32)
-    
-        # 1. Дополняем тензор, если его размер не кратен block_size
         num_elements = tensor_flat.numel()
         rem = num_elements % block_size
         if rem != 0:
-            padding_needed = block_size - rem
-            padding = torch.zeros(padding_needed, dtype=tensor_flat.dtype, device=tensor.device)
+            padding = torch.zeros(block_size - rem, dtype=tensor_flat.dtype, device=tensor.device)
             tensor_flat = torch.cat([tensor_flat, padding])
-    
-        # 2. Решейпим в блоки
         num_blocks = tensor_flat.numel() // block_size
         blocked_tensor = tensor_flat.view(num_blocks, block_size)
-    
-        # 3. Находим scale для каждого блока (локально)
         max_abs_per_block = torch.max(torch.abs(blocked_tensor), dim=1, keepdim=True)[0]
         scales = max_abs_per_block / 127.0
-        # Предотвращаем деление на ноль, если блок нулевой
         scales[scales == 0] = 1.0 
-
-        # 4. Квантуем каждый блок с его собственным scale
         quantized_blocks = torch.round(blocked_tensor / scales).clamp(-128, 127).to(torch.int8)
-    
-        # 5. Возвращаем плоский квантованный тензор и scales
-        # Сжимаем scales до 1D
         return quantized_blocks.flatten(), scales.squeeze()
         
     def _quantize_parameters(self, method: str):
@@ -661,107 +553,113 @@ class ModelProcessor:
                 dims = tuple(range(1, v.dim())) if is_channel else None
                 scales = v.abs().amax(dim=dims, keepdim=True) / 127.0
                 scales[scales == 0] = 1e-9
-
-                if is_channel:
-                    # ГАРАНТИРУЕМ список даже при одном канале
-                    scales_list = scales.reshape(-1).tolist()
-                    meta = {
-                        'quant_type': 'INT8_CHANNEL',
-                        'scales': scales_list,
-                        'axis': 0
-                    }
-                else:
-                    meta = {
-                        'quant_type': 'INT8_TENSOR',
-                        'scale': float(scales.item())
-                    }
-                if is_channel: meta['axis'] = 0
+                meta = {'quant_type': 'INT8_CHANNEL', 'scales': scales.reshape(-1).tolist(), 'axis': 0} if is_channel else {'quant_type': 'INT8_TENSOR', 'scale': float(scales.item())}
                 quantized_map[k] = ((v / scales).round().clamp(-127, 127).to(torch.int8), meta)
             elif method == 'BLOCK_FP8':
                 q_flat, scales = self._quantize_to_block_fp8(v)
-                meta = {
-                    'quant_type': 'BLOCK_FP8',
-                    'block_size': 64,
-                    'original_shape': list(v.shape),
-                    'scales': scales.tolist()
-                }
+                meta = {'quant_type': 'BLOCK_FP8', 'block_size': 64, 'original_shape': list(v.shape), 'scales': scales.tolist()}
                 quantized_map[k] = (q_flat, meta)
         self.param_data_map = quantized_map
-        print("Quantization complete.")
 
-    def process_exported_program(self, exported_program: ExportedProgram, quantization_method: str = 'none'):
+    def process_exported_program(self, exported_program: ExportedProgram, quantization_method: str = 'none', original_model: torch.nn.Module = None):
         print(f"\n--- Processing model ---")
         main_graph, sig = exported_program.graph, exported_program.graph_signature
         
         all_placeholders = {n for n in main_graph.nodes if n.op == 'placeholder'}
-        self.data_input_nodes = {n for n in all_placeholders if n.target in sig.user_inputs}
+        state_dict = exported_program.state_dict
+        constants = exported_program.constants
+        
+        # 1. Собираем все НЕ-пользовательские входы (параметры и буферы)
+        full_param_map = {}
+        for mangled, clean in sig.inputs_to_parameters.items():
+            if clean in state_dict: full_param_map[mangled] = (clean, state_dict[clean])
+        for mangled, clean in sig.inputs_to_buffers.items():
+            if clean in state_dict: full_param_map[mangled] = (clean, state_dict[clean])
+            
+        if hasattr(sig, 'inputs_to_non_persistent_buffers'):
+            for mangled, clean in sig.inputs_to_non_persistent_buffers.items():
+                if clean in state_dict: full_param_map[mangled] = (clean, state_dict[clean])
+                elif clean in constants: full_param_map[mangled] = (clean, constants[clean])
+                elif original_model is not None:
+                    try: full_param_map[mangled] = (clean, original_model.get_buffer(clean))
+                    except Exception: pass
+                    
+        if hasattr(sig, 'inputs_to_tensor_constants'):
+            for mangled, clean in sig.inputs_to_tensor_constants.items():
+                if clean in constants: full_param_map[mangled] = (clean, constants[clean])
+                elif clean in state_dict: full_param_map[mangled] = (clean, state_dict[clean])
+        
+        # 2. Идентифицируем НАСТОЯЩИЕ пользовательские входы
+        true_user_inputs = set(sig.user_inputs)
+        # Удаляем всё, что замаплено как параметры
+        for mangled in full_param_map.keys():
+            true_user_inputs.discard(mangled)
+        # Защита от багов PyTorch: удаляем всё, что начинается с 'lifted_'
+        true_user_inputs = {name for name in true_user_inputs if not name.startswith("lifted_")}
+        
+        self.data_input_nodes = {n for n in all_placeholders if n.name in true_user_inputs}
         self.io_counts = (len(self.data_input_nodes), self.io_counts[1])
         
         current_param_id = 1
-        state_dict, mangled_map = exported_program.state_dict, {**sig.inputs_to_parameters, **sig.inputs_to_buffers}
-        target_to_node = {p.target: p for p in all_placeholders}
-        for mangled, clean in mangled_map.items():
-            if mangled in target_to_node and clean in state_dict:
-                node = target_to_node[mangled]
-                self.param_to_id[mangled] = current_param_id; self.param_id_to_name[current_param_id] = clean
-                self.param_data_map[current_param_id] = state_dict[clean].detach()
-                self.param_nodes.add(node); current_param_id += 1
-        
+        node_name_to_node = {p.name: p for p in all_placeholders}
+        for mangled, (clean, tensor) in full_param_map.items():
+            if mangled in node_name_to_node:
+                node = node_name_to_node[mangled]
+                self.param_to_id[node.name] = current_param_id
+                self.param_id_to_name[current_param_id] = clean
+                self.param_data_map[current_param_id] = tensor.detach()
+                self.param_nodes.add(node)
+                current_param_id += 1
+                
+        # 3. Всё остальное — это lifted константы (B=3)
         lifted_placeholders = all_placeholders - self.data_input_nodes - self.param_nodes
         if lifted_placeholders:
-            print(f"Found {len(lifted_placeholders)} lifted constant placeholder(s).")
-            for node in sorted(list(lifted_placeholders), key=lambda n: n.target):
-                 for clean_name, const_tensor in exported_program.constants.items():
-                    if node.target.startswith(clean_name):
-                         self.lifted_const_nodes[node] = const_tensor
-                         self.unique_constants.add(self._get_hashable_const(const_tensor))
-                         break
+            for node in sorted(list(lifted_placeholders), key=lambda n: n.name):
+                found = False
+                for clean_name, const_tensor in constants.items():
+                    if node.name.startswith(clean_name):
+                        self.lifted_const_nodes[node] = const_tensor
+                        self.unique_constants.add(self._get_hashable_const(const_tensor))
+                        found = True; break
+                if not found and original_model is not None:
+                    orig_sd = original_model.state_dict()
+                    for k, v in orig_sd.items():
+                        if k.replace('.', '_') in node.name or node.name in k.replace('.', '_'):
+                            self.lifted_const_nodes[node] = v
+                            self.unique_constants.add(self._get_hashable_const(v))
+                            found = True; break
+                if not found:
+                    # Failsafe
+                    dummy = torch.tensor(0, dtype=torch.int32)
+                    self.lifted_const_nodes[node] = dummy
+                    self.unique_constants.add(self._get_hashable_const(dummy))
 
-        print(f"Found {len(self.data_input_nodes)} data inputs, {len(self.param_nodes)} params, {len(self.lifted_const_nodes)} lifted consts.")
+        print(f"Captured: {len(self.data_input_nodes)} Data Inputs, {len(self.param_nodes)} Parameters/Buffers, {len(self.lifted_const_nodes)} Lifted Constants.")
         self._quantize_parameters(quantization_method)
         
         for i, node in enumerate(main_graph.nodes): self.global_node_map[node] = i
         
-        # Collection of all unique canonical operations, constants, and permutations
         for node in main_graph.nodes:
-            sig = self._get_canonical_signature(node)
-            if sig != "<NONE>":
-                self.canonical_operations.add(sig)
-            
+            sig_name = self._get_canonical_signature(node)
+            if sig_name != "<NONE>": self.canonical_operations.add(sig_name)
             if node.op in ['call_function', 'output']:
                 arg_details = self._get_canonical_argument_details(node)
                 parts = tuple(code for code, _, _ in arg_details)
-                if parts:
-                    self.unique_permutations.add(parts)
-                
-                consts = [self._get_hashable_const(val) for _, val, arg_node in arg_details if arg_node is None]
-                for const in consts:
+                if parts: self.unique_permutations.add(parts)
+                for const in [self._get_hashable_const(val) for _, val, arg_node in arg_details if arg_node is None]:
                     self.unique_constants.add(const)
 
         new_ops = sorted(list(self.canonical_operations - set(self.op_string_to_id.keys())))
         if new_ops:
-            print(f"Found {len(new_ops)} new custom operations: {new_ops}")
-            # Find the maximum ID among all existing operations (standard and custom)
-            max_current_id = 0
-            if self.op_string_to_id:
-                max_current_id = max(v for v in self.op_string_to_id.values() if v < 256) # Ignore possible future ranges
-
-            # Start with CUSTOM_OP_ID_START or with the next one after the maximum, if it is greater
+            max_current_id = max([v for v in self.op_string_to_id.values() if v < 256] + [0])
             next_custom_id = max(CUSTOM_OP_ID_START, max_current_id + 1)
-            
             for op in new_ops:
-                # In NAC format 'A' is 1 byte (0-255), so check the upper limit
-                if next_custom_id > 255:
-                    raise ValueError(f"Ran out of available operation IDs (0-255). Cannot register new op: {op}")
-                self.op_string_to_id[op] = next_custom_id
-                next_custom_id += 1
+                self.op_string_to_id[op] = next_custom_id; next_custom_id += 1
         
-        # Assigning IDs to new constants
         next_id = max([0] + list(ModelProcessor.const_to_id.values())) + 1
         for const in sorted([c for c in self.unique_constants if c not in ModelProcessor.const_to_id], key=lambda x: str(x)):
             ModelProcessor.const_to_id[const] = next_id; next_id += 1
         
-        # Assigning IDs to new permutations
         next_id = max([0] + list(self.perm_tuple_to_id.values())) + 1
         for perm in sorted([p for p in self.unique_permutations if p not in self.perm_tuple_to_id]):
             self.perm_tuple_to_id[perm] = next_id; next_id += 1
@@ -770,13 +668,9 @@ class ModelProcessor:
         print(f"Model processing complete. Generated {len(self.precomputed_nodes)} operations.")
 
     def get_used_mappings(self) -> Dict:
-        """
-        Assembles ID->value maps for a .nac file using LOCAL data found ONLY in this model.
-        """
         used_op_ids = {self.op_string_to_id[op] for op in self.canonical_operations}
         used_const_ids = {ModelProcessor.const_to_id[c] for c in self.unique_constants}
         used_perm_ids = {self.perm_tuple_to_id[p] for p in self.unique_permutations}
-
         id_to_op = {v: k for k, v in self.op_string_to_id.items()}
         id_to_const = {v: k for k, v in ModelProcessor.const_to_id.items()}
         id_to_perm = {v: k for k, v in self.perm_tuple_to_id.items()}
@@ -788,43 +682,18 @@ class ModelProcessor:
         }
 
 def _get_d_model(model: torch.nn.Module) -> int:
-    """
-    Tries to automatically infer the model's hidden dimension (d_model).
-    1. Checks for a `config` attribute and common key names.
-    2. If that fails, inspects the last linear layer of the model.
-    Returns 0 if it cannot be determined.
-    """
-    # Method 1: Search in the configuration (for Hugging Face models)
     if hasattr(model, 'config'):
-        config = model.config
-        possible_keys = ['hidden_size', 'd_model', 'n_embd', 'hidden_dim']
-        for key in possible_keys:
-            if hasattr(config, key):
-                d_model = getattr(config, key)
-                if isinstance(d_model, int):
-                    print(f"Auto-detected d_model='{d_model}' from config.{key}")
-                    return d_model
-
-    # Method 2: Inspecting the last line layer (for torchvision and others)
-    last_linear_layer = None
+        for key in ['hidden_size', 'd_model', 'n_embd', 'hidden_dim']:
+            if hasattr(model.config, key):
+                return getattr(model.config, key)
     for m in reversed(list(model.modules())):
-        if isinstance(m, torch.nn.Linear):
-            last_linear_layer = m
-            break
-            
-    if last_linear_layer is not None:
-        d_model = last_linear_layer.in_features
-        print(f"Auto-detected d_model='{d_model}' from last linear layer's in_features.")
-        return d_model
-
-    print("Warning: Could not automatically determine d_model. Defaulting to 0.")
+        if isinstance(m, torch.nn.Linear): return m.in_features
     return 0
 
 def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tuple, d_model: Optional[int] = None, quantization_method: str = 'none', dynamic_shapes=None, store_weights_internally=True, io_counts=(0,0), tokenizer_repo=None, optimize = True, tokenizer_input: str = 'none', optimize_memory_locality: bool = True, compile_tokenizer_resources: bool = True, mep_program=None):
     print("\n" + "="*20 + f" GENERATION ({model_name}) " + "="*20)
     result_manager = ResultManager()
-
-    tokenizer_resources = {} # Final resources for RSRC entry
+    tokenizer_resources = {} 
     
     if tokenizer_repo:
         print(f"Retrieving tokenizer resources from '{tokenizer_repo}'...")
@@ -832,26 +701,17 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
             from transformers import AutoTokenizer
             import io
             hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo)
-
             if compile_tokenizer_resources:
-                print("  - Mode: Compiling tokenizer resources into optimized binary format.")
-                # Compilation to .b and .vidx.b
-                print("    - Compiling vocab into vocab.b (for encoding) and vidx.b (for decoding)...")
                 vocab_dict = hf_tokenizer.get_vocab()
-                
-                # 1. Preparing vocab.b (sort by token)
                 vocab_sorted_by_token = sorted(vocab_dict.items(), key=lambda item: item[0])
-                
                 num_entries = len(vocab_sorted_by_token)
                 data_buffer = io.BytesIO()
                 token_offsets = []
                 id_to_offset_map = {}
-
                 for token_str, token_id in vocab_sorted_by_token:
                     current_offset = data_buffer.tell()
                     token_offsets.append(current_offset) 
                     id_to_offset_map[token_id] = current_offset
-                    
                     token_bytes = token_str.encode('utf-8')
                     data_buffer.write(struct.pack('<H', len(token_bytes)))
                     data_buffer.write(token_bytes)
@@ -861,26 +721,18 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
                 final_vocab_b.extend(struct.pack('<I', num_entries))
                 final_vocab_b.extend(struct.pack(f'<{num_entries}I', *token_offsets))
                 final_vocab_b.extend(data_buffer.getvalue())
-                
                 tokenizer_resources['vocab.b'] = bytes(final_vocab_b)
-                print(f"      - 'vocab.b' created successfully ({len(tokenizer_resources['vocab.b'])} bytes).")
 
-                # 2. Preparing vidx.b (sorted by ID)
                 if id_to_offset_map:
                     max_id = max(id_to_offset_map.keys())
                     id_sorted_offsets = [id_to_offset_map.get(i, 0) for i in range(max_id + 1)]
-                    
                     vidx_b_content = bytearray()
                     vidx_b_content.extend(struct.pack('<I', len(id_sorted_offsets)))
                     vidx_b_content.extend(struct.pack(f'<{len(id_sorted_offsets)}I', *id_sorted_offsets))
-                    
                     tokenizer_resources['vidx.b'] = bytes(vidx_b_content)
-                    print(f"      - 'vidx.b' for fast decoding created successfully ({len(tokenizer_resources['vidx.b'])} bytes).")
 
-                # 3. Compile merges.txt -> merges.b
                 try:
                     merges_path = hf_hub_download(repo_id=tokenizer_repo, filename="merges.txt")
-                    print("    - Compiling merges.txt into merges.b...")
                     with open(merges_path, 'r', encoding='utf-8') as f: lines = f.readlines()
                     if lines and lines[0].startswith("#"): lines = lines[1:]
                     merges_b_content = bytearray()
@@ -892,45 +744,26 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
                         merges_b_content.extend(struct.pack('<H', len(p1_bytes))); merges_b_content.extend(p1_bytes)
                         merges_b_content.extend(struct.pack('<H', len(p2_bytes))); merges_b_content.extend(p2_bytes)
                     tokenizer_resources['merges.b'] = bytes(merges_b_content)
-                    print(f"      - 'merges.b' created successfully ({len(tokenizer_resources['merges.b'])} bytes).")
-                except Exception:
-                     print("    - 'merges.txt' not found for this tokenizer. Skipping 'merges.b' compilation.")
-            
+                except Exception: pass
             else:
-                print("  - Mode: Packing original tokenizer files (JSON, txt)...")
-                # Just download and pack
-                files_to_pack = [
-                    "tokenizer.json", "vocab.json", "merges.txt",
-                    "spiece.model", "special_tokens_map.json", "tokenizer_config.json"
-                ]
-                for filename in files_to_pack:
+                for filename in ["tokenizer.json", "vocab.json", "merges.txt", "spiece.model", "special_tokens_map.json", "tokenizer_config.json"]:
                     try:
                         downloaded_path = hf_hub_download(repo_id=tokenizer_repo, filename=filename)
-                        with open(downloaded_path, 'rb') as f:
-                            tokenizer_resources[filename] = f.read()
-                        print(f"    - Packed '{filename}' successfully.")
-                    except Exception:
-                        pass # File not found, this is normal
-
-                # Важный фолбэк для старого режима
+                        with open(downloaded_path, 'rb') as f: tokenizer_resources[filename] = f.read()
+                    except Exception: pass
                 if "vocab.json" not in tokenizer_resources:
-                    print("    - 'vocab.json' not found. Generating from tokenizer object as a fallback.")
                     vocab = hf_tokenizer.get_vocab()
                     sorted_vocab = {k: v for k, v in sorted(vocab.items(), key=lambda item: item[1])}
                     tokenizer_resources['vocab.json'] = json.dumps(sorted_vocab, ensure_ascii=False).encode('utf-8')
 
-            # GENERAL PART for both modes
-            print(f"  - Tokenizer resource processing finished. Total files to pack: {len(tokenizer_resources)}.")
             if not store_weights_internally:
                 tokenizer_dir = os.path.join(result_manager.output_path, f"{model_name}-tokenizer")
                 os.makedirs(tokenizer_dir, exist_ok=True)
                 for filename, content in tokenizer_resources.items():
                     with open(os.path.join(tokenizer_dir, filename), 'wb') as f: f.write(content)
-                print(f"Tokenizer resources are stored externally in {tokenizer_dir}")
                 tokenizer_resources = {}
 
-        except Exception as e:
-            print(f"!!!!! WARNING: Failed to process tokenizer for '{tokenizer_repo}'. Error: {e}"); traceback.print_exc()
+        except Exception as e: print(f"!!!!! WARNING: Failed to process tokenizer. Error: {e}")
 
     print("Exporting a model to FX graphics...")
     exported_program = torch.export.export(model.eval(), args=dummy_args, dynamic_shapes=dynamic_shapes)
@@ -938,7 +771,6 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
     if optimize:
         optimizer_file = 'NAC_optimizer.py'
         if os.path.exists(optimizer_file):
-            print(f"\n--- Run graph optimization (from {optimizer_file}) ---")
             try:
                 import importlib.util, sys
                 spec = importlib.util.spec_from_file_location("NAC_optimizer", optimizer_file)
@@ -949,36 +781,28 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
                 folder = GraphConstantFolder(exported_program, canonical_op_map=ModelProcessor.CANONICAL_OP_MAP)
                 folder.fold(optimize_memory_locality=optimize_memory_locality)
                 generated_memory_map = getattr(folder, 'generated_memory_map', None)
-            except Exception as e:
-                print(f"!!!!! ERROR while executing graph optimization: {e}\nContinuing without optimization...")
-        else:
-            print(f"--- INFO: Optimizer file '{optimizer_file}' not found. Skipping optimization. ---")
-
+            except Exception as e: print(f"!!!!! ERROR while executing graph optimization: {e}")
+            
     registry_filepath = os.path.join(result_manager.output_path, 'registry.json')
     existing_registry_data = None
     if os.path.exists(registry_filepath) and os.path.getsize(registry_filepath) > 0:
         try:
             with open(registry_filepath, 'r', encoding='utf-8') as f: existing_registry_data = json.load(f)
-            print(f"Successfully loaded existing registry from {registry_filepath}")
-        except Exception as e: print(f"Failed to read existing registry: {e}")
+        except Exception: pass
 
     tokenizer_manifest_bytes = None
     if tokenizer_repo:
-        print(f"\n--- Compiling the tokenizer from '{tokenizer_repo}' ---")
         try:
             if 'hf_tokenizer' not in locals(): hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo)
             probe_text = tokenizer_input if tokenizer_input != 'none' else "This is a probe text."
             tokenizer_manifest_bytes = TISACompiler.compile_and_calibrate(hf_tokenizer, probe_text)
-            print(f"The tokenizer was successfully compiled into a {len(tokenizer_manifest_bytes)}-byte TISA manifest.")
-        except Exception as e:
-            print(f"!!!!! WARNING: Failed to compile tokenizer for '{tokenizer_repo}'. Error: {e}"); traceback.print_exc()
+        except Exception: pass
 
     processor = ModelProcessor(existing_registry=existing_registry_data)
-    processor.process_exported_program(exported_program=exported_program, quantization_method=quantization_method)
+    processor.process_exported_program(exported_program=exported_program, quantization_method=quantization_method, original_model=model)
     used_mappings = processor.get_used_mappings()
     result_manager.save_registry(processor.op_string_to_id, ModelProcessor.const_to_id, processor.perm_tuple_to_id)
     final_d_model = d_model if isinstance(d_model, int) else _get_d_model(model)
-    if isinstance(d_model, int): print(f"Uses manually specified d_model: {final_d_model}")
     
     result_manager.save_model_nac(
         model_name,
