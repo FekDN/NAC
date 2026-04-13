@@ -147,7 +147,7 @@ class Reconstructor:
                 
                 if self.weights_stored_internally:
                     num_tensors = struct.unpack('<I', f.read(4))[0]
-                    quant_code_to_str = {0: 'none', 1: 'INT8_TENSOR', 2: 'INT8_CHANNEL'}
+                    quant_code_to_str = {0: 'none', 1: 'FP16', 2: 'INT8_TENSOR', 3: 'INT8_CHANNEL', 4: 'BLOCK_FP8'}
                     for _ in range(num_tensors):
                         p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14))
                         meta_bytes = f.read(meta_len)
@@ -165,11 +165,25 @@ class Reconstructor:
                         if quant_type_str != 'none': metadata['quant_type'] = quant_type_str
 
                         if quant_type_str == 'INT8_TENSOR':
-                            metadata['scale'], = struct.unpack_from('<f', meta_bytes, meta_offset); meta_offset += 4
+                            metadata['scale'], = struct.unpack_from('<f', meta_bytes, meta_offset)
+                            meta_offset += 4
                         elif quant_type_str == 'INT8_CHANNEL':
-                            axis, num_scales = struct.unpack_from('<BI', meta_bytes, meta_offset); meta_offset += 5
+                            axis, num_scales = struct.unpack_from('<BI', meta_bytes, meta_offset)
+                            meta_offset += 5
                             metadata['axis'] = axis
                             metadata['scales'] = list(struct.unpack_from(f'<{num_scales}f', meta_bytes, meta_offset))
+                            meta_offset += num_scales * 4
+                        elif quant_type_str == 'BLOCK_FP8':
+                            block_size, orig_rank = struct.unpack_from('<HB', meta_bytes, meta_offset)
+                            meta_offset += 3
+                            metadata['block_size'] = block_size
+                            if orig_rank > 0:
+                                metadata['original_shape'] = list(struct.unpack_from(f'<{orig_rank}I', meta_bytes, meta_offset))
+                                meta_offset += orig_rank * 4
+                            num_scales, = struct.unpack_from('<I', meta_bytes, meta_offset)
+                            meta_offset += 4
+                            metadata['scales'] = list(struct.unpack_from(f'<{num_scales}f', meta_bytes, meta_offset))
+                            meta_offset += num_scales * 4
                         
                         dummy_tensor = torch.empty(0)
                         self.loaded_param_data[p_id] = (dummy_tensor, metadata)
