@@ -1,3 +1,5 @@
+# --- START OF FILE NAC_kernels.py ---
+
 # Copyright (c) 2025 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import numpy as np
@@ -14,7 +16,19 @@ NAC_OPS = {
     16: "nac.clone",
     17: "nac.view",
     18: "nac.le",
-    19: "nac.arange"
+    19: "nac.arange",
+    20: "nac.mul",
+    21: "nac.div",
+    22: "nac.matmul",
+    23: "nac.transpose",
+    24: "nac.zeros",
+    25: "nac.zeros_like",
+    26: "nac.new_zeros",
+    27: "nac.ones",
+    28: "nac.ones_like",
+    29: "nac.new_ones",
+    30: "nac.full",
+    31: "nac.full_like",
 }
 
 NAC_OPS_REVERSED = {v: k for k, v in NAC_OPS.items()}
@@ -100,18 +114,13 @@ class NacKernelBase:
         return out
 
     def op_getitem(self, t, i):
-        return t[i]
+        return t[int(i)]
 
     def op_aten_sym_size_int(self, tensor, dim):
-        return tensor.shape[dim]
+        return tensor.shape[int(dim)]
 
     def op_aten_relu_default(self, x):
         return np.maximum(x, 0)
-
-    def op_aten_ones_default(self, sz, *a, **kw):
-        dtype_enum = kw.get('dtype', a[0] if a else None)
-        np_dtype = self._enum_to_numpy_dtype(dtype_enum) if dtype_enum is not None else np.float32
-        return np.ones(sz, dtype=np_dtype)
 
     def op_aten_exp_default(self, x):
         return np.exp(x)
@@ -124,10 +133,6 @@ class NacKernelBase:
 
     def op_aten_eq_Scalar(self, a, b):
         return np.equal(a, b)
-
-    def op_aten_ones_like_default(self, x, *args, **kwargs):
-        # np.ones_like - this is a direct analogue
-        return np.ones_like(x)
 
     def op_aten_cat_default(self, *args, **kwargs):
         # Version contains a patch for the torch.export bug.
@@ -319,6 +324,8 @@ class NacKernelBase:
         return out
 
     def op_aten_split_Tensor(self, x, split_size, dim):
+        dim = int(dim)
+        split_size = int(split_size)
         if x.shape[dim] == 0:
             return [x]
         return np.split(x, np.arange(split_size, x.shape[dim], split_size), axis=dim)
@@ -361,15 +368,6 @@ class NacKernelBase:
             # If both are not empty and the error still exists, then the forms are indeed incompatible.
             raise ValueError(f"aten::mul.Tensor shapes {a.shape} and {b.shape} are not broadcast-compatible")
 
-    def op_aten_zeros_default(self, sz, *a, **kw):
-        dtype_enum = kw.get('dtype', a[0] if a else None)
-        np_dtype = self._enum_to_numpy_dtype(dtype_enum) if dtype_enum is not None else np.float32
-        return np.zeros(sz, dtype=np_dtype)
-
-    def op_aten_zeros_like_default(self, x, *args, **kwargs):
-        # np.zeros_like - this is a direct analogue
-        return np.zeros_like(x)
-
     def op_aten_expand_default(self, *args, _perm=None):
         """
         The function implementation can take the target shape
@@ -389,6 +387,10 @@ class NacKernelBase:
         else:
             # Otherwise, the form was passed as separate arguments.
             target_shape = list(shape_args)
+            
+        # ПРИВОДИМ ВСЕ РАЗМЕРНОСТИ К ЦЕЛЫМ ЧИСЛАМ
+        target_shape = [int(dim) for dim in target_shape]
+        
         # The rank of the target shape must be >= the rank of the input tensor
         if len(target_shape) < x.ndim:
             raise ValueError(
@@ -444,10 +446,6 @@ class NacKernelBase:
         epsilon = np.finfo(np.float32).eps
         return np.log(np.maximum(tensor, epsilon))
 
-    def op_aten_full_like_default(self, x, fill_value, *args, **kwargs):
-        # np.full - this is an ideal analogue.
-        return np.full(x.shape, fill_value, dtype=x.dtype)
-
     def op_aten_rsqrt_default(self, tensor):
         # For numerical stability, we convert to float32
         x = np.asarray(tensor, dtype=np.float32)
@@ -479,15 +477,9 @@ class NacKernelBase:
         x = np.asarray(x)
         return np.triu(x, k=diagonal)
 
-    def op_aten_transpose_int(self, tensor, dim0, dim1):
-        dim0 = int(dim0)
-        dim1 = int(dim1)
-        axes = list(range(tensor.ndim))
-        axes[dim0], axes[dim1] = axes[dim1], axes[dim0]
-        return np.transpose(tensor, axes=axes)
-
     def op_aten_unsqueeze_default(self, x, dim):
-        dim = dim if dim >= 0 else x.ndim + dim + 1  # support for negative dim
+        dim = int(dim) # Обязательно приводим к int
+        dim = dim if dim >= 0 else x.ndim + dim + 1  # поддержка отрицательных dim
         return np.expand_dims(x, dim)
 
     def op_aten_softmax_int(self, tensor, dim):
@@ -524,6 +516,11 @@ class NacKernelBase:
 
     def op_aten_slice_Tensor(self, x, dim, start=None, end=None, step=1, _perm=None):
         x = np.asarray(x)
+        dim = int(dim)
+        if start is not None: start = int(start)
+        if end is not None: end = int(end)
+        step = int(step)
+        
         if dim < 0:
             dim += x.ndim
         if dim < 0 or dim >= x.ndim:
@@ -549,15 +546,14 @@ class NacKernelBase:
         Implements aten.slice_scatter.default.
         Equivalent to x[:, start:end, :] = src
         """
-        # Create a copy so as not to change the original array,
-        # which can be used in other parts of the graph.
-        out = np.copy(x)
+        dim = int(dim)
+        if start is not None: start = int(start)
+        if end is not None: end = int(end)
+        step = int(step)
         
-        # Create a cut for the required measurement
+        out = np.copy(x)
         slicer = [slice(None)] * x.ndim
         slicer[dim] = slice(start, end, step)
-        
-        # Perform the assignment
         out[tuple(slicer)] = src
         return out
 
@@ -567,14 +563,11 @@ class NacKernelBase:
         """
         return np.copy(src)
 
-    def op_aten_full_default(self, sz, val, *a, **kw):
-        return np.full(sz, val)
-
     def op_aten_ne_Scalar(self, x, val):
         return x != val
 
     def op_aten_cumsum_default(self, x, dim, *a, **kw):
-        return np.cumsum(x, axis=dim)
+        return np.cumsum(x, axis=int(dim))
 
     def op_aten_type_as_default(self, x, other):
         return x.astype(other.dtype) if x.dtype != other.dtype else x
@@ -850,6 +843,98 @@ class NacKernelBase:
 
         return np.matmul(a, b)
 
+    def op_aten_ge_Scalar(self, a, b):
+        return np.greater_equal(a, b)
+
+    def op_aten___and___Tensor(self, a, b):
+        # Побитовое И. Поддерживает broadcast
+        a = np.asarray(a)
+        b = np.asarray(b)
+        return np.bitwise_and(a, b)
+
+    def op_aten___or___Tensor(self, a, b):
+        a = np.asarray(a)
+        b = np.asarray(b)
+        return np.bitwise_or(a, b)
+        
+    def op_aten___not___Tensor(self, a):
+        a = np.asarray(a)
+        return np.bitwise_not(a)
+
+    def op_aten_where_ScalarOther(self, condition, x, y):
+        """
+        Упрощенная версия where, где один из аргументов (y) — это скаляр (например, -inf)
+        """
+        condition = np.asarray(condition, dtype=bool)
+        x = np.asarray(x)
+        # Если y это объект float, numpy его легко broadcast-ит
+        return np.where(condition, x, y)
+        
+    def op_aten_index_Tensor(self, tensor, *indices):
+        """
+        Эмулирует aten.index.Tensor (Advanced indexing в PyTorch).
+        Часто используется для извлечения/применения масок.
+        В PyTorch indices - это список тензоров.
+        """
+        tensor = np.asarray(tensor)
+        # PyTorch передает indices как список/tuple массивов. Numpy требует tuple.
+        if len(indices) == 1 and isinstance(indices[0], (list, tuple)):
+            # Извлекаем список тензоров-индексов
+            idx_tuple = tuple(np.asarray(i) if i is not None else slice(None) for i in indices[0])
+            return tensor[idx_tuple]
+        else:
+            # Обычный вызов
+            idx_tuple = tuple(np.asarray(i) if i is not None else slice(None) for i in indices)
+            return tensor[idx_tuple]
+
+    def _parse_shape(self, sz):
+        """Обобщенный парсинг размерности (sz) из разных форматов PyTorch."""
+        if isinstance(sz, list) and len(sz) == 0: return ()
+        if isinstance(sz, int): return (sz,)
+        if isinstance(sz, np.ndarray): return tuple(sz.tolist())
+        return tuple(sz)
+
+    def _get_dtype(self, explicit_dtype_enum, base_dtype=np.float32):
+        """Обобщенный поиск нужного типа данных."""
+        if explicit_dtype_enum is not None:
+            return self._enum_to_numpy_dtype(explicit_dtype_enum)
+        return base_dtype
+
+    # === ZEROS ===
+    def op_nac_zeros(self, sz, *args, **kwargs):
+        dtype = self._get_dtype(kwargs.get('dtype', args[0] if args else None))
+        return np.zeros(self._parse_shape(sz), dtype=dtype)
+
+    def op_nac_zeros_like(self, x, *args, **kwargs):
+        dtype = self._get_dtype(kwargs.get('dtype', args[0] if args else None), x.dtype)
+        return np.zeros(x.shape, dtype=dtype)
+
+    def op_nac_new_zeros(self, x, sz, *args, **kwargs):
+        dtype = self._get_dtype(kwargs.get('dtype', args[0] if args else None), x.dtype)
+        return np.zeros(self._parse_shape(sz), dtype=dtype)
+
+    # === ONES ===
+    def op_nac_ones(self, sz, *args, **kwargs):
+        dtype = self._get_dtype(kwargs.get('dtype', args[0] if args else None))
+        return np.ones(self._parse_shape(sz), dtype=dtype)
+
+    def op_nac_ones_like(self, x, *args, **kwargs):
+        dtype = self._get_dtype(kwargs.get('dtype', args[0] if args else None), x.dtype)
+        return np.ones(x.shape, dtype=dtype)
+
+    def op_nac_new_ones(self, x, sz, *args, **kwargs):
+        dtype = self._get_dtype(kwargs.get('dtype', args[0] if args else None), x.dtype)
+        return np.ones(self._parse_shape(sz), dtype=dtype)
+
+    # === FULL ===
+    def op_nac_full(self, sz, val, *args, **kwargs):
+        dtype = self._get_dtype(kwargs.get('dtype', args[0] if args else None))
+        return np.full(self._parse_shape(sz), val, dtype=dtype)
+
+    def op_nac_full_like(self, x, val, *args, **kwargs):
+        dtype = self._get_dtype(kwargs.get('dtype', args[0] if args else None), x.dtype)
+        return np.full(x.shape, val, dtype=dtype)
+
     def op_nac_neg(self, x):
         return np.negative(x)
 
@@ -941,3 +1026,262 @@ class NacKernelBase:
     
     def op_nac_le(self, a, b, *args, **kw):
         return np.less_equal(a, b)
+
+    def op_nac_mul(self, a, b, *args, **kwargs):
+        return np.multiply(a, b)
+
+    def op_nac_div(self, a, b, *args, **kwargs):
+        return np.divide(a, b)
+
+    def op_nac_transpose(self, tensor, dim0=None, dim1=None):
+        """
+        Универсальное транспонирование.
+        Если dim0 и dim1 не переданы, работает как aten.t()
+        Если переданы, работает как aten.transpose(dim0, dim1)
+        """
+        if dim0 is None and dim1 is None:
+            # Логика aten.t
+            return np.transpose(tensor)
+        else:
+            # Логика aten.transpose
+            dim0 = int(dim0)
+            dim1 = int(dim1)
+            axes = list(range(tensor.ndim))
+            axes[dim0], axes[dim1] = axes[dim1], axes[dim0]
+            return np.transpose(tensor, axes=axes)
+
+    def op_nac_matmul(self, a, b):
+        return np.matmul(a, b)
+
+    def op_aten_sum_dim_IntList(self, x, dim, keepdim=False, dtype=None, *args, **kwargs):
+        axis = tuple(dim) if dim else None
+        res = np.sum(x, axis=axis, keepdims=keepdim)
+        if dtype is not None:
+            res = res.astype(self._enum_to_numpy_dtype(dtype), copy=False)
+        return res
+
+    def op_aten_div_Scalar(self, a, b):
+        return np.divide(a, b)
+
+    def op_aten_threshold_backward_default(self, grad_output, x, threshold):
+        return grad_output * (x > threshold)
+
+    def op_aten_native_batch_norm_backward_default(self, grad_out, input, weight, running_mean, running_var, save_mean, save_invstd, train, eps, output_mask):
+        sh = (1, -1, 1, 1) if input.ndim == 4 else (1, -1)
+        grad_input = grad_weight = grad_bias = None
+        invstd = 1.0 / np.sqrt(running_var.reshape(sh) + eps)
+        norm_x = (input - running_mean.reshape(sh)) * invstd
+        
+        if output_mask[0]:
+            w = weight.reshape(sh) if weight is not None else 1.0
+            grad_input = grad_out * w * invstd
+        if output_mask[1] and weight is not None:
+            axes = tuple(i for i in range(input.ndim) if i != 1)
+            grad_weight = np.sum(grad_out * norm_x, axis=axes)
+        if output_mask[2] and weight is not None:
+            axes = tuple(i for i in range(input.ndim) if i != 1)
+            grad_bias = np.sum(grad_out, axis=axes)
+            
+        return (grad_input, grad_weight, grad_bias)
+
+    def _col2im_indices(self, cols, x_shape, field_height, field_width, padding=1, stride=1):
+        N, C, H, W = x_shape
+        H_padded, W_padded = H + 2 * padding, W + 2 * padding
+        x_padded = np.zeros((N, C, H_padded, W_padded), dtype=cols.dtype)
+        k, i, j = get_im2col_indices_cached(x_shape, field_height, field_width, padding, stride)
+        cols_reshaped = cols.reshape(C * field_height * field_width, -1, N).transpose(2, 0, 1)
+        np.add.at(x_padded, (slice(None), k, i, j), cols_reshaped)
+        if padding > 0:
+            return x_padded[:, :, padding:-padding, padding:-padding]
+        return x_padded
+
+    def op_aten_convolution_backward_default(self, grad_output, input, weight, bias_sizes, stride, padding, dilation, transposed, output_padding, groups, output_mask):
+        grad_input = grad_weight = grad_bias = None
+        if output_mask[2]:
+            grad_bias = np.sum(grad_output, axis=(0, 2, 3))
+            
+        if output_mask[0] or output_mask[1]:
+            N, C_out, H_out, W_out = grad_output.shape
+            _, C_in, H_in, W_in = input.shape
+            kH, kW = weight.shape[2], weight.shape[3]
+            sH, sW = stride
+            pH, pW = padding
+            
+            x_cols = im2col_indices(input, kH, kW, padding=pH, stride=sH)
+            grad_out_reshaped = grad_output.transpose(1, 0, 2, 3).reshape(C_out, -1)
+            
+            if output_mask[1]:
+                gw_cols = grad_out_reshaped @ x_cols.T
+                grad_weight = gw_cols.reshape(weight.shape)
+                
+            if output_mask[0]:
+                w_reshaped = weight.reshape(C_out, -1)
+                dx_cols = w_reshaped.T @ grad_out_reshaped
+                grad_input = self._col2im_indices(dx_cols, input.shape, kH, kW, padding=pH, stride=sH)
+                
+        return (grad_input, grad_weight, grad_bias)
+
+    def op_aten_max_pool2d_with_indices_backward_default(self, grad_output, x, kernel_size, stride, padding, dilation, ceil_mode, indices):
+        grad_input = np.zeros_like(x)
+        N, C, H, W = x.shape
+        grad_input_flat = grad_input.reshape(N, C, H * W)
+        grad_output_flat = grad_output.reshape(N, C, -1)
+        indices_flat = indices.reshape(N, C, -1)
+        
+        for n in range(N):
+            for c in range(C):
+                np.add.at(grad_input_flat[n, c], indices_flat[n, c], grad_output_flat[n, c])
+                
+        return grad_input
+
+    def op_aten_mul_Scalar(self, a, b):
+        return np.multiply(a, b)
+
+    def op_aten__softmax_backward_data_default(self, grad_output, output, dim, input_dtype):
+        sum_val = np.sum(grad_output * output, axis=dim, keepdims=True)
+        return output * (grad_output - sum_val)
+
+    def op_aten_new_empty_strided_default(self, x, size, stride, **kwargs):
+        return np.empty(size, dtype=x.dtype)
+
+    def op_aten_embedding_dense_backward_default(self, grad_output, indices, num_weights, padding_idx, scale_grad_by_freq):
+        grad_weight = np.zeros((num_weights, grad_output.shape[-1]), dtype=grad_output.dtype)
+        indices_flat = indices.flatten()
+        grad_output_flat = grad_output.reshape(-1, grad_output.shape[-1])
+        np.add.at(grad_weight, indices_flat, grad_output_flat)
+        if padding_idx is not None and padding_idx >= 0:
+            grad_weight[padding_idx] = 0
+        return grad_weight
+
+    def op_aten_slice_backward_default(self, grad_output, input_sizes, dim, start, end, step):
+        grad_input = np.zeros(input_sizes, dtype=grad_output.dtype)
+        slc = [slice(None)] * len(input_sizes)
+        slc[dim] = slice(start, end, step)
+        grad_input[tuple(slc)] = grad_output
+        return grad_input
+
+    def op_aten_sigmoid_default(self, x):
+        return self._sigmoid(x)
+
+    def op_aten_empty_like_default(self, x, *args, **kwargs):
+        return np.empty_like(x)
+
+    def op_aten_fill_Scalar(self, x, value):
+        out = np.empty_like(x)
+        out.fill(value)
+        return out
+
+    def op_aten_native_group_norm_backward_default(self, dY, X, mean, rstd, weight, N, C, HxW, groups, output_mask):
+        dY_reshaped = dY.reshape(N, groups, C // groups, -1)
+        X_reshaped = X.reshape(N, groups, C // groups, -1)
+        mean_reshaped = mean.reshape(N, groups, 1, 1)
+        rstd_reshaped = rstd.reshape(N, groups, 1, 1)
+        weight_reshaped = weight.reshape(1, groups, C // groups, 1) if weight is not None else 1.0
+
+        dX = dW = dB = None
+        if output_mask[0]:
+            dx_norm = dY_reshaped * weight_reshaped
+            N_el = (C // groups) * HxW
+            sum_dx_norm = np.sum(dx_norm, axis=(2, 3), keepdims=True)
+            sum_dx_norm_x = np.sum(dx_norm * X_reshaped, axis=(2, 3), keepdims=True)
+            dX_reshaped = (dx_norm - sum_dx_norm / N_el - (X_reshaped - mean_reshaped) * rstd_reshaped**2 * sum_dx_norm_x / N_el) * rstd_reshaped
+            dX = dX_reshaped.reshape(X.shape)
+            
+        if output_mask[1] and weight is not None:
+            norm_X = (X - mean.reshape(N, groups, 1, 1).repeat(C // groups, axis=2).reshape(N, C, 1, 1)) * rstd.reshape(N, groups, 1, 1).repeat(C // groups, axis=2).reshape(N, C, 1, 1)
+            dW = np.sum(dY * norm_X, axis=(0, 2, 3))
+            
+        if output_mask[2] and weight is not None:
+            dB = np.sum(dY, axis=(0, 2, 3))
+            
+        return (dX, dW, dB)
+
+    def op_aten_gelu_backward_default(self, grad_output, x, approximate="none"):
+        cdf = 0.5 * (1.0 + np.vectorize(math.erf)(x / math.sqrt(2.0)))
+        pdf = np.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+        return grad_output * (cdf + x * pdf)
+
+    def op_aten_native_layer_norm_backward_default(self, grad_out, input, norm_shape, mean, rstd, weight, bias, output_mask):
+        axis = tuple(range(input.ndim - len(norm_shape), input.ndim))
+        dX = dW = dB = None
+        
+        if output_mask[0]:
+            N_el = np.prod(norm_shape)
+            W = weight if weight is not None else 1.0
+            dx_norm = grad_out * W
+            sum_dx_norm = np.sum(dx_norm, axis=axis, keepdims=True)
+            sum_dx_norm_x = np.sum(dx_norm * input, axis=axis, keepdims=True)
+            dX = (dx_norm - sum_dx_norm / N_el - (input - np.expand_dims(mean, axis)) * np.expand_dims(rstd, axis)**2 * sum_dx_norm_x / N_el) * np.expand_dims(rstd, axis)
+            
+        if output_mask[1] and weight is not None:
+            norm_x = (input - np.expand_dims(mean, axis)) * np.expand_dims(rstd, axis)
+            dW = np.sum(grad_out * norm_x, axis=tuple(range(input.ndim - len(norm_shape))))
+            
+        if output_mask[2] and bias is not None:
+            dB = np.sum(grad_out, axis=tuple(range(input.ndim - len(norm_shape))))
+            
+        return (dX, dW, dB)
+
+    def op_aten__scaled_dot_product_flash_attention_for_cpu_backward_default(self, grad_out, q, k, v, out, logsumexp, p, is_causal, scale):
+        return (np.zeros_like(q), np.zeros_like(k), np.zeros_like(v))
+
+    def op_aten__unsafe_index_put_default(self, x, indices, values, accumulate=False):
+        out = np.copy(x)
+        idx_tuple = tuple(np.asarray(i) if i is not None else slice(None) for i in indices)
+        if accumulate:
+            np.add.at(out, idx_tuple, values)
+        else:
+            out[idx_tuple] = values
+        return out
+
+    def op_aten_nll_loss_backward_default(self, grad_output, x, target, weight, reduction, ignore_index, total_weight):
+        grad_input = np.zeros_like(x)
+        target = np.asarray(target, dtype=int)
+        reduction = int(reduction)
+        ignore_index = int(ignore_index)
+        
+        if target.ndim == 0: target = np.expand_dims(target, 0)
+        if grad_output.ndim == 0: grad_output = np.expand_dims(grad_output, 0)
+            
+        if x.ndim == 2:
+            for i in range(x.shape[0]):
+                t = target[i]
+                if t != ignore_index:
+                    w = weight[t] if weight is not None else 1.0
+                    div = x.shape[0] if reduction == 1 else 1.0
+                    grad_input[i, t] = -grad_output[0] * w / div
+        return grad_input
+
+    def op_aten__log_softmax_backward_data_default(self, grad_output, output, dim, input_dtype):
+        dim = int(dim)
+        sum_val = np.sum(grad_output * output, axis=dim, keepdims=True)
+        return grad_output - np.exp(output) * sum_val
+
+    def op_aten_select_backward_default(self, grad_output, input_sizes, dim, index):
+        grad_input = np.zeros(input_sizes, dtype=grad_output.dtype)
+        slc = [slice(None)] * len(input_sizes)
+        slc[dim] = index
+        grad_input[tuple(slc)] = grad_output
+        return grad_input
+
+    def op_aten_nll_loss2d_backward_default(self, grad_output, x, target, weight, reduction, ignore_index, total_weight):
+        return self.op_aten_nll_loss_backward_default(grad_output, x, target, weight, reduction, ignore_index, total_weight)
+
+    def op_aten_tanh_backward_default(self, grad_output, output):
+        return grad_output * (1.0 - output**2)
+
+    def op_aten_scalar_tensor_default(self, s, **kwargs):
+        dtype_enum = kwargs.get('dtype', None)
+        np_dtype = self._enum_to_numpy_dtype(dtype_enum) if dtype_enum is not None else np.float32
+        return np.array(s, dtype=np_dtype)
+
+    def op_aten_sum_dim_IntList(self, x, dim, keepdim=False, dtype=None, *args, **kwargs):
+        if isinstance(keepdim, float): keepdim = bool(keepdim)
+        if dim is not None:
+            dim = tuple(int(d) for d in dim)
+        res = np.sum(x, axis=dim, keepdims=keepdim)
+        if dtype is not None:
+            res = res.astype(self._enum_to_numpy_dtype(dtype), copy=False)
+        return res
+
+# --- END OF FILE NAC_kernels.py ---

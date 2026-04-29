@@ -1,469 +1,360 @@
-# MEP_compiler.py
-#
-# Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com)
-# Licensed under the Apache License, Version 2.0
-#
-# This file contains the MEPCompiler, a compiler class that translates
-# high-level Python calls into binary bytecode for the Model Execution
-# Pipeline (MEP) virtual machine. It is the primary tool for creating
-# executable MEP plans.
+# --- START OF FILE MEP_compiler.py ---
+# Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import struct
+import os
 from typing import Dict, Any, List, Optional, Tuple
 
 class MEPCompiler:
-    """
-    A compiler helper class to generate MEP ISA v1.0 bytecode 
-    from high-level, Python-like method calls.
-
-    This class manages the entire compilation state, including:
-    - Allocation of context slots (registers).
-    - Management of the constants pool.
-    - Generation of binary instructions.
-    - Handling of labels and calculating jump offsets (the linking phase).
-    """
     def __init__(self):
-        """Initializes a new compiler instance."""
         self.bytecode = bytearray()
         self.constants: Dict[str, Tuple[int, Any]] = {}
         self.next_const_id = 0
         self.context_vars: Dict[str, int] = {}
         self.next_context_key = 0
-        
-        # For handling jumps and labels during the linking phase
         self._labels: Dict[str, int] = {}
         self._jumps: Dict[str, List[int]] = {}
-        
-        # A stack to manage nested loops and calculate offsets for 'break' statements
         self._loop_stack: List[Dict[str, Any]] = []
 
-
     def _get_const_id(self, value: Any) -> int:
-        """
-        Adds a value to the constant pool if it doesn't exist and returns its ID.
-        """
-        # Use the string representation for caching simple values.
-        # Note: This is not robust for complex, non-string-representable objects.
         val_key = str(value)
         if val_key not in self.constants:
-            if self.next_const_id > 65535:
-                raise OverflowError("Constant pool limit (65536) exceeded.")
+            if self.next_const_id > 65535: raise OverflowError("Constant pool limit exceeded.")
             self.constants[val_key] = (self.next_const_id, value)
             self.next_const_id += 1
         return self.constants[val_key][0]
 
     def _get_context_key(self, name: str) -> int:
-        """
-        Assigns a context slot (key) to a variable name if it's new, and returns the key.
-        """
         if name not in self.context_vars:
-            if self.next_context_key > 255:
-                raise OverflowError("Context variable limit (256) exceeded.")
+            if self.next_context_key > 255: raise OverflowError("Context variable limit exceeded.")
             self.context_vars[name] = self.next_context_key
             self.next_context_key += 1
         return self.context_vars[name]
 
-    # --- 0x00-0x0F: Data Sources & Parameters ---
-
+    # 0x00-0x0F  Data Sources
     def src_user_prompt(self, out_var: str, prompt_text: str, data_type: int = 0):
-        """0x02: SRC_USER_PROMPT. Prompts the user for input."""
+        """0x02: data_type (0=str, 1=int, 2=float)"""
         key = self._get_context_key(out_var)
-        prompt_id = self._get_const_id(prompt_text)
         self.bytecode.append(0x02)
-        # Parameters: out_key(1), data_type(1), prompt_const_id(2)
-        self.bytecode += struct.pack('<BBH', key, data_type, prompt_id)
+        self.bytecode += struct.pack('<BBH', key, data_type, self._get_const_id(prompt_text))
 
     def src_constant(self, out_var: str, value: Any):
-        """0x04: SRC_CONSTANT. Loads a predefined constant into the context."""
+        """0x04: Load constant"""
         key = self._get_context_key(out_var)
-        const_id = self._get_const_id(value)
         self.bytecode.append(0x04)
-        # Parameters: out_key(1), const_id(2)
-        self.bytecode += struct.pack('<BH', key, const_id)
+        self.bytecode += struct.pack('<BH', key, self._get_const_id(value))
 
-    # --- 0x10-0x1F: Resource & Environment Management ---
+    def src_exec_mode(self, out_var: str):
+        """0x05: Load current exec_mode string ('infer', 'train', 'infer_train')"""
+        key = self._get_context_key(out_var)
+        self.bytecode.append(0x05)
+        self.bytecode += struct.pack('<B', key)
 
+    # 0x10-0x1F  Resource management
     def res_load_model(self, model_id: int, model_path: str):
-        """0x10: RES_LOAD_MODEL. Loads a model from a resource path."""
-        path_const_id = self._get_const_id(model_path)
         self.bytecode.append(0x10)
-        # Parameters: model_id(1), path_const_id(2)
-        self.bytecode += struct.pack('<BH', model_id, path_const_id)
+        self.bytecode += struct.pack('<BH', model_id, self._get_const_id(model_path))
 
     def res_load_datafile(self, out_var: str, file_path: str, file_type: int):
-        """0x11: RES_LOAD_DATAFILE. Loads a data file (e.g., .npy, .json)."""
-        out_key = self._get_context_key(out_var)
-        path_const_id = self._get_const_id(file_path)
         self.bytecode.append(0x11)
-        # Parameters: out_key(1), file_type(1), path_const_id(2)
-        self.bytecode += struct.pack('<BBH', out_key, file_type, path_const_id)
+        self.bytecode += struct.pack('<BBH', self._get_context_key(out_var), file_type, self._get_const_id(file_path))
 
     def res_load_dynamic(self, out_var: str, path_var: str, file_type: int):
-        """0x13: RES_LOAD_DYNAMIC. Loads a file whose path comes from a context variable.
-
-        Unlike res_load_datafile (0x11) where the path is a compile-time string
-        constant, here *path_var* is the name of a runtime MEP variable that holds
-        the path string (typically the result of src_user_prompt).
-
-        file_type codes (same as res_load_datafile):
-            2  — .npy binary tensor, loaded as-is via np.load()
-            3  — image file (jpg/png/…) with ImageNet preprocessing
-                 → NacRuntime.preprocess_image_for_imagenet() → (1,3,224,224) float32
-        """
-        out_key  = self._get_context_key(out_var)
-        path_key = self._get_context_key(path_var)
         self.bytecode.append(0x13)
-        # Parameters: out_key(1), path_key(1), file_type(1)
-        self.bytecode += struct.pack('<BBB', out_key, path_key, file_type)
+        self.bytecode += struct.pack('<BBB', self._get_context_key(out_var), self._get_context_key(path_var), file_type)
 
     def res_load_extern(self, out_var: str, res_type: int, resource_id: Any):
-        """0x12: RES_LOAD_EXTERN (universal).
-        
-        res_type:
-            0 - extract a component from an already loaded model (NacRuntime)
-            1 - standalone resource (by path/name)
-        """
-        key = self._get_context_key(out_var)
-        res_id_const = self._get_const_id(resource_id)
-        
         self.bytecode.append(0x12)
-        # Parameters: out_key(1), res_type(1), res_id_const_id(2)
-        self.bytecode += struct.pack('<BBH', key, res_type, res_id_const)
+        self.bytecode += struct.pack('<BBH', self._get_context_key(out_var), res_type, self._get_const_id(resource_id))
 
-    # --- 0x20-0x2F: Preprocessing ---
-    
+    def res_unload(self, res_type: int, id_or_var: str):
+        self.bytecode.append(0x1F)
+        val = int(id_or_var) if res_type == 0 else self._get_context_key(id_or_var)
+        self.bytecode += struct.pack('<BB', res_type, val)
+
+    # 0x20-0x2F  Preprocessing
     def preproc_encode(self, proc_var: str, in_var: str, out_var: str):
-        """0x20: PREPROC_ENCODE. Applies an encoder (e.g., tokenizer) to data."""
-        proc_key, in_key, out_key = self._get_context_key(proc_var), self._get_context_key(in_var), self._get_context_key(out_var)
         self.bytecode.append(0x20)
-        self.bytecode += struct.pack('<BBB', proc_key, in_key, out_key)
-        
+        self.bytecode += struct.pack('<BBB', self._get_context_key(proc_var), self._get_context_key(in_var), self._get_context_key(out_var))
+
     def preproc_decode(self, proc_var: str, in_var: str, out_var: str):
-        """0x21: PREPROC_DECODE. Applies a decoder to data."""
-        proc_key, in_key, out_key = self._get_context_key(proc_var), self._get_context_key(in_var), self._get_context_key(out_var)
         self.bytecode.append(0x21)
-        self.bytecode += struct.pack('<BBB', proc_key, in_key, out_key)
+        self.bytecode += struct.pack('<BBB', self._get_context_key(proc_var), self._get_context_key(in_var), self._get_context_key(out_var))
 
     def preproc_get_id(self, proc_var: str, item_str: str, out_var: str):
-        """0x22: PREPROC_GET_ID. Gets a special ID (e.g., <eos>) from a preprocessor."""
-        proc_key = self._get_context_key(proc_var)
-        item_const_id = self._get_const_id(item_str)
-        out_key = self._get_context_key(out_var)
         self.bytecode.append(0x22)
-        self.bytecode += struct.pack('<BHB', proc_key, item_const_id, out_key)
+        self.bytecode += struct.pack('<BHB', self._get_context_key(proc_var), self._get_const_id(item_str), self._get_context_key(out_var))
 
     def string_format(self, out_var: str, format_str: str, in_vars: List[str]):
-        """0x2A: STRING_FORMAT. Creates a formatted string."""
-        out_key, format_id = self._get_context_key(out_var), self._get_const_id(format_str)
         in_keys = [self._get_context_key(v) for v in in_vars]
         self.bytecode.append(0x2A)
-        self.bytecode += struct.pack('<BHB', out_key, format_id, len(in_keys))
+        self.bytecode += struct.pack('<BHB', self._get_context_key(out_var), self._get_const_id(format_str), len(in_keys))
         if in_keys: self.bytecode += struct.pack(f'<{len(in_keys)}B', *in_keys)
 
-    # --- 0x30-0x4F: Tensor Processing ---
-
+    # 0x30-0x4F  Tensor processing
     def tensor_create(self, from_py: Optional[dict] = None, arange: Optional[dict] = None, ones: Optional[dict] = None):
-        """0x30: TENSOR_CREATE. Creates a new tensor."""
         self.bytecode.append(0x30)
         if from_py:
-            out_key, in_key = self._get_context_key(from_py['out_var']), self._get_context_key(from_py['in_var'])
-            self.bytecode += struct.pack('<BBBB', out_key, from_py['dtype_code'], 0, in_key)
+            self.bytecode += struct.pack('<BBBB', self._get_context_key(from_py['out_var']), from_py['dtype_code'], 0, self._get_context_key(from_py['in_var']))
         elif arange:
-            out_key, end_key = self._get_context_key(arange['out_var']), self._get_context_key(arange['end_var'])
-            self.bytecode += struct.pack('<BBBB', out_key, arange['dtype_code'], 1, end_key)
+            self.bytecode += struct.pack('<BBBB', self._get_context_key(arange['out_var']), arange['dtype_code'], 1, self._get_context_key(arange['end_var']))
         elif ones:
-            out_key, shape_key = self._get_context_key(ones['out_var']), self._get_context_key(ones['shape_var'])
-            self.bytecode += struct.pack('<BBBB', out_key, ones['dtype_code'], 2, shape_key)
-        else: raise ValueError("A tensor creation type (from_py, arange, ones) must be specified.")
+            self.bytecode += struct.pack('<BBBB', self._get_context_key(ones['out_var']), ones['dtype_code'], 2, self._get_context_key(ones['shape_var']))
+        else: raise ValueError("Specify from_py, arange, or ones.")
 
     def tensor_manipulate(self, op_type: str, out_var: str, in_var: str, **kwargs):
-        """0x38: TENSOR_MANIPULATE. Performs simple tensor manipulations (pad, reshape, etc.)."""
-        op_map = {'pad': 1} # 0 is reserved for future reshape
-        op_code = op_map.get(op_type)
-        if op_code is None: raise ValueError(f"Unknown TENSOR_MANIPULATE op_type: {op_type}")
-        
-        out_key, in_key = self._get_context_key(out_var), self._get_context_key(in_var)
+        op_code = {'pad': 1}.get(op_type)
         self.bytecode.append(0x38)
-        self.bytecode += struct.pack('<BBB', op_code, out_key, in_key)
-
-        if op_type == 'pad':
-            pad_width_key = self._get_context_key(kwargs['pad_width_var'])
-            const_val_key = self._get_context_key(kwargs['const_val_var'])
-            self.bytecode += struct.pack('<BB', pad_width_key, const_val_key)
+        self.bytecode += struct.pack('<BBB', op_code, self._get_context_key(out_var), self._get_context_key(in_var))
+        if op_type == 'pad': self.bytecode += struct.pack('<BB', self._get_context_key(kwargs['pad_width_var']), self._get_context_key(kwargs['const_val_var']))
 
     def tensor_combine(self, op_type: str, out_var: str, in_vars: List[str], **kwargs):
-        """0x39: TENSOR_COMBINE. Combines multiple tensors (concat, stack)."""
-        op_map = {'concat': 0}
-        op_code = op_map.get(op_type)
-        if op_code is None: raise ValueError(f"Unknown TENSOR_COMBINE op_type: {op_type}")
-        
-        out_key, in_keys = self._get_context_key(out_var), [self._get_context_key(v) for v in in_vars]
+        op_code = {'concat': 0}.get(op_type)
+        in_keys = [self._get_context_key(v) for v in in_vars]
         self.bytecode.append(0x39)
-        self.bytecode += struct.pack('<BBB', op_code, out_key, len(in_keys))
-        self.bytecode += struct.pack(f'<{len(in_keys)}B', *in_keys)
-
-        if op_type == 'concat':
-            axis_key = self._get_context_key(kwargs['axis_var'])
-            self.bytecode += struct.pack('<B', axis_key)
+        self.bytecode += struct.pack('<BBB', op_code, self._get_context_key(out_var), len(in_keys))
+        if in_keys: self.bytecode += struct.pack(f'<{len(in_keys)}B', *in_keys)
+        if op_type == 'concat': self.bytecode += struct.pack('<B', self._get_context_key(kwargs['axis_var']))
 
     def tensor_info(self, op_type: str, out_var: str, in_var: str, **kwargs):
-        """0x3A: TENSOR_INFO. Gets metadata from a tensor (shape, dim, etc.)."""
-        op_map = {'shape': 0, 'dim': 1, 'to_py': 2}
-        op_code = op_map.get(op_type)
-        if op_code is None: raise ValueError(f"Unknown TENSOR_INFO op_type: {op_type}")
-        out_key, in_key = self._get_context_key(out_var), self._get_context_key(in_var)
+        op_code = {'shape': 0, 'dim': 1, 'to_py': 2}.get(op_type)
         self.bytecode.append(0x3A)
-        self.bytecode += struct.pack('<BBB', op_code, out_key, in_key)
-        if op_type == 'dim':
-            dim_key = self._get_context_key(kwargs['dim_idx_var'])
-            self.bytecode += struct.pack('<B', dim_key)
+        self.bytecode += struct.pack('<BBB', op_code, self._get_context_key(out_var), self._get_context_key(in_var))
+        if op_type == 'dim': self.bytecode += struct.pack('<B', self._get_context_key(kwargs['dim_idx_var']))
 
     def tensor_extract(self, out_var: str, in_tensor_var: str, in_idx_var: str):
-        """0x3B: TENSOR_EXTRACT. Extracts an element or slice by index."""
-        out_key, in_tensor_key, in_idx_key = self._get_context_key(out_var), self._get_context_key(in_tensor_var), self._get_context_key(in_idx_var)
         self.bytecode.append(0x3B)
-        self.bytecode += struct.pack('<BBB', out_key, in_tensor_key, in_idx_key)
+        self.bytecode += struct.pack('<BBB', self._get_context_key(out_var), self._get_context_key(in_tensor_var), self._get_context_key(in_idx_var))
 
-    # --- 0x50-0x5F: System & External Calls ---
-
+    # 0x50-0x5F  System / utility
     def sys_copy(self, out_var: str, in_var: str):
-        """0x59: SYS_COPY. Copies an object within the context."""
-        out_key, in_key = self._get_context_key(out_var), self._get_context_key(in_var)
         self.bytecode.append(0x59)
-        self.bytecode += struct.pack('<BB', out_key, in_key)
+        self.bytecode += struct.pack('<BB', self._get_context_key(out_var), self._get_context_key(in_var))
 
     def sys_debug_print(self, var_name: str, msg: str = ""):
-        """0x5F: SYS_DEBUG_PRINT. Prints a context value for debugging."""
-        key = self._get_context_key(var_name)
-        msg_id = self._get_const_id(msg or f"{var_name}:")
         self.bytecode.append(0x5F)
-        self.bytecode += struct.pack('<BH', key, msg_id)
+        self.bytecode += struct.pack('<BH', self._get_context_key(var_name), self._get_const_id(msg or f"{var_name}:"))
 
-    # --- 0x60-0x7F: Post-processing & Logic ---
-
+    # 0x60-0x7F  Post-processing & logic
     def math_unary(self, op_type: str, out_var: str, in_var: str):
-        """0x60: MATH_UNARY. Performs a unary math operation (e.g., softmax)."""
-        op_map = {'softmax': 0}
-        op_code = op_map.get(op_type)
-        if op_code is None: raise ValueError(f"Unknown unary math op_type: {op_type}")
-        out_key, in_key = self._get_context_key(out_var), self._get_context_key(in_var)
+        op_code = {'softmax': 0}.get(op_type)
         self.bytecode.append(0x60)
-        self.bytecode += struct.pack('<BBB', op_code, out_key, in_key)
+        self.bytecode += struct.pack('<BBB', op_code, self._get_context_key(out_var), self._get_context_key(in_var))
 
     def math_binary(self, op_type: str, out_var: str, in_var1: str, in_var2: str):
-        """0x61: MATH_BINARY. Performs a binary arithmetic operation."""
-        op_map = {'add': 0, 'sub': 1, 'mul': 2}
-        op_code = op_map.get(op_type)
-        if op_code is None: raise ValueError(f"Unknown binary math op_type: {op_type}")
-        out_key, in_key1, in_key2 = self._get_context_key(out_var), self._get_context_key(in_var1), self._get_context_key(in_var2)
+        op_code = {'add': 0, 'sub': 1, 'mul': 2}.get(op_type)
         self.bytecode.append(0x61)
-        self.bytecode += struct.pack('<BBBB', op_code, out_key, in_key1, in_key2)
+        self.bytecode += struct.pack('<BBBB', op_code, self._get_context_key(out_var), self._get_context_key(in_var1), self._get_context_key(in_var2))
 
     def math_aggregate(self, op_type: str, out_var: str, in_var: str):
-        """0x62: MATH_AGGREGATE. Performs an aggregate operation (e.g., argmax)."""
-        op_map = {'argmax': 0}
-        op_code = op_map.get(op_type)
-        if op_code is None: raise ValueError(f"Unknown aggregate math op_type: {op_type}")
-        out_key, in_key = self._get_context_key(out_var), self._get_context_key(in_var)
+        op_code = {'argmax': 0}.get(op_type)
         self.bytecode.append(0x62)
-        self.bytecode += struct.pack('<BBB', op_code, out_key, in_key)
+        self.bytecode += struct.pack('<BBB', op_code, self._get_context_key(out_var), self._get_context_key(in_var))
 
     def logic_compare(self, op_type: str, out_var: str, in_var1: str, in_var2: str):
-        """0x68: LOGIC_COMPARE. Compares two values."""
-        op_map = {'eq': 0, 'neq': 1, 'gt': 2, 'lt': 3}
-        op_code = op_map.get(op_type)
-        if op_code is None: raise ValueError(f"Unknown comparison op_type: {op_type}")
-        out_key, in_key1, in_key2 = self._get_context_key(out_var), self._get_context_key(in_var1), self._get_context_key(in_var2)
+        op_code = {'eq': 0, 'neq': 1, 'gt': 2, 'lt': 3}.get(op_type)
         self.bytecode.append(0x68)
-        self.bytecode += struct.pack('<BBBB', op_code, out_key, in_key1, in_key2)
+        self.bytecode += struct.pack('<BBBB', op_code, self._get_context_key(out_var), self._get_context_key(in_var1), self._get_context_key(in_var2))
 
-    def analysis_top_k(self, in_var: str, k_var: str,
-                       out_indices_var: str, out_vals_var: str):
-        """0x70: ANALYSIS_TOP_K.
-        Finds top-K values and their indices in a 1-D logits tensor.
-        Parameters: in_key(1), k_key(1), out_indices_key(1), out_vals_key(1)
-        """
-        in_key       = self._get_context_key(in_var)
-        k_key        = self._get_context_key(k_var)
-        out_idx_key  = self._get_context_key(out_indices_var)
-        out_vals_key = self._get_context_key(out_vals_var)
+    def analysis_top_k(self, in_var: str, k_var: str, out_indices_var: str, out_vals_var: str):
         self.bytecode.append(0x70)
-        self.bytecode += struct.pack('<BBBB', in_key, k_key, out_idx_key, out_vals_key)
+        self.bytecode += struct.pack('<BBBB', self._get_context_key(in_var), self._get_context_key(k_var), self._get_context_key(out_indices_var), self._get_context_key(out_vals_var))
 
-    def analysis_sample(self, logits_var: str, temp_var: str,
-                        topk_var: str, out_var: str):
-        """0x71: ANALYSIS_SAMPLE.
-        Applies temperature scaling + top-k masking + softmax, then samples
-        a token ID from the resulting distribution.
-        Parameters: logits_key(1), temp_key(1), topk_key(1), out_key(1)
-        """
-        logits_key = self._get_context_key(logits_var)
-        temp_key   = self._get_context_key(temp_var)
-        topk_key   = self._get_context_key(topk_var)
-        out_key    = self._get_context_key(out_var)
+    def analysis_sample(self, logits_var: str, temp_var: str, topk_var: str, out_var: str):
         self.bytecode.append(0x71)
-        self.bytecode += struct.pack('<BBBB', logits_key, temp_key, topk_key, out_key)
+        self.bytecode += struct.pack('<BBBB', self._get_context_key(logits_var), self._get_context_key(temp_var), self._get_context_key(topk_var), self._get_context_key(out_var))
 
-    # --- 0x80-0x8F: Model Execution ---
-
+    # 0x80-0x8F  Model execution
     def model_run_static(self, model_id: int, in_vars: List[str], out_vars: List[str]):
-        """0x80: MODEL_RUN_STATIC. Runs a model with a fixed I/O contract."""
-        in_keys = [self._get_context_key(v) for v in in_vars]
-        out_keys = [self._get_context_key(v) for v in out_vars]
+        in_keys, out_keys = [self._get_context_key(v) for v in in_vars], [self._get_context_key(v) for v in out_vars]
         self.bytecode.append(0x80)
-        self.bytecode += struct.pack('<B', model_id)
-        self.bytecode += struct.pack('<B', len(in_keys))
+        self.bytecode += struct.pack('<BB', model_id, len(in_keys))
         if in_keys: self.bytecode += struct.pack(f'<{len(in_keys)}B', *in_keys)
-        self.bytecode += struct.pack('<B', len(out_keys))
+        self.bytecode.append(len(out_keys))
         if out_keys: self.bytecode += struct.pack(f'<{len(out_keys)}B', *out_keys)
-        
-    # --- 0xA0-0xAF: Flow Control ---
 
+    def model_train_step(self, 
+                         model_id: int, 
+                         loss_type: int, 
+                         in_vars: List[str], 
+                         target_vars: List[str], 
+                         out_loss_var: str, 
+                         lr_var: str = "learning_rate",
+                         logits_var: str = None,
+                         head_weight_name: str = "",
+                         head_bias_name: str = ""):
+        """Простая и надёжная версия model_train_step"""
+        in_keys = [self._get_context_key(v) for v in in_vars]
+        target_keys = [self._get_context_key(v) for v in target_vars]
+
+        self.bytecode.append(0x82)
+        self.bytecode += struct.pack('<BBB', model_id, loss_type, len(in_keys))
+        if in_keys:
+            self.bytecode += struct.pack(f'<{len(in_keys)}B', *in_keys)
+
+        self.bytecode.append(len(target_keys))
+        if target_keys:
+            self.bytecode += struct.pack(f'<{len(target_keys)}B', *target_keys)
+
+        logits_key = self._get_context_key(logits_var) if logits_var else 0
+        lr_key = self._get_context_key(lr_var)
+        weight_name_id = self._get_const_id(head_weight_name) if head_weight_name else 0
+        bias_name_id = self._get_const_id(head_bias_name) if head_bias_name else 0
+
+        # Простая и стабильная упаковка (BBBHH вместо BBHHH)
+        self.bytecode += struct.pack('<BBBHH', 
+                                     self._get_context_key(out_loss_var),
+                                     lr_key,
+                                     logits_key,
+                                     weight_name_id,
+                                     bias_name_id)
+
+    def model_zero_grad(self, model_id: int):
+        self.bytecode.append(0x83)
+        self.bytecode.append(model_id)
+
+    def model_save_weights(self, model_id: int, path_var: str, save_type: int = 0):
+        self.bytecode.append(0x85)
+        self.bytecode += struct.pack('<BBB', model_id, self._get_context_key(path_var), save_type)
+
+    # 0xA0-0xAF  Flow control
     def flow_loop_start(self, counter_var: str):
-        """0xA0: FLOW_LOOP_START. Marks the beginning of a loop."""
-        counter_key = self._get_context_key(counter_var)
         self.bytecode.append(0xA0)
-        self.bytecode.append(counter_key)
-        # Save the starting position of the loop body for the end instruction to jump back to.
-        # Also prepare a list to hold placeholders for any 'break' statements.
+        self.bytecode.append(self._get_context_key(counter_var))
         self._loop_stack.append({'start_pos': len(self.bytecode), 'break_placeholders': []})
 
     def flow_loop_end(self):
-        """0xA1: FLOW_LOOP_END. Marks the end of a loop body."""
-        if not self._loop_stack:
-            raise RuntimeError("FLOW_LOOP_END called without a matching FLOW_LOOP_START.")
-        
+        if not self._loop_stack: raise RuntimeError("flow_loop_end() without matching flow_loop_start().")
         loop_info = self._loop_stack[-1]
-        
-        # --- Backpatching for 'break' statements ---
-        # The target for a 'break' is the instruction immediately *after* this FLOW_LOOP_END.
-        # Length of FLOW_LOOP_END is 1 (flag) + 2 (offset) = 3 bytes.
         break_target_pos = len(self.bytecode) + 3
-        for placeholder_pos in loop_info['break_placeholders']:
-            # The jump offset is from the byte *after* the placeholder to the target.
-            jump_offset = break_target_pos - (placeholder_pos + 2)
-            self.bytecode[placeholder_pos:placeholder_pos+2] = struct.pack('<h', jump_offset)
-
-        # --- Calculate backward jump for the loop itself ---
-        start_pos = loop_info['start_pos']
-        # The jump offset is from the byte *after* this instruction back to the start of the loop body.
-        jump_offset = start_pos - (len(self.bytecode) + 3)
-        
+        for ph in loop_info['break_placeholders']:
+            self.bytecode[ph:ph+2] = struct.pack('<h', break_target_pos - (ph + 2))
+        jump_offset = loop_info['start_pos'] - (len(self.bytecode) + 3)
         self.bytecode.append(0xA1)
         self.bytecode += struct.pack('<h', jump_offset)
         self._loop_stack.pop()
 
     def flow_branch_if(self, cond_var: str, jump_label: str):
-        """0xA8: FLOW_BRANCH_IF. Jumps to a label if the condition is true."""
-        cond_key = self._get_context_key(cond_var)
         self.bytecode.append(0xA8)
-        self.bytecode.append(cond_key)
-        # Add a 2-byte placeholder for the jump offset.
+        self.bytecode.append(self._get_context_key(cond_var))
         offset_pos = len(self.bytecode)
         self.bytecode += struct.pack('<h', 0)
-        # Record this position to be patched later during the linking stage.
-        if jump_label not in self._jumps: self._jumps[jump_label] = []
-        self._jumps[jump_label].append(offset_pos)
+        self._jumps.setdefault(jump_label, []).append(offset_pos)
 
     def flow_break_loop_if(self, cond_var: str):
-        """0xA9: FLOW_BREAK_LOOP_IF. Exits the current loop if the condition is true."""
-        if not self._loop_stack:
-            raise RuntimeError("FLOW_BREAK_LOOP_IF called outside of a loop.")
-        
-        cond_key = self._get_context_key(cond_var)
+        if not self._loop_stack: raise RuntimeError("flow_break_loop_if() outside loop.")
         self.bytecode.append(0xA9)
-        self.bytecode.append(cond_key)
-        
-        # Add a placeholder for the jump offset and record its position.
-        # This will be patched by the corresponding FLOW_LOOP_END instruction.
+        self.bytecode.append(self._get_context_key(cond_var))
         offset_pos = len(self.bytecode)
         self.bytecode += struct.pack('<h', 0)
         self._loop_stack[-1]['break_placeholders'].append(offset_pos)
 
     def place_label(self, label_name: str):
-        """Places a named label at the current position in the bytecode."""
-        if label_name in self._labels:
-            raise NameError(f"Label '{label_name}' is already defined.")
+        if label_name in self._labels: raise NameError(f"Label '{label_name}' already defined.")
         self._labels[label_name] = len(self.bytecode)
 
-    # --- 0xE0-0xEF: Data Serialization & Conversion ---
-
+    # 0xE0-0xEF  Data serialization
     def serialize_object(self, out_var: str, in_var: str, format_type: int):
-        """0xE0: SERIALIZE_OBJECT. Serializes an object into bytes or a string."""
-        out_key, in_key = self._get_context_key(out_var), self._get_context_key(in_var)
         self.bytecode.append(0xE0)
-        # Parameters: out_key(1), in_key(1), format_type(1)
-        self.bytecode += struct.pack('<BBB', out_key, in_key, format_type)
+        self.bytecode += struct.pack('<BBB', self._get_context_key(out_var), self._get_context_key(in_var), format_type)
 
-    # --- 0xF0-0xFF: I/O Sinks & Termination ---
-
+    # 0xF0-0xFF  I/O & termination
     def io_write(self, in_var: str, dest_type: int, dest_var: Optional[str] = None, write_mode: int = 0):
-        """0xF0: IO_WRITE. Writes data to a specified destination (e.g., STDOUT, FILE)."""
-        in_key = self._get_context_key(in_var)
-        # For STDOUT/STDERR, dest_key is not used, so we can use a placeholder.
         dest_key = self._get_context_key(dest_var) if dest_var else 0
         self.bytecode.append(0xF0)
-        # Parameters: in_key(1), dest_type(1), dest_key(1), write_mode(1)
-        self.bytecode += struct.pack('<BBBB', in_key, dest_type, dest_key, write_mode)
+        self.bytecode += struct.pack('<BBBB', self._get_context_key(in_var), dest_type, dest_key, write_mode)
 
     def exec_return(self, var_names: List[str]):
-        """0xFE: EXEC_RETURN. Terminates execution and returns specified values."""
         keys = [self._get_context_key(v) for v in var_names]
         self.bytecode.append(0xFE)
         self.bytecode.append(len(keys))
         if keys: self.bytecode += struct.pack(f'<{len(keys)}B', *keys)
 
     def exec_halt(self):
-        """0xFF: EXEC_HALT. Immediately halts execution."""
         self.bytecode.append(0xFF)
 
-    # --- Compilation Finalization ---
-
+    # Finalization
     def get_program(self) -> Tuple[bytes, Dict[int, Any]]:
-        """
-        Finalizes the bytecode, performs linking, and returns the program.
+        if self._loop_stack: raise RuntimeError("Not all loops closed with flow_loop_end().")
+        for label_name, jump_positions in self._jumps.items():
+            if label_name not in self._labels: raise NameError(f"Jump label '{label_name}' never placed.")
+            target_pos = self._labels[label_name]
+            for offset_pos in jump_positions:
+                jump_offset = target_pos - (offset_pos + 2)
+                self.bytecode[offset_pos:offset_pos+2] = struct.pack('<h', jump_offset)
+        const_map = {cid: val for _, (cid, val) in self.constants.items()}
+        return bytes(self.bytecode), const_map
 
-        Returns:
-            A tuple containing:
-            - The final, linked bytecode as a bytes object.
-            - The map of constant IDs to their Python values for the runtime.
-        """
-        if self._loop_stack:
-            raise RuntimeError("Not all loops were closed with flow_loop_end().")
-        
-        # --- Linking Stage ---
-        # Resolve all forward jumps (from FLOW_BRANCH_IF) by patching their offsets.
-        if self._jumps:
-            for label_name, jump_positions in self._jumps.items():
-                if label_name not in self._labels:
-                    raise NameError(f"Jump label '{label_name}' was never placed.")
-                
-                target_pos = self._labels[label_name]
-                for offset_pos in jump_positions:
-                    # Calculate the relative offset from the byte *after* the offset placeholder.
-                    jump_offset = target_pos - (offset_pos + 2)
-                    if not -32768 <= jump_offset <= 32767:
-                        raise OverflowError("Jump offset exceeds i16 range.")
-                    # Patch the bytecode with the calculated offset.
-                    self.bytecode[offset_pos:offset_pos+2] = struct.pack('<h', jump_offset)
-        
-        # Prepare the constants map for the interpreter.
-        const_map_for_runtime = {cid: val for _, (cid, val) in self.constants.items()}
-        
-        return bytes(self.bytecode), const_map_for_runtime
+class MEPPatcher:
+    _FIXED: Dict[int, int] = {
+        0x02: 4, 0x03: 3, 0x04: 3, 0x05: 1,
+        0x10: 3, 0x11: 4, 0x12: 4, 0x13: 3, 0x1F: 2,
+        0x20: 3, 0x21: 3, 0x22: 4, 0x2A: -1,
+        0x30: 4, 0x38: -1, 0x39: -1, 0x3A: -1, 0x3B: 3,
+        0x59: 2, 0x5F: 3,
+        0x60: 3, 0x61: 4, 0x62: 3, 0x68: 4,
+        0x70: 4, 0x71: 4,
+        0x80: -1, 0x82: -1, 0x83: 1, 0x85: 3,
+        0xA0: 1, 0xA1: 2, 0xA8: 3, 0xA9: 3,
+        0xE0: 3, 0xF0: 4, 0xFE: -1, 0xFF: 0,
+    }
 
-    def save_to_file(self, mep_path: str = "hello.mep", constants_path: str = "hello.constants.json"):
-        """Saves the compiled plan and constant pool to files."""
-        program, const_map = self.get_program()
-        
-        with open(mep_path, "wb") as f:
-            f.write(program)
-        
-        if constants_path:
-            import json
-            with open(constants_path, "w", encoding="utf-8") as f:
-                json.dump(const_map, f, ensure_ascii=False, indent=2)
-        
-        print(f"✅ MEP saved successfully:")
-        print(f"   • Bytecode:     {mep_path}  ({len(program)} byte)")
-        print(f"   • Constants:    {constants_path}  ({len(const_map)} records)")
+    @classmethod
+    def instruction_length(cls, bytecode: bytes, offset: int) -> int:
+        flag = bytecode[offset]
+        length = cls._FIXED.get(flag)
+        if length is None: raise NotImplementedError(f"Unknown opcode 0x{flag:02x}")
+        if length != -1: return 1 + length
+        if flag == 0x2A: return 5 + bytecode[offset + 4]
+        if flag == 0x38: return 1 + (5 if bytecode[offset + 1] == 1 else 3)
+        if flag == 0x39: return 4 + bytecode[offset + 3] + (1 if bytecode[offset + 1] == 0 else 0)
+        if flag == 0x3A: return 4 + (1 if bytecode[offset + 1] == 1 else 0)
+        if flag == 0x80: count_in = bytecode[offset + 2]; return 4 + count_in + bytecode[offset + 3 + count_in]
+        if flag == 0x82: 
+            count_in = bytecode[offset + 3]
+            count_target = bytecode[offset + 4 + count_in]
+            return 12 + count_in + count_target
+        if flag == 0xFE: return 2 + bytecode[offset + 1]
+
+    @classmethod
+    def find_src_constant_offset(cls, bytecode: bytes, constants: Dict[int, Any], target_value: Any) -> Optional[int]:
+        target_str = str(target_value)
+        offset = 0
+        while offset < len(bytecode):
+            flag = bytecode[offset]
+            length = cls.instruction_length(bytecode, offset)
+            if flag == 0x04:
+                cid = struct.unpack_from('<H', bytecode, offset + 2)[0]
+                if str(constants.get(cid)) == target_str: return offset
+            offset += length
+        return None
+
+    @classmethod
+    def patch_src_constant_value(cls, bytecode: bytes, constants: Dict[int, Any], offset: int, new_value: Any) -> Tuple[bytes, Dict[int, Any]]:
+        cid = struct.unpack_from('<H', bytecode, offset + 2)[0]
+        new_consts = dict(constants)
+        new_consts[cid] = new_value
+        return bytecode, new_consts
+
+    @classmethod
+    def rewrite_constant_in_nac(cls, nac_path: str, old_value: Any, new_value: Any, occurrence: int = 0) -> bool:
+        from NAC_run import NacRuntime
+        bytecode, constants = NacRuntime.load_mep_from_nac(nac_path)
+        target_str = str(old_value)
+        found, target_cid = 0, None
+        for k, v in constants.items():
+            if str(v) == target_str:
+                if found == occurrence: target_cid = k; break
+                found += 1
+        if target_cid is None: return False
+        constants[target_cid] = new_value
+        const_blob = b''.join(NacRuntime._serialize_mep_constant(cid, val) for cid, val in sorted(constants.items()))
+        new_blob = b'ORCH' + struct.pack('<II', len(bytecode), len(constants)) + bytecode + const_blob
+        with open(nac_path, 'r+b') as f:
+            f.seek(10)
+            offsets = struct.unpack('<H10Q', f.read(82))[1:]
+            f.seek(offsets[7])
+            f.write(new_blob)
+        return True
+
+# --- END OF FILE MEP_compiler.py ---
