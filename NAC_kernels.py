@@ -44,17 +44,24 @@ def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
 from functools import lru_cache
 
 @lru_cache(maxsize=128)
-def get_im2col_indices_cached(x_shape, field_height, field_width, padding, stride):
+def get_im2col_indices_cached(x_shape, field_height, field_width, padding, stride, dilation=(1,1)):
     N, C, H, W = x_shape
-    out_h = (H + 2 * padding - field_height) // stride + 1
-    out_w = (W + 2 * padding - field_width) // stride + 1
+    pH, pW = padding if isinstance(padding, (tuple, list)) else (padding, padding)
+    sH, sW = stride if isinstance(stride, (tuple, list)) else (stride, stride)
+    dH, dW = dilation if isinstance(dilation, (tuple, list)) else (dilation, dilation)
 
-    i0 = np.repeat(np.arange(field_height), field_width)
+    eff_kH = (field_height - 1) * dH + 1
+    eff_kW = (field_width - 1) * dW + 1
+
+    out_h = (H + 2 * pH - eff_kH) // sH + 1
+    out_w = (W + 2 * pW - eff_kW) // sW + 1
+
+    i0 = np.repeat(np.arange(field_height) * dH, field_width)
     i0 = np.tile(i0, C)
-    j0 = np.tile(np.arange(field_width), field_height * C)
+    j0 = np.tile(np.arange(field_width) * dW, field_height * C)
 
-    i1 = stride * np.repeat(np.arange(out_h), out_w)
-    j1 = stride * np.tile(np.arange(out_w), out_h)
+    i1 = sH * np.repeat(np.arange(out_h), out_w)
+    j1 = sW * np.tile(np.arange(out_w), out_h)
 
     i = i0[:, None] + i1[None, :]
     j = j0[:, None] + j1[None, :]
@@ -62,18 +69,17 @@ def get_im2col_indices_cached(x_shape, field_height, field_width, padding, strid
 
     return k, i, j
 
-def im2col_indices(x, field_height, field_width, padding=1, stride=1):
-    p = padding
-    x_padded = np.pad(x, ((0,0),(0,0),(p,p),(p,p)), mode='constant')
+def im2col_indices(x, field_height, field_width, padding=1, stride=1, dilation=1):
+    pH, pW = padding if isinstance(padding, (tuple, list)) else (padding, padding)
+    x_padded = np.pad(x, ((0,0),(0,0),(pH,pH),(pW,pW)), mode='constant')
 
     k, i, j = get_im2col_indices_cached(
-        x.shape, field_height, field_width, padding, stride
+        x.shape, field_height, field_width, padding, stride, dilation
     )
 
     cols = x_padded[:, k, i, j]
     C = x.shape[1]
     return cols.transpose(1, 2, 0).reshape(field_height * field_width * C, -1)
-
 
 class NacKernelBase:
     def _enum_to_numpy_dtype(self, enum: Any) -> Any: return {0:np.float32, 1:np.float64, 2:np.float16, 4:np.int32, 5:np.int64, 6:np.int16, 7:np.int8, 8:np.uint8, 9:np.bool_}.get(enum)
@@ -642,51 +648,57 @@ class NacKernelBase:
 
         return out
 
-    def op_aten_conv2d_default1(self, x, weight, bias=None,
+    def op_aten_conv2d_default(self, x, weight, bias=None,
                                stride=(1,1), padding=(0,0),
                                dilation=(1,1), groups=1):
 
-        if dilation != (1,1):
-            raise NotImplementedError
+        # Type casting for calculations
+        if x.dtype != np.float32: x = x.astype(np.float32, copy=False)
+        if weight.dtype != np.float32: weight = weight.astype(np.float32, copy=False)
 
         N, C_in, H, W = x.shape
-        C_out, C_in_g, kH, kW = weight.shape
-        sH, sW = stride
-        pH, pW = padding
+        C_out, _, kH, kW = weight.shape
+        sH, sW = stride if isinstance(stride, (tuple, list)) else (stride, stride)
+        pH, pW = padding if isinstance(padding, (tuple, list)) else (padding, padding)
+        dH, dW = dilation if isinstance(dilation, (tuple, list)) else (dilation, dilation)
 
-        if sH != sW or pH != pW:
-            raise NotImplementedError
+        # Calculating effective kernel size and output sizes
+        eff_kH = (kH - 1) * dH + 1
+        eff_kW = (kW - 1) * dW + 1
+        out_h = (H + 2 * pH - eff_kH) // sH + 1
+        out_w = (W + 2 * pW - eff_kW) // sW + 1
 
-        if x.dtype != np.float32:
-            x = x.astype(np.float32, copy=False)
-        if weight.dtype != np.float32:
-            weight = weight.astype(np.float32, copy=False)
+        # im2col converts image patches into columns
+        x_cols = im2col_indices(x, kH, kW, padding=(pH, pW), stride=(sH, sW), dilation=(dH, dW))
 
-        if groups > 1:
-            out = []
-            ocpg = C_out // groups
-            icpg = C_in // groups
-            for g in range(groups):
-                out.append(
-                    self.op_aten_conv2d_default(
-                        x[:, g*icpg:(g+1)*icpg],
-                        weight[g*ocpg:(g+1)*ocpg],
-                        None, stride, padding, dilation, 1
-                    )
-                )
-            out = np.concatenate(out, axis=1)
-        else:
-            out_h = (H + 2*pH - kH)//sH + 1
-            out_w = (W + 2*pW - kW)//sW + 1
-
-            x_cols = im2col_indices(x, kH, kW, pH, sH)
-            x_cols = np.ascontiguousarray(x_cols)
-
+        if groups == 1:
+            # Standard roll: one large matmul
             w_cols = weight.reshape(C_out, -1)
-            w_cols = np.ascontiguousarray(w_cols)
-
             out_cols = w_cols @ x_cols
-            out = out_cols.reshape(C_out, out_h, out_w, N).transpose(3,0,1,2)
+        else:
+            # Grouped convolution: performed as a series of independent convolutions
+            # Output data will be collected here
+            out_cols = np.zeros((C_out, x_cols.shape[1]), dtype=x.dtype)
+            
+            # Channel sizes per group
+            C_out_per_group = C_out // groups
+            C_in_per_group = C_in // groups
+            
+            # Size of one group in expanded scales and inputs
+            w_group_size = C_out_per_group * (C_in_per_group * kH * kW)
+            x_group_size = C_in_per_group * kH * kW
+
+            w_reshaped = weight.reshape(groups, C_out_per_group, -1)
+            x_cols_reshaped = x_cols.reshape(groups, x_group_size, -1)
+            
+            # Perform matmul for each group separately
+            out_cols_reshaped = np.matmul(w_reshaped, x_cols_reshaped)
+            
+            # Collect the result back into a single matrix
+            out_cols = out_cols_reshaped.reshape(C_out, -1)
+
+        # Convert columns back to image format
+        out = out_cols.reshape(C_out, out_h, out_w, N).transpose(3, 0, 1, 2)
 
         if bias is not None:
             out += bias.reshape(1, -1, 1, 1)
@@ -1084,16 +1096,21 @@ class NacKernelBase:
             
         return (grad_input, grad_weight, grad_bias)
 
-    def _col2im_indices(self, cols, x_shape, field_height, field_width, padding=1, stride=1):
+    def _col2im_indices(self, cols, x_shape, field_height, field_width, padding=1, stride=1, dilation=1):
         N, C, H, W = x_shape
-        H_padded, W_padded = H + 2 * padding, W + 2 * padding
+        pH, pW = padding if isinstance(padding, (tuple, list)) else (padding, padding)
+        H_padded, W_padded = H + 2 * pH, W + 2 * pW
         x_padded = np.zeros((N, C, H_padded, W_padded), dtype=cols.dtype)
-        k, i, j = get_im2col_indices_cached(x_shape, field_height, field_width, padding, stride)
+        k, i, j = get_im2col_indices_cached(x_shape, field_height, field_width, padding, stride, dilation)
         cols_reshaped = cols.reshape(C * field_height * field_width, -1, N).transpose(2, 0, 1)
         np.add.at(x_padded, (slice(None), k, i, j), cols_reshaped)
-        if padding > 0:
-            return x_padded[:, :, padding:-padding, padding:-padding]
-        return x_padded
+        
+        res = x_padded
+        if pH > 0:
+            res = res[:, :, pH:-pH, :]
+        if pW > 0:
+            res = res[:, :, :, pW:-pW]
+        return res
 
     def op_aten_convolution_backward_default(self, grad_output, input, weight, bias_sizes, stride, padding, dilation, transposed, output_padding, groups, output_mask):
         grad_input = grad_weight = grad_bias = None
@@ -1104,10 +1121,11 @@ class NacKernelBase:
             N, C_out, H_out, W_out = grad_output.shape
             _, C_in, H_in, W_in = input.shape
             kH, kW = weight.shape[2], weight.shape[3]
-            sH, sW = stride
-            pH, pW = padding
+            sH, sW = stride if isinstance(stride, (tuple, list)) else (stride, stride)
+            pH, pW = padding if isinstance(padding, (tuple, list)) else (padding, padding)
+            dH, dW = dilation if isinstance(dilation, (tuple, list)) else (dilation, dilation)
             
-            x_cols = im2col_indices(input, kH, kW, padding=pH, stride=sH)
+            x_cols = im2col_indices(input, kH, kW, padding=(pH, pW), stride=(sH, sW), dilation=(dH, dW))
             grad_out_reshaped = grad_output.transpose(1, 0, 2, 3).reshape(C_out, -1)
             
             if output_mask[1]:
@@ -1117,7 +1135,7 @@ class NacKernelBase:
             if output_mask[0]:
                 w_reshaped = weight.reshape(C_out, -1)
                 dx_cols = w_reshaped.T @ grad_out_reshaped
-                grad_input = self._col2im_indices(dx_cols, input.shape, kH, kW, padding=pH, stride=sH)
+                grad_input = self._col2im_indices(dx_cols, input.shape, kH, kW, padding=(pH, pW), stride=(sH, sW), dilation=(dH, dW))
                 
         return (grad_input, grad_weight, grad_bias)
 
@@ -1170,6 +1188,39 @@ class NacKernelBase:
         out = np.empty_like(x)
         out.fill(value)
         return out
+
+    def op_aten_hardsigmoid_default(self, x):
+        """
+        PyTorch Hardsigmoid: max(0, min(6, x + 3)) / 6
+        """
+        x = np.asarray(x)
+        return np.clip(x + 3.0, 0.0, 6.0) / 6.0
+
+    def op_aten_hardswish_default(self, x):
+        """
+        PyTorch Hardswish: x * hardsigmoid(x)
+        """
+        x = np.asarray(x)
+        return x * np.clip(x + 3.0, 0.0, 6.0) / 6.0
+
+    def op_aten_hardswish_backward_default(self, grad_output, x):
+        """
+        Производная для Hardswish (нужна для TRNG).
+        x < -3: 0
+        x >= 3: 1
+        -3 <= x < 3: (2x + 3) / 6
+        """
+        grad_output = np.asarray(grad_output)
+        x = np.asarray(x)
+        
+        grad_x = np.zeros_like(x)
+        mask_high = x >= 3.0
+        mask_mid = (x > -3.0) & (x < 3.0)
+        
+        grad_x[mask_high] = 1.0
+        grad_x[mask_mid] = (2.0 * x[mask_mid] + 3.0) / 6.0
+        
+        return grad_output * grad_x
 
     def op_aten_native_group_norm_backward_default(self, dY, X, mean, rstd, weight, N, C, HxW, groups, output_mask):
         dY_reshaped = dY.reshape(N, groups, C // groups, -1)
