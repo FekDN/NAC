@@ -53,19 +53,21 @@ def inspect_nac_file(filepath: str):
         # --- Quantization and Storage ---
         quant_id = struct.unpack('<B', f.read(1))[0]
         weights_stored_internally = (quant_id & 0x80) > 0
-        quant_method_id = quant_id & 0x7F
+        has_trng = (quant_id & 0x40) > 0
+        quant_method_id = quant_id & 0x3F
         quant_map = {0:'none', 1:'FP16', 2:'INT8_TENSOR', 3:'INT8_CHANNEL', 4:'BLOCK_FP8'}
         quant_method = quant_map.get(quant_method_id, f'UNKNOWN ({quant_method_id})')
         storage_method = "Internal" if weights_stored_internally else "External (.safetensors)"
         print(f"Quantization: {quant_method}")
         print(f"Weights Storage: {storage_method}")
+        print(f"Training Graph (TRNG): {'Present' if has_trng else 'Absent'}")
         
         # --- IO Counts ---
         num_inputs, num_outputs, reserved = struct.unpack('<HHB', f.read(5))
         print(f"IO Counts: {num_inputs} Inputs, {num_outputs} Outputs")
 
         # --- Section Offsets ---
-        offsets_header_format = '<H9Q4x' 
+        offsets_header_format = '<H10Q'
         header_bytes = f.read(struct.calcsize(offsets_header_format))
         
         unpacked_header = struct.unpack(offsets_header_format, header_bytes)
@@ -73,7 +75,7 @@ def inspect_nac_file(filepath: str):
         offsets = unpacked_header[1:]
         
         mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, \
-        proc_off, orch_off, rsrc_off = offsets
+        proc_off, orch_off, trng_off, rsrc_off = offsets
         
         print(f"Model Dimension (d_model): {d_model}")
 
@@ -85,8 +87,9 @@ def inspect_nac_file(filepath: str):
         print(f"  - PERM Section:     Starts at byte {perm_off}")
         print(f"  - DATA Section:     Starts at byte {data_off}")
         print(f"  - PROC Section:     Starts at byte {proc_off} (Tokenizer Manifest)")
-        print(f"  - RSRC Section:     Starts at byte {rsrc_off} (Internal Resources)")
         print(f"  - ORCH Section:     Starts at byte {orch_off} (MEP Orchestrator)")
+        print(f"  - TRNG Section:     Starts at byte {trng_off} (Training Graph)" + (" [PRESENT]" if trng_off > 0 else " [ABSENT]"))
+        print(f"  - RSRC Section:     Starts at byte {rsrc_off} (Internal Resources)")
 
         # --- 1. Read Memory Map (MMAP) ---
         print("\n--- Memory Map (MMAP) ---")
@@ -95,18 +98,19 @@ def inspect_nac_file(filepath: str):
             if f.read(4) != b'MMAP': print("Error: MMAP tag mismatch.")
             else:
                 num_records = struct.unpack('<I', f.read(4))[0]
-                print(f"Found {num_records} memory management records:")
-                
-                action_map = {10: 'SAVE_RESULT', 20: 'FREE', 30: 'FORWARD', 40: 'PRELOAD'}
-                
+                action_map = {10: 'SAVE_RESULT', 15: 'SAVE_FOR_GRAD', 20: 'FREE', 25: 'FREE_AFTER_TRNG', 30: 'FORWARD', 40: 'PRELOAD'}
+                action_counts = {}
+                save_for_grad_count = 0
+                free_after_trng_count = 0
                 for _ in range(num_records):
-                    instr_id, num_cmds = struct.unpack('<HB', f.read(3))
-                    cmds_str = []
+                    _, num_cmds = struct.unpack('<HB', f.read(3))
                     for _ in range(num_cmds):
-                        action_code, target_id = struct.unpack('<BH', f.read(3))
-                        action_str = action_map.get(action_code, f'UNK({action_code})')
-                        cmds_str.append(f"{action_str} -> {target_id}")
-                    print(f"  - On Tick {instr_id:<4}: " + ", ".join(cmds_str))
+                        action_code, _ = struct.unpack('<BH', f.read(3))
+                        name = action_map.get(action_code, f'UNK({action_code})')
+                        action_counts[name] = action_counts.get(name, 0) + 1
+                print(f"Total records: {num_records}")
+                for action, count in sorted(action_counts.items()):
+                    print(f"  {action}: {count}")
         else:
             print("No MMAP section found.")
 
@@ -332,7 +336,11 @@ def inspect_nac_file(filepath: str):
                         0x59: "SYS_COPY",           0x5F: "SYS_DEBUG_PRINT",
                         0x60: "MATH_UNARY",         0x61: "MATH_BINARY",
                         0x62: "MATH_AGGREGATE",     0x68: "LOGIC_COMPARE",
+                        0x70: "ANALYSIS_TOP_K",     0x71: "ANALYSIS_SAMPLE",
                         0x80: "MODEL_RUN_STATIC",
+                        0x82: "MODEL_TRAIN_STEP",   # MEP v1.1
+                        0x83: "MODEL_ZERO_GRAD",    # MEP v1.1
+                        0x85: "MODEL_SAVE_WEIGHTS", # MEP v1.1
                         0xA0: "FLOW_LOOP_START",    0xA1: "FLOW_LOOP_END",
                         0xA8: "FLOW_BRANCH_IF",     0xA9: "FLOW_BREAK_LOOP_IF",
                         0xE0: "SERIALIZE_OBJECT",   0xF0: "IO_WRITE",
@@ -351,6 +359,8 @@ def inspect_nac_file(filepath: str):
                             0x02:5, 0x04:4, 0x10:4, 0x11:5, 0x12:5, 0x13:4, 0x1F:3,
                             0x20:4, 0x21:4, 0x22:5, 0x30:5, 0x3B:4,
                             0x59:3, 0x5F:4, 0x60:4, 0x61:5, 0x62:4, 0x68:5,
+                            0x70:5, 0x71:5,
+                            0x83:2, 0x85:4,  # MEP v1.1: MODEL_ZERO_GRAD, MODEL_SAVE_WEIGHTS
                             0xA0:3, 0xA1:4, 0xA8:5, 0xA9:5, 0xE0:4, 0xF0:5,
                             0xFF:1,
                         }
@@ -371,6 +381,11 @@ def inspect_nac_file(filepath: str):
                             n_in  = bytecode[ip+2] if ip+2 < len(bytecode) else 0
                             n_out = bytecode[ip+3+n_in] if ip+3+n_in < len(bytecode) else 0
                             ip += 4 + n_in + n_out
+                        elif flag == 0x82:   # MODEL_TRAIN_STEP (MEP v1.1): variable
+                            # layout: flag(1)+model_id(1)+loss_type(1)+count_in(1)+in_keys+count_target(1)+target_keys+out_loss_key(1)
+                            n_in     = bytecode[ip+3] if ip+3 < len(bytecode) else 0
+                            n_target = bytecode[ip+4+n_in] if ip+4+n_in < len(bytecode) else 0
+                            ip += 6 + n_in + n_target
                         elif flag == 0xFE:   # EXEC_RETURN
                             count = bytecode[ip+1] if ip+1 < len(bytecode) else 0
                             ip += 2 + count
@@ -383,6 +398,97 @@ def inspect_nac_file(filepath: str):
                             print(f"  [{cid:3d}] {repr(orch_consts[cid])}")
         else:
             print("No ORCH section found (file compiled without MEP plan).")
+
+        # --- 9. Read Training Graph (TRNG) ---
+        print("\n--- Training Graph (TRNG) ---")
+        if trng_off > 0:
+            f.seek(trng_off)
+            if f.read(4) != b'TRNG':
+                print("Error: TRNG section tag mismatch.")
+            else:
+                num_trng_ops = struct.unpack('<I', f.read(4))[0]
+                print(f"Instructions: {num_trng_ops} (Backward Pass + Optimizer Steps)")
+
+                # Scan for <INPUT B=1> (trainable params) and <INPUT B=4> (optimizer states)
+                # without full disassembly — use DATA param_names already read above.
+                # Count ops by A-code to show composition summary.
+                trng_perms_local: dict = {}
+                if perm_off > 0:
+                    f.seek(perm_off); f.read(4)
+                    for _ in range(struct.unpack('<I', f.read(4))[0]):
+                        pid, plen = struct.unpack('<HB', f.read(3))
+                        trng_perms_local[pid] = f.read(plen).decode('utf-8')
+
+                CODE_TO_CATEGORY_LOCAL = {
+                    'Q':'offset','K':'offset','V':'offset','M':'offset',
+                    'B':'offset','W':'offset','T':'offset','P':'offset',
+                    'S':'const','A':'const','f':'const','i':'const',
+                    'b':'const','s':'const','c':'const',
+                }
+
+                f.seek(trng_off + 8)
+                trainable_params = []
+                optimizer_states = []
+                saved_activations = []
+                op_name_counts: dict = {}
+                parse_ok = True
+
+                for t_idx in range(num_trng_ops):
+                    A, B = struct.unpack('<BB', f.read(2))
+                    op_label = base_ops.get(A) or custom_ops.get(A) or f"op_{A}"
+                    op_name_counts[op_label] = op_name_counts.get(op_label, 0) + 1
+
+                    if A < 10:  # Special ops — fixed parse
+                        if op_label == "<INPUT>" and B in (1, 2, 3, 4):
+                            C = list(struct.unpack('<2h', f.read(4)))
+                            param_id = C[1] if len(C) > 1 else -1
+                            pname = param_names.get(param_id, f'<id {param_id}>')
+                            if B == 1:
+                                trainable_params.append(pname)
+                            elif B == 4:
+                                optimizer_states.append(pname)
+                            elif B == 3:
+                                saved_activations.append(f"OPS[{param_id}]")
+                        elif op_label == "<o>":
+                            f.read((num_outputs + 1) * 2 + num_outputs * 2)
+                    else:  # Regular ops — skip C+D using perm
+                        perm_str = trng_perms_local.get(B, "")
+                        num_consts_in_perm = sum(1 for p in perm_str if CODE_TO_CATEGORY_LOCAL.get(p) == 'const')
+                        if num_consts_in_perm > 0:
+                            try:
+                                num_c, = struct.unpack('<h', f.read(2))
+                                if num_c > 0:
+                                    f.read(num_c * 2)
+                            except struct.error:
+                                parse_ok = False; break
+                        nD = len(perm_str)
+                        if nD > 0:
+                            try:
+                                f.read(nD * 2)
+                            except struct.error:
+                                parse_ok = False; break
+
+                if not parse_ok:
+                    print("  [Warning: parse stopped early — some ops have unregistered permutations]")
+
+                if trainable_params:
+                    unique_params = list(dict.fromkeys(trainable_params))
+                    print(f"Trainable parameters ({len(unique_params)}):")
+                    for p in unique_params:
+                        print(f"  - {p}")
+                if optimizer_states:
+                    unique_states = list(dict.fromkeys(optimizer_states))
+                    print(f"Optimizer states ({len(unique_states)}): {', '.join(unique_states[:5])}" +
+                          (f" ... +{len(unique_states)-5} more" if len(unique_states) > 5 else ""))
+                if saved_activations:
+                    print(f"Saved activations referenced from OPS: {len(saved_activations)}")
+
+                if op_name_counts:
+                    print("Op composition:")
+                    for name, cnt in sorted(op_name_counts.items(), key=lambda x: -x[1]):
+                        print(f"  {name}: {cnt}")
+        else:
+            print("No TRNG section found (file compiled for inference only).")
 
     print("\n" + "="*20 + f" INSPECTION COMPLETE " + "="*20 + "\n")
 

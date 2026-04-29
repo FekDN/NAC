@@ -1,3 +1,5 @@
+# --- START OF FILE NAC_reconstructor.py ---
+
 # Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import os
@@ -24,10 +26,12 @@ class Reconstructor:
         self.constants: Dict[int, Any] = {}
         self.permutations: Dict[int, Tuple[str, ...]] = {}
         self.parsed_nodes: List[Dict[str, Any]] = []
+        self.parsed_trng_nodes: List[Dict[str, Any]] = []
         self.loaded_param_data: Dict[int, Union[torch.Tensor, Tuple[torch.Tensor, Dict]]] = {}
         self.global_var_map: Dict[int, str] = {}
         self.quantization_method: str = "none"
         self.weights_stored_internally: bool = True
+        self.has_trng: bool = False
         self.io_counts: Tuple[int, int] = (0, 0)
         self.d_model: int = 0
         self.param_id_to_name: Dict[int, str] = {}
@@ -44,7 +48,11 @@ class Reconstructor:
         self.id_to_canonical = { 2: "<INPUT>", 3: "<OUTPUT>", 6: "<CONTROL_FLOW>", 7: "<CONVERGENCE>" }
         self.id_to_canonical.update(NAC_OPS)
         
-        self.code_to_action: Dict[int, str] = {10: 'SAVE_RESULT', 20: 'FREE', 30: 'FORWARD', 40: 'PRELOAD'}
+        self.code_to_action: Dict[int, str] = {
+            10: 'SAVE_RESULT', 15: 'SAVE_FOR_GRAD',
+            20: 'FREE',        25: 'FREE_AFTER_TRNG',
+            30: 'FORWARD',     40: 'PRELOAD',
+        }
 
     def _map_enum_to_dtype_str(self, enum: int) -> str:
         return {
@@ -54,8 +62,19 @@ class Reconstructor:
 
     def _infer_special_cd_lengths(self, A: int, B: int) -> Tuple[int, int]:
         op_name = self.id_to_canonical.get(A)
-        if op_name == "<INPUT>": return (2 if B in (1, 2, 3) else 0), 0
-        if op_name == "<OUTPUT>": num_outputs = self.io_counts[1]; return num_outputs + 1, num_outputs
+        if op_name == "<INPUT>": 
+            # --- FIX: Универсально для TRNG. Все типы 1-6 имеют префикс длины (nC=2). ---
+            if B in (1, 2, 3, 4, 5, 6): return 2, 0  # [len_prefix, id]
+            return 0, 0
+        if op_name == "<OUTPUT>": 
+            if B in (0, 1): # Standard output
+                num_outputs = self.io_counts[1]
+                return num_outputs + 1, num_outputs
+            # --- FIX: Учтены измененные размеры C и D в TRNG (Fused SGD). ---
+            if B == 2: return 2, 1  # Write Weight: C=[1, param_id], D=[offset]
+            if B == 3: return 2, 2  # Fused SGD step: C=[1, param_id], D=[grad, lr]
+            if B == 4: return 0, 1  # Return TRNG:  C=[], D=[offset]
+            return 0, 0
         if op_name == "<CONTROL_FLOW>": return 3, 1
         if op_name == "<CONVERGENCE>": return (-1, -1) # Dynamic length
         return 0, 0
@@ -70,7 +89,7 @@ class Reconstructor:
             if nD > 0: D = list(struct.unpack(f'<{nD}h', f.read(nD * 2)))
         else:  # Regular ops
             perm = self.permutations.get(B)
-            if perm:
+            if perm is not None:
                 num_consts_in_perm = sum(1 for p in perm if self.CODE_TO_CATEGORY.get(p) == 'const')
                 if num_consts_in_perm > 0:
                     num_consts_from_c, = struct.unpack('<h', f.read(2))
@@ -85,39 +104,56 @@ class Reconstructor:
     def _load_nac_file(self, nac_path: str):
         print(f"Loading self-contained binary NAC file: {nac_path}")
         with open(nac_path, 'rb') as f:
-            # --- HEADER ---
             if f.read(3) != b'NAC': raise ValueError("'NAC' magic bytes not found.")
             version, quant_byte = struct.unpack('<BB', f.read(2))
-            if version != 1: raise ValueError(f"Unsupported NAC version {version}.")
+            if version not in (1, 2):
+                raise ValueError(f"Unsupported NAC version {version}. Supported: 1 (v1.6), 2 (v1.7).")
             
             self.weights_stored_internally = (quant_byte & 0x80) != 0
+            self.has_trng = (quant_byte & 0x40) != 0
             quant_map = {0: 'none', 1: 'FP16', 2: 'INT8_TENSOR', 3: 'INT8_CHANNEL', 4: 'BLOCK_FP8'}
-            self.quantization_method = quant_map.get(quant_byte & 0x7F, 'unknown')
+            self.quantization_method = quant_map.get(quant_byte & 0x3F, 'unknown')
             
             num_inputs, num_outputs, _ = struct.unpack('<HHB', f.read(5))
             self.io_counts = (num_inputs, num_outputs)
             
-            offsets_header_format = '<H9Q4x' 
+            if version >= 2:
+                offsets_header_format = '<H10Q'
+            else:
+                offsets_header_format = '<H9Q4x'
             header_bytes = f.read(struct.calcsize(offsets_header_format))
-            self.d_model, *offsets = struct.unpack(offsets_header_format, header_bytes)
-        
-            mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, orch_off, rsrc_off = offsets
-            print(f"NAC v{version}, d_model: {self.d_model}, Quant: '{self.quantization_method}', IO: {self.io_counts}, Weights: {'Internal' if self.weights_stored_internally else 'External'}, ORCH: {'yes' if orch_off > 0 else 'no'}")
+            unpacked = struct.unpack(offsets_header_format, header_bytes)
+            self.d_model = unpacked[0]
+            offsets = unpacked[1:]
+
+            if version >= 2:
+                mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, orch_off, trng_off, rsrc_off = offsets
+            else:
+                mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, orch_off, rsrc_off = offsets
+                trng_off = 0
+
+            print(f"NAC v{version}, d_model: {self.d_model}, Quant: '{self.quantization_method}', "
+                  f"IO: {self.io_counts}, Weights: {'Internal' if self.weights_stored_internally else 'External'}, "
+                  f"ORCH: {'yes' if orch_off > 0 else 'no'}, TRNG: {'yes' if trng_off > 0 else 'no'}")
 
             # --- MMAP ---
             if mmap_off > 0:
-                f.seek(mmap_off); f.read(4)
+                f.seek(mmap_off)
+                if f.read(4) != b'MMAP': print("Warning: MMAP tag mismatch")
                 for _ in range(struct.unpack('<I', f.read(4))[0]):
                     instr_id, num_commands = struct.unpack('<HB', f.read(3))
                     self.memory_map[instr_id] = [{'action': self.code_to_action.get(c, f'UK_{c}'), 'target_id': t} for c, t in [struct.unpack('<BH', f.read(3)) for _ in range(num_commands)]]
 
             # --- CMAP, CNST, PERM ---
             if cmap_off > 0:
-                f.seek(cmap_off); f.read(4)
+                f.seek(cmap_off)
+                if f.read(4) != b'CMAP': print("Warning: CMAP tag mismatch")
                 for _ in range(struct.unpack('<I', f.read(4))[0]):
                     op_id, name_len = struct.unpack('<HB', f.read(3)); self.id_to_canonical[op_id] = f.read(name_len).decode('utf-8')
+            
             if cnst_off > 0:
-                f.seek(cnst_off); f.read(4)
+                f.seek(cnst_off)
+                if f.read(4) != b'CNST': print("Warning: CNST tag mismatch")
                 for _ in range(struct.unpack('<I', f.read(4))[0]):
                     const_id, type_code, length = struct.unpack('<HBH', f.read(5)); val = None
                     if type_code == 1: val = struct.unpack('<?', f.read(length))[0]
@@ -127,19 +163,24 @@ class Reconstructor:
                     elif type_code == 5: val = list(struct.unpack(f'<{length}i', f.read(length * 4)))
                     elif type_code == 6: val = list(struct.unpack(f'<{length}f', f.read(length * 4)))
                     self.constants[const_id] = val
+            
             if perm_off > 0:
-                f.seek(perm_off); f.read(4)
+                f.seek(perm_off)
+                if f.read(4) != b'PERM': print("Warning: PERM tag mismatch")
                 for _ in range(struct.unpack('<I', f.read(4))[0]):
-                    p_id, p_len = struct.unpack('<HB', f.read(3)); self.permutations[p_id] = tuple(f.read(p_len).decode('utf-8'))
+                    p_id, p_len = struct.unpack('<HB', f.read(3))
+                    self.permutations[p_id] = tuple(f.read(p_len).decode('utf-8'))
 
             # --- OPS ---
             if ops_off > 0:
-                f.seek(ops_off); f.read(4)
+                f.seek(ops_off)
+                if f.read(4) != b'OPS ': print("Warning: OPS tag mismatch")
                 self.parsed_nodes = [self._read_op(f) for _ in range(struct.unpack('<I', f.read(4))[0])]
 
             # --- DATA ---
             if data_off > 0:
-                f.seek(data_off); f.read(4)
+                f.seek(data_off)
+                if f.read(4) != b'DATA': print("Warning: DATA tag mismatch")
                 for _ in range(struct.unpack('<I', f.read(4))[0]):
                     p_id, name_len = struct.unpack('<HH', f.read(4)); self.param_id_to_name[p_id] = f.read(name_len).decode('utf-8')
                 for _ in range(struct.unpack('<I', f.read(4))[0]):
@@ -151,7 +192,7 @@ class Reconstructor:
                     for _ in range(num_tensors):
                         p_id, meta_len, data_len = struct.unpack('<HIQ', f.read(14))
                         meta_bytes = f.read(meta_len)
-                        f.seek(data_len, 1) # Skip the tensor data
+                        f.seek(data_len, 1) 
 
                         meta_offset = 0; metadata = {}
                         dtype_id, rank = struct.unpack_from('<BB', meta_bytes, meta_offset); meta_offset += 2
@@ -188,22 +229,29 @@ class Reconstructor:
                         dummy_tensor = torch.empty(0)
                         self.loaded_param_data[p_id] = (dummy_tensor, metadata)
 
-        # Store orch_off so reconstruct can report it
         self._orch_off = orch_off
+        self._trng_off = trng_off
         self._nac_path = nac_path
 
-        print(f"Successfully loaded {len(self.parsed_nodes)} ops, {len(self.memory_map)} MMAP records, and metadata for {len(self.loaded_param_data)} tensors.")
+        print(f"Successfully loaded {len(self.parsed_nodes)} OPS, {len(self.memory_map)} MMAP records, "
+              f"metadata for {len(self.loaded_param_data)} tensors.")
+
+        # --- TRNG ---
+        if trng_off > 0:
+            with open(nac_path, 'rb') as _f:
+                _f.seek(trng_off)
+                if _f.read(4) == b'TRNG':
+                    num_trng = struct.unpack('<I', _f.read(4))[0]
+                    self.parsed_trng_nodes = [self._read_op(_f) for _ in range(num_trng)]
+                    print(f"Training graph (TRNG): {len(self.parsed_trng_nodes)} instructions loaded.")
+
         if orch_off > 0:
             with open(nac_path, 'rb') as _f:
                 _f.seek(orch_off)
                 if _f.read(4) == b'ORCH':
-                    # Format: bytecode_len(4) + const_count(4) written BEFORE bytecode
                     _bytecode_len, _const_count = struct.unpack('<II', _f.read(8))
                     if _bytecode_len > 0:
                         print(f"MEP Orchestrator plan: {_bytecode_len} bytes bytecode, {_const_count} constants.")
-                    else:
-                        print("MEP Orchestrator plan: empty stub (no plan compiled).")
-
 
     def reconstruct_from_nac_file(self, nac_path: str, show_mmap: bool = False) -> Tuple[str, str]:
         try:
@@ -211,7 +259,6 @@ class Reconstructor:
         except Exception as e:
             print(f"FATAL ERROR loading or parsing NAC file: {e}"); traceback.print_exc(); return "", ""
 
-        print("\n--- Reconstructing from loaded NAC data ---")
         lines = []
         action_priority = {'FORWARD': 0, 'FREE': 1, 'SAVE_RESULT': 2, 'PRELOAD': 3}
         user_inputs_info = []
@@ -228,14 +275,21 @@ class Reconstructor:
                     line = f"{var_name} = user_input(name='{name}')"
                     user_inputs_info.append(f"  - Input index {i}: name='{name}'")
                 elif B == 1:
-                    param_id = C[1]; param_name = self.param_id_to_name.get(param_id, '<UNKNOWN>')
+                    param_id = C[1] if len(C)>1 else C[0]; param_name = self.param_id_to_name.get(param_id, '<UNKNOWN>')
                     param_info = f"name='{param_name}'"
                     if param_id in self.loaded_param_data:
                         _, metadata = self.loaded_param_data[param_id]
-                        param_info += f", {', '.join(f'{k}={v}' for k, v in metadata.items())}"
+                        meta_parts = []
+                        for k, v in metadata.items():
+                            if k == 'scales':
+                                meta_parts.append(f"scales=[...×{len(v)}]")
+                            else:
+                                meta_parts.append(f"{k}={v}")
+                        param_info += f", {', '.join(meta_parts)}"
                     line = f"{var_name} = load_param({param_info})"
                 elif B == 3:
-                    const_val = self.constants.get(C[1])
+                    const_id = C[1] if len(C)>1 else C[0]
+                    const_val = self.constants.get(const_id)
                     line = f"{var_name} = lifted_constant(value={repr(const_val)})"
                     user_inputs_info.append(f"  - Input index {i}: name='lifted_constant', value={repr(const_val)}")
             elif op_name == "<OUTPUT>":
@@ -244,17 +298,13 @@ class Reconstructor:
             else: 
                 final_args = []
                 perm = self.permutations.get(B)
-                if perm:
+                if perm is not None:
                     c_iter = iter(C[1:] if C and C[0] > 0 else [])
-                    
-                    const_markers_in_D = [idx for idx, val in enumerate(D) if val == 0]
-                    const_marker_iter = iter(const_markers_in_D)
-                    
-                    for d_idx, d_val in enumerate(D):
+                    for d_val in D:
                         if d_val != 0:
                             final_args.append(self.global_var_map.get(i + d_val, f"v{i+d_val}_<ERR>"))
                         else:
-                            const_id = next(c_iter)
+                            const_id = next(c_iter, None)
                             final_args.append(repr(self.constants.get(const_id, f"<CONST_ERR_{const_id}>")))
                 
                 args_str = ", ".join(final_args)
@@ -267,6 +317,104 @@ class Reconstructor:
             lines.append("  " + line)
             
         return "\n".join(lines), "\n".join(sorted(user_inputs_info))
+
+    def _reconstruct_trng(self) -> str:
+        if not self.parsed_trng_nodes:
+            return ""
+
+        INPUT_B_NAMES = {
+            0: "user_input",
+            1: "param",
+            2: "kv_state",
+            3: "lifted_constant",
+            4: "saved_activation_from_OPS",
+            5: "target_data",
+            6: "optimizer_state",
+        }
+        OUTPUT_B_NAMES = {
+            2: "write_updated_weight_to_DATA",
+            3: "fused_sgd_step",
+            4: "return_trng",
+        }
+
+        lines = []
+        trng_var_map: Dict[int, str] = {}
+
+        for t_idx, node in enumerate(self.parsed_trng_nodes):
+            var_name = f"t{t_idx}"
+            trng_var_map[t_idx] = var_name
+            A, B, C, D = node['A'], node['B'], node['C'], node['D']
+            op_name = self.id_to_canonical.get(A, f"<UNKNOWN_OP_{A}>")
+            line = ""
+
+            if op_name == "<INPUT>":
+                subtype = INPUT_B_NAMES.get(B, f"subtype_{B}")
+                if B in (1, 6) and C:
+                    param_id = C[1] if len(C) > 1 else C[0]
+                    param_name = self.param_id_to_name.get(param_id, f"<param_{param_id}>")
+                    if B == 6:
+                        line = f"{var_name} = load_optimizer_state(param='{param_name}')"
+                    else:
+                        line = f"{var_name} = load_param(name='{param_name}')"
+                elif B == 3 and C:
+                    const_id = C[1] if len(C) > 1 else C[0]
+                    const_val = self.constants.get(const_id, f"<CONST_ERR_{const_id}>")
+                    line = f"{var_name} = lifted_constant(value={repr(const_val)})"
+                elif B == 4 and C:
+                    ops_idx = C[1] if len(C) > 1 else C[0]
+                    ops_var = self.global_var_map.get(ops_idx, f"v{ops_idx}")
+                    line = f"{var_name} = saved_activation_from_OPS[{ops_idx}]  # = {ops_var}"
+                elif B == 5 and C:
+                    target_idx = C[1] if len(C) > 1 else C[0]
+                    line = f"{var_name} = target_data(target_idx={target_idx})"
+                else:
+                    line = f"{var_name} = {subtype}()"
+
+            elif op_name == "<OUTPUT>":
+                subtype = OUTPUT_B_NAMES.get(B, f"output_subtype_{B}")
+                dep_vars = []
+                for offset in D:
+                    abs_idx = t_idx + offset
+                    if abs_idx >= 0:
+                        dep_vars.append(trng_var_map.get(abs_idx, f"t{abs_idx}"))
+                    else:
+                        dep_vars.append(self.global_var_map.get(t_idx + offset, f"v{t_idx+offset}"))
+                if B in (2, 3) and C:
+                    param_id = C[1] if len(C) > 1 else C[0]
+                    param_name = self.param_id_to_name.get(param_id, f"<param_{param_id}>")
+                    line = f"{subtype}(param='{param_name}', args=[{', '.join(dep_vars)}])"
+                else:
+                    line = f"{subtype}({', '.join(dep_vars)})"
+
+            else:
+                final_args = []
+                perm = self.permutations.get(B)
+                c_iter = iter(C[1:] if C and len(C) > 1 and C[0] > 0 else [])
+                for d_val in D:
+                    if d_val != 0:
+                        abs_idx = t_idx + d_val
+                        if abs_idx >= 0:
+                            final_args.append(trng_var_map.get(abs_idx, f"t{abs_idx}"))
+                        else:
+                            ops_abs = abs_idx + len(self.parsed_nodes)
+                            ops_var = self.global_var_map.get(ops_abs, f"v{ops_abs}")
+                            final_args.append(f"OPS.{ops_var}")
+                    else:
+                        const_id = next(c_iter, None)
+                        if const_id is not None:
+                            final_args.append(repr(self.constants.get(const_id, f"<CONST_{const_id}>")))
+                        else:
+                            final_args.append("<?>")
+
+                if not final_args and perm is None:
+                    line = f"{var_name} = {op_name}(<?> perm_id={B} not in PERM)"
+                else:
+                    args_str = ", ".join(final_args)
+                    line = f"{var_name} = {op_name}({args_str})"
+
+            lines.append("  " + line)
+
+        return "\n".join(lines)
 
 def reconstruct_from_file(nac_filepath: str, show_mmap: bool = False):
     print("\n" + "="*20 + f" RECONSTRUCTION OF {os.path.basename(nac_filepath)} " + "="*20)
@@ -282,12 +430,12 @@ def reconstruct_from_file(nac_filepath: str, show_mmap: bool = False):
         print(f"Model Dimension (d_model): {reconstructor.d_model}")
         print(f"Quantization Method: {reconstructor.quantization_method}")
         print(f"Total User Inputs: {reconstructor.io_counts[0]}")
+        trng_off = getattr(reconstructor, '_trng_off', 0)
         orch_off = getattr(reconstructor, '_orch_off', 0)
         if orch_off > 0:
             with open(nac_filepath, 'rb') as _f:
                 _f.seek(orch_off)
                 if _f.read(4) == b'ORCH':
-                    # Format: bytecode_len(4) + const_count(4) written BEFORE bytecode
                     _blen, _cc = struct.unpack('<II', _f.read(8))
                     if _blen > 0:
                         print(f"MEP Plan: {_blen} bytes bytecode, {_cc} constants (run NAC_info.py for full disassembly)")
@@ -296,13 +444,23 @@ def reconstruct_from_file(nac_filepath: str, show_mmap: bool = False):
         else:
             print("MEP Plan: none (file compiled without MEP plan)")
 
+        trng_code = reconstructor._reconstruct_trng()
+        has_trng_section = trng_off > 0 and bool(trng_code)
+        print(f"Training Graph (TRNG): {'Present' if has_trng_section else 'Absent'} "
+              f"({len(reconstructor.parsed_trng_nodes)} instructions)")
+
         if input_summary:
             print("\n--- User Input Summary (in order of execution) ---")
             print(input_summary)
 
-        print("\n--- Reconstructed Pseudo-code ---")
+        print("\n--- Reconstructed Forward Pseudo-code (OPS) ---")
         print(pseudo_code)
         print("-" * 30)
+
+        if trng_code:
+            print("\n--- Reconstructed Training Pseudo-code (TRNG) ---")
+            print(trng_code)
+            print("-" * 30)
 
 if __name__ == "__main__":
     args = sys.argv[1:]
@@ -312,3 +470,5 @@ if __name__ == "__main__":
     if not args: print("Usage: python NAC_reconstructor.py [-m|--mmap] <path_to_model.nac>"); sys.exit(1)
         
     reconstruct_from_file(nac_filepath=args[0], show_mmap=show_mmap_flag)
+
+# --- END OF FILE NAC_reconstructor.py ---
