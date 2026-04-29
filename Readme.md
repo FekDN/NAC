@@ -26,13 +26,15 @@ This decouples the model's architectural "body" from its parametric "mind," enab
 *   **Generative Architecture Synthesis (NAS):** By learning the statistical "grammar" of AI design from the knowledge base, NAC enables a generative synthesizer that builds new, statistically sound architectures not by random search, but through informed construction.
 *   **Knowledge Transplantation:** By defining a canonical mapping between operations, NAC makes it possible to transfer trained weights ("skills") from a block in one model to a compatible block in another, drastically reducing retraining costs.
 
+### 4. Neuroplasticity and Self-Modifying Binaries
+Unlike static ONNX or TFLite files, a `.nac` container is "alive". It supports in-place binary mutations. During on-device fine-tuning, if a model encounters a new class, the NAC runtime dynamically expands the weight matrices (e.g., adding new neurons to a classification head), recalculates the binary section offsets, and surgically overwrites its own `.nac` file. This brings true biological neuroplasticity to edge devices.
 ---
 
 ## Instructions for use in the `/test/` directory
 
 ---
 
-## Neural Architecture Code (NAC) v1.6 Specification
+## Neural Architecture Code (NAC) v1.7 Specification
 
 The NAC format is designed for the compact, unified, and machine-readable
 representation of neural network computation graphs. Each graph is a sequence
@@ -66,90 +68,73 @@ The NAC standard is built on three fundamental principles:
 *   **Canonization:** Instead of supporting hundreds of operations from deep learning frameworks, NAC reduces them to a small, orthogonal, and stable set of canonical instructions. This significantly simplifies the development and verification of the runtime (especially hardware) and makes the standard resilient to changes in upstream libraries.
 *   **Hardware Orientation:** The entire design, from the simple, sequential ABCD instruction structure to the static nature of the graph, is aimed at direct and efficient implementation in digital logic. The absence of dynamic elements, such as data-dependent control flow (in the current version), makes the graph easily parallelizable and pipelineable at the hardware level.
 
-### 1.4. Versioning (Current Version: 1.6)
+### 1.4. Versioning (Current Version: 1.7)
 
-The current version of the standard is **NAC v1.6**. The version is explicitly stated in the header of the `.nac` file, which ensures backward compatibility and allows for future extensions. Any changes to the header structure, instruction format, or the semantics of system operations will require an increment of the standard's version.
+The current version of the standard is **NAC v1.7**. The version is explicitly stated in the header of the `.nac` file, which ensures backward compatibility and allows for future extensions. Any changes to the header structure, instruction format, or the semantics of system operations will require an increment of the standard's version.
+- Added `TRNG` section for on-device fine-tuning support.
+- Extended MODEL_TRAIN_STEP (0x82) instruction with logits_key, head_weight_name_id, and head_bias_name_id for dynamic architecture expansion.
+- Bit 6 in the header quantization byte now indicates presence of training graph.
+- Improved header structure documentation (92 bytes).
+- Enhanced runtime training capabilities with more universal `run_training_step`.
 
 
 ## 2. Structure of the Binary File (.nac)
 
 ### 2.1. Overall File Layout (Header and Sections)
 
-A `.nac` format file is a binary container with a sequential structure. It begins with a fixed 88-byte header, followed by several sections of variable-length data. The header contains a "table of contents"—absolute offsets from the beginning of the file to the start of each section. This allows the runtime to quickly locate the necessary data without having to scan the entire file sequentially.
+A `.nac` format file is a binary container with a sequential structure. It begins with a fixed 92-byte header, followed by several sections of variable-length data. The header contains a "table of contents"—absolute offsets from the beginning of the file to the start of each section. This allows the runtime to quickly locate the necessary data without having to scan the entire file sequentially.
 
-### 2.2. File Header (88 bytes)
+### 2.2. File Header (92 bytes)
 
-The header has a fixed length and contains essential metadata about the model and the file's structure. All numerical values are stored in Little Endian format.
+The header has a fixed length of **92 bytes** and contains essential metadata. All multi-byte values are stored in **Little Endian** format.
 
 #### 2.2.1. Magic Bytes and Version (4 bytes)
 *   **Offset:** `0`
-*   **Length:** 3 bytes
-*   **Value:** `b'NAC'` (`0x4E`, `0x41`, `0x43`). These serve to quickly identify the file as belonging to the NAC format.
-*   ---
-*   **Offset:** `3`
-*   **Length:** 1 byte
-*   **Type:** `uint8`
-*   **Description:** The version number of the standard. For the current specification, this value is `1`.
+*   **Value:** `b'NAC\x02'` (Magic `'NAC'` + version `2`)
 
-#### 2.2.2. Quantization and Storage Byte (1 byte)
+#### 2.2.2. Quantization and Storage Flags (1 byte)
 *   **Offset:** `4`
-*   **Length:** 1 byte
 *   **Type:** `uint8` (bitfield)
-*   **Description:** This byte encodes two parameters: the quantization method and the weight storage method.
-    *   **Most Significant Bit (bit 7):** Weight storage flag.
-        *   `1` (`0x80`): The model's weights are stored inside this `.nac` file in the `DATA` section.
-        *   `0`: The weights are stored in an external `.safetensors` file, which must have the same name as the `.nac` file and be located in the same directory.
-    *   **Least Significant 7 bits (bits 0-6):** Quantization method ID.
-        *   `0`: No quantization (weights are in `float32` format).
-        *   `1`: `FP16`.
-        *   `2`: `INT8_TENSOR` (per-tensor INT8 quantization).
-        *   `3`: `INT8_CHANNEL` (per-channel INT8 quantization).
-        *   `4`: `BLOCK_FP8` (block-wise FP8 quantization).
+*   **Bits:**
+    *   Bit 7: Weights storage (1 = internal, 0 = external `.safetensors`)
+    *   Bit 6: TRNG section present (1 = training supported)
+    *   Bits 5–0: Quantization method (0=none, 1=FP16, 2=INT8_TENSOR, 3=INT8_CHANNEL, 4=BLOCK_FP8)
 
-#### 2.2.3. Input/Output Counts (5 bytes)
+#### 2.2.3. I/O Counts (5 bytes)
 *   **Offset:** `5`
-*   **Length:** 2 bytes
-*   **Type:** `uint16`
-*   **Description:** The number of user inputs that the model expects during execution.
-*   ---
+*   **Type:** `uint16` — Number of user inputs
 *   **Offset:** `7`
-*   **Length:** 2 bytes
-*   **Type:** `uint16`
-*   **Description:** The number of outputs that the model returns.
-*   ---
+*   **Type:** `uint16` — Number of outputs
 *   **Offset:** `9`
-*   **Length:** 1 byte
-*   **Description:** Reserved for future use, should be `0`.
+*   **Type:** `uint8` — Reserved (must be 0)
 
 #### 2.2.4. Model Dimension `d_model` (2 bytes)
 *   **Offset:** `10`
-*   **Length:** 2 bytes
 *   **Type:** `uint16`
-*   **Description:** The key dimension of the model, typically corresponding to the embedding size or hidden state size in transformers. A value of `0` indicates that it is not defined.
+*   **Description:** Primary model dimension (e.g. hidden size). 0 if not applicable.
 
-#### 2.2.5. Section Offset Table (76 bytes)
-
+#### 2.2.5. Section Offset Table (80 bytes)
 *   **Offset:** `12`
-*   **Length:** 72 bytes (9 offsets of 8 bytes each)
-*   **Type:** `uint64[]`
-*   **Description:** An array of nine 64-bit unsigned integers, each representing the absolute offset (in bytes) from the beginning of the file to the start of the corresponding section. If a section is absent, its offset is `0`. The offsets are stored in the following order:
+*   **Type:** `10 × uint64` (packed as `<10Q`)
+*   **Description:** Absolute byte offsets from the start of the file to each section. `0` means the section is absent.
 
-| Index | Field name       | Section tag | Description                                             |
-|------:|------------------|-------------|---------------------------------------------------------|
-| 0     | `mmap_offset`    | `MMAP`      | Memory Map — coprocessor schedule                       |
-| 1     | `ops_offset`     | `OPS `      | Executable instruction stream                           |
-| 2     | `cmap_offset`    | `CMAP`      | Canonical Map — operation ID → name                     |
-| 3     | `cnst_offset`    | `CNST`      | Constants storage                                       |
-| 4     | `perm_offset`    | `PERM`      | Permutations — signature ID → argument layout string    |
-| 5     | `data_offset`    | `DATA`      | Parameter metadata and optional internal weight tensors |
-| 6     | `proc_offset`    | `PROC`      | Preprocessing — compiled tokenizer manifest             |
-| 7     | `orch_offset`    | `ORCH`      | Orchestrator — MEP bytecode and constant pool           |
-| 8     | `rsrc_offset`    | `RSRC`      | Resources — embedded auxiliary files                    |
+| Index | Field            | Tag    | Description |
+|------:|------------------|--------|-----------|
+| 0     | `mmap_offset`    | MMAP   | Memory Map |
+| 1     | `ops_offset`     | OPS    | Main computation graph |
+| 2     | `cmap_offset`    | CMAP   | Canonical map |
+| 3     | `cnst_offset`    | CNST   | Constants |
+| 4     | `perm_offset`    | PERM   | Permutations |
+| 5     | `data_offset`    | DATA   | Parameters + optional weights |
+| 6     | `proc_offset`    | PROC   | Tokenizer manifest |
+| 7     | `orch_offset`    | ORCH   | MEP Orchestrator plan |
+| 8     | `trng_offset`    | TRNG   | Training Graph (backward + updates) |
+| 9     | `rsrc_offset`    | RSRC   | Embedded resources |
 
-*   ---
-*   **Offset:** `84`
-*   **Length:** 4 bytes
-*   **Description:** Padding. Reserved and should be filled with zeros.
+*   **Offset:** `92`
+*   **Length:** 0 (end of header)
+
+**Note:** Total header size is **92 bytes**. Previous documentation incorrectly stated 88 bytes and used `<H10Q` (82 bytes) for the offsets part.
 
 ### 2.3. Section Structure
 
@@ -157,15 +142,27 @@ The header has a fixed length and contains essential metadata about the model an
 Each section (except for the header) begins with a 4-byte ASCII tag that identifies its type. The section's data immediately follows the tag. This structure allows for easy location and verification of sections when reading the file.
 
 #### 2.3.2. Description of Section Tags
-*   `MMAP`: (*Memory Map*) Contains a schedule of memory management commands for a parallel coprocessor.
-*   `OPS `: Contains the model's executable code—a sequence of instructions in the ABCD format.
-*   `CMAP`: (*Canonical Map*) A table mapping numerical operation IDs to their string-based canonical names.
-*   `CNST`: (*Constants*) A storage for constant values (numbers, strings, lists) used in the graph.
-*   `PERM`: (*Permutations*) A table mapping signature IDs to strings that describe the types and semantics of operation arguments.
-*   `DATA`: Contains metadata about the model's parameters (weights) and inputs. If the internal storage flag is set, the weight tensors themselves are also stored here.
-*   `PROC`: (*Processing*) A section for preprocessing data, primarily for a compiled tokenizer manifest.
-*   `ORCH`: (*Orchestrator*) Contains the compiled MEP (Model Execution Plan) bytecode and its associated constant pool. See Section 9.
-*   `RSRC`: (*Resources*) A storage for auxiliary resources, such as tokenizer vocabularies, merge files, etc.
+
+Each section (except the header) begins with a 4-byte ASCII tag followed by its data. The following sections are currently defined:
+
+| Tag   | Name              | Description |
+|-------|-------------------|-----------|
+| `MMAP` | **Memory Map**    | Schedule of memory management commands for a parallel coprocessor (preload, save, forward, free). Designed to hide memory latency and optimize data locality. |
+| `OPS ` | **Operations**    | Core computation graph — sequence of ABCD instructions representing the forward pass of the model. This is the main executable code of the neural network. |
+| `CMAP` | **Canonical Map** | Mapping from numerical operation IDs (`A` field) to their canonical string names. Used for custom or unmapped operations. Optional. |
+| `CNST` | **Constants**     | Storage for all constant values (scalars, strings, lists) used in the graph. Referenced by ID from the `C` field of instructions. |
+| `PERM` | **Permutations**  | Mapping from signature IDs (`B` field) to argument layout strings. Defines the order, type and semantics of arguments for each operation. |
+| `DATA` | **Data Section**  | Parameter metadata (names, shapes, dtypes) and optional internal storage of weight tensors. Also contains mapping from parameter IDs to human-readable names. |
+| `PROC` | **Processing**    | Preprocessing data, primarily the compiled tokenizer manifest (TISA format). |
+| `ORCH` | **Orchestrator**  | MEP (Model Execution Pipeline) bytecode and its constant pool. High-level execution recipe that orchestrates inference, training, preprocessing and I/O. |
+| `TRNG` | **Training Graph**| **New in v2.0**. Separate optimized graph for on-device training (fine-tuning). Contains backward operations and parameter update logic. Optional. |
+| `RSRC` | **Resources**     | Embedded auxiliary files (tokenizer vocabularies, merges.txt, special tokens, etc.). |
+
+**Important notes:**
+- The `TRNG` section is optional. Its presence is indicated by **bit 6** in the quantization byte of the header.
+- If the `TRNG` section is absent, the model supports only inference.
+- The `ORCH` section provides high-level orchestration via MEP instructions and works in conjunction with the low-level `OPS` graph.
+- Weights can be stored either internally (`DATA` section) or externally (`.safetensors` file with the same base name).
 
 **A Note on Autonomy:** The executable NAC code (`OPS`) does not require all model data (weights, resources) to be stored within a single `.nac` file. The storage flag in the header allows weights to be placed in an external `.safetensors` file, and tokenizer resources can be loaded from an external directory. This flexibility enables the creation of fully autonomous files for small models, as well as efficient handling of large models where weights can occupy tens of gigabytes.
 
@@ -450,6 +447,9 @@ The metadata block is a **compact binary structure**, not JSON. It is parsed seq
 ```
 Total metadata length: 11 bytes.
 
+Note on BLOCK_FP8: 
+When a tensor is quantized using BLOCK_FP8 (code 4), it is flattened into a 1D array to ensure strict memory alignment for hardware accelerators. The original N-dimensional shape is preserved inside the metadata block, allowing the runtime to seamlessly reconstruct the tensor during decoding.
+
 ### 6.2. `PROC` Section (Processing)
 
 #### 6.2.1. Purpose
@@ -594,6 +594,65 @@ Both `Bytecode Length` and `Const Count` are read together as a single 8-byte re
 
 The MEP bytecode operates at a level above `OPS`: it references `OPS` instruction indices as targets, uses the same `DATA` and `CNST` sections for operands, and can encode bulk operations (e.g., "execute block of ops 10–50 in parallel") that are too coarse-grained for the per-instruction `MMAP` schedule. The `ORCH` section complements rather than replaces `MMAP`.
 
+### 9.4. Runtime Patching
+The ORCH bytecode is designed to be dynamically modifiable. The NAC Runtime provides APIs (`patch_mep_instruction`, `patch_instruction_by_ip`) that allow users to safely inject new logic at runtime without recompiling the model. For example, a user can swap an `argmax` operation for a `softmax`, or temporarily override a hyperparameter (like `learning_rate` or `num_epochs`) in the constant pool directly in memory.
+
+## 10. TRNG Section (Training Graph)
+
+### 10.1. Purpose
+
+The `TRNG` section contains a separate, optimized computation graph specifically designed for **on-device training** (fine-tuning). It is generated automatically during compilation from the backward pass extracted via AOTAutograd.
+
+While the main `OPS` section is used for inference, the `TRNG` section provides the minimal set of operations required to:
+- Compute gradients with respect to the model parameters.
+- Perform parameter updates (currently SGD on the final linear layers).
+- Support different loss functions (`loss_type`).
+
+This separation allows the runtime to execute training efficiently without re-executing the entire forward graph unnecessarily, and makes the format more suitable for hardware acceleration on FPGA/ASIC, where training logic can be implemented as a specialized coprocessor.
+
+### 10.2. Section Format
+
+The section begins with the 4-byte ASCII tag `TRNG`, followed by:
+
+| Field                  | Type     | Size (bytes) | Description |
+|------------------------|----------|--------------|-----------|
+| **Section Tag**        | `char[4]`| 4            | ASCII `'T' 'R' 'N' 'G'`. |
+| **Number of Instructions** | `uint32` | 4            | Number of ABCD instructions in the training graph. |
+| **Instructions...**    | `ABCD[]` | variable     | Sequence of training operations in standard ABCD format (see Section 3). |
+
+### 10.3. Key Differences from OPS Section
+
+- **Focus on backward pass**: Contains operations such as `_log_softmax_backward_data`, `nll_loss_backward`, gradient propagation through linear layers, and fused SGD updates.
+- **Simplified structure**: Many intermediate activations are reused from the forward pass (`saved_activation_from_OPS`).
+- **Parameter updates**: Currently implements simple SGD on output linear layers (`fc.weight`, `lm_head.weight`, `classifier.weight`, etc.). Future versions will support selective layer updating and different optimizers via `extra_flags`.
+- **get_item handling**: Special support for unpacking tuples returned by backward functions (e.g., `convolution_backward`, `native_batch_norm_backward`).
+
+### 10.4. Integration with MEP
+
+The training process is orchestrated via the `MODEL_TRAIN_STEP` instruction (0x82) in the MEP plan (ORCH section):
+
+- `loss_type`: 0 = CrossEntropy, 1 = MSE, others fallback to CrossEntropy.
+- `logits_key`: Optional explicit context key for logits.
+- `lr_key`: Context key containing the learning rate value.
+- `weight_name_id` & `bias_name_id`: Constant IDs pointing to the names of the final classification layer (e.g., "fc.weight"). This allows the runtime to dynamically expand the layer if the training target exceeds the current model capacity.
+
+This design allows training to be fully controlled from the high-level MEP recipe without hardcoding model-specific logic in the core runtime.
+
+### 10.5. Current Limitations & Future Extensions
+
+**Current implementation:**
+- Uses Transfer Learning logic: updates only the specified classification head, freezing the deep backbone to ensure extreme speed and low memory footprint on edge devices.
+- Supports basic SGD.
+- Dynamically adds new neurons (classes) to the model if the target ID exceeds the current output dimension.
+
+**Planned extensions:**
+- Support for multiple optimizers (SGD with momentum, Adam, AdamW) via `extra_flags`.
+- Selective layer training (train only head, last N layers, or specific parameter groups).
+- Gradient accumulation and mixed precision.
+- Hardware-friendly micro-operations for FPGA (fused gradient + update kernels).
+
+The TRNG section is optional. If absent (`trng_off = 0`), training is not supported for that model.
+
 ---
 
 ### Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
@@ -605,3 +664,4 @@ The MEP bytecode operates at a level above `OPS`: it references `OPS` instructio
 The source code of this project is licensed under the **GNU General Public License v3.0**. See the `LICENSE` file for details.
 
 The accompanying documentation, including this README and the project's White Paper, is licensed under the **Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License**.
+
