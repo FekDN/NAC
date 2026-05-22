@@ -90,25 +90,32 @@ class NACGraphParser:
         with open(nac_path, 'rb') as f:
             if f.read(3) != b'NAC': raise ValueError("Not a NAC file")
             version, quant_byte = struct.unpack('<BB', f.read(2))
+            
             self.weights_stored_internally = (quant_byte & 0x80) != 0
-            qmap = {0:'none',1:'FP16',2:'INT8_TENSOR',3:'INT8_CHANNEL',4:'BLOCK_FP8'}
-            self.quantization_method = qmap.get(quant_byte & 0x7F, f'q{quant_byte&0x7F}')
+            self.has_trng = (quant_byte & 0x40) != 0
+            
+            # Битовая маска квантования: 0x3F (6 младших бит), т.к. 0x80 (Internal Weights) и 0x40 (TRNG)
+            qmap = {0:'none', 1:'FP16', 2:'INT8_TENSOR', 3:'INT8_CHANNEL', 4:'BLOCK_FP8'}
+            self.quantization_method = qmap.get(quant_byte & 0x3F, f'q{quant_byte&0x3F}')
+            
             n_in, n_out, _ = struct.unpack('<HHB', f.read(5))
             self.io_counts = (n_in, n_out)
 
             hdr_fmt = '<H11Q'
             raw = struct.unpack(hdr_fmt, f.read(struct.calcsize(hdr_fmt)))
             self.d_model = raw[0]
+            
+            # В NAC v1.8 ровно 11 смещений
             mmap_off, ops_off, cmap_off, cnst_off, perm_off, \
-            data_off, proc_off, orch_off, rsrc_off, arrs_off = raw[1:]
+            data_off, proc_off, orch_off, trng_off, rsrc_off, arrs_off = raw[1:]
 
-            if cmap_off:
+            if cmap_off > 0:
                 f.seek(cmap_off); f.read(4)
                 for _ in range(struct.unpack('<I', f.read(4))[0]):
                     oid, nl = struct.unpack('<HB', f.read(3))
-                    self.id_to_canonical[oid] = f.read(nl).decode()
+                    self.id_to_canonical[oid] = f.read(nl).decode('utf-8')
 
-            if cnst_off:
+            if cnst_off > 0:
                 f.seek(cnst_off); f.read(4)
                 for _ in range(struct.unpack('<I', f.read(4))[0]):
                     cid, tc, ln = struct.unpack('<HBH', f.read(5))
@@ -117,46 +124,47 @@ class NACGraphParser:
                     elif tc == 2: v = struct.unpack('<q', f.read(ln))[0]
                     elif tc == 3: v = struct.unpack('<d', f.read(ln))[0]
                     elif tc == 4: v = f.read(ln).decode('utf-8')
-                    elif tc == 5: v = list(struct.unpack(f'<{ln}i', f.read(ln*4))) if ln else []
-                    elif tc == 6: v = list(struct.unpack(f'<{ln}f', f.read(ln*4))) if ln else []
+                    elif tc == 5: v = list(struct.unpack(f'<{ln}i', f.read(ln*4))) if ln > 0 else []
+                    elif tc == 6: v = list(struct.unpack(f'<{ln}f', f.read(ln*4))) if ln > 0 else []
                     self.constants[cid] = v
 
-            if perm_off:
+            if perm_off > 0:
                 f.seek(perm_off); f.read(4)
                 for _ in range(struct.unpack('<I', f.read(4))[0]):
                     pid, pl = struct.unpack('<HB', f.read(3))
-                    self.permutations[pid] = tuple(f.read(pl).decode())
+                    self.permutations[pid] = tuple(f.read(pl).decode('utf-8'))
 
-            if ops_off:
+            if ops_off > 0:
                 f.seek(ops_off); f.read(4)
                 n_ops = struct.unpack('<I', f.read(4))[0]
                 self.parsed_nodes = [self._read_op(f) for _ in range(n_ops)]
 
-            if data_off:
+            if data_off > 0:
                 f.seek(data_off); f.read(4)
                 for _ in range(struct.unpack('<I', f.read(4))[0]):
                     pid, nl = struct.unpack('<HH', f.read(4))
-                    self.param_id_to_name[pid] = f.read(nl).decode()
+                    self.param_id_to_name[pid] = f.read(nl).decode('utf-8')
                 for _ in range(struct.unpack('<I', f.read(4))[0]):
                     iidx, nl = struct.unpack('<HH', f.read(4))
-                    self.input_node_idx_to_name[iidx] = f.read(nl).decode()
+                    self.input_node_idx_to_name[iidx] = f.read(nl).decode('utf-8')
+                
                 if self.weights_stored_internally:
                     for _ in range(struct.unpack('<I', f.read(4))[0]):
                         pid, ml, dl = struct.unpack('<HIQ', f.read(14))
-                        mb = f.read(ml); f.seek(dl, 1)
+                        mb = f.read(ml); f.seek(dl, 1) # Skip data bytes (dl)
                         mo, meta = 0, {}
                         did, rank = struct.unpack_from('<BB', mb, mo); mo += 2
                         meta['dtype'] = self.DTYPE_MAP.get(did, 'unk')
-                        meta['shape'] = list(struct.unpack_from(f'<{rank}I', mb, mo)) if rank else []
+                        meta['shape'] = list(struct.unpack_from(f'<{rank}I', mb, mo)) if rank > 0 else []
                         mo += rank * 4
                         qtc, = struct.unpack_from('<B', mb, mo); mo += 1
-                        qts = {0:'none',1:'FP16',2:'INT8_TENSOR',3:'INT8_CHANNEL',4:'BLOCK_FP8'}.get(qtc,'none')
+                        qts = {0:'none', 1:'FP16', 2:'INT8_TENSOR', 3:'INT8_CHANNEL', 4:'BLOCK_FP8'}.get(qtc, 'none')
                         if qts != 'none': meta['quant'] = qts
                         meta['data_bytes'] = dl
                         self.param_metadata[pid] = meta
 
-            if orch_off:
-                f.seek(orch_off); f.read(4)  # skip magic
+            if orch_off > 0:
+                f.seek(orch_off); f.read(4)
                 blen, cc = struct.unpack('<II', f.read(8))
                 self.mep_bytecode_len = blen
                 self.mep_const_count = cc
