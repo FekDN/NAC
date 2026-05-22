@@ -60,41 +60,84 @@ Upon completion, the compiled `.nac` files for all models will be available in y
 
 ---
 
-### **Stage 2: Executing and Testing Models (using `NACmodels_test.py`)**
+### **Stage 2: Executing, Testing, and Fine-Tuning Models (using `NACmodels_test.py`)**
 
-This is the online process that uses the generated `.nac` files. It demonstrates the main advantage of NAC—running models in a lightweight environment without heavy dependencies.
+The `NACmodels_test.py` script serves as the universal orchestrator for running any `.nac` container. Since execution logic (Inference, Training, and Pre/Post-processing) is encoded natively inside the `.nac` file's MEP section, this single script can handle vision, text, and generative models without requiring model-specific Python code.
 
-#### 2.3. Requirements
+#### 2.4. General Usage
 
-*   The compiled `.nac` files (and `.safetensors` if weights are stored externally).
-*   Installed libraries: `numpy` and `Pillow` (for image processing models).
-*   The `imagenet_classes.json` file (for ResNet), which must be downloaded separately and placed in the same directory.
-
-#### 2.4. Running the Execution Script
-
-The script is run from the command line, specifying the `.nac` file and the input data.
+The script relies on interactive prompts built into the `.nac` file, but you can also provide pre-answers via the command line interface (CLI) to automate the flow.
 
 ```bash
-# Image Classification
-python NACmodels_test.py resnet18.nac path/to/your/image.jpg
-
-# Fill-Mask (uses the built-in tokenizer)
-python NACmodels_test.py roberta-base-fill-mask.nac "The capital of France is <mask>."
-
-# Text Generation (uses the built-in tokenizer)
-python NACmodels_test.py gpt2-text-generation.nac "Hello, I'm a language model,"
-
-# Sentiment Analysis (uses the built-in tokenizer)
-python NACmodels_test.py distilbert-sst2-sentiment.nac "This movie is absolutely fantastic!"
-
-# Image Generation (Stable Diffusion)
-python NACmodels_test.py sd-unet-256.nac "A photo of an astronaut riding a horse on mars"
-
-# Translation (T5)
-python NACmodels_test.py t5-encoder.nac t5-decoder.nac "My name is Wolfgang and I live in Berlin"
+python NACmodels_test.py <model.nac> [CLI arguments (pre-answers)] [--flags]
 ```
 
-The script will automatically detect the task based on the filename, initialize `NacRuntime`, preprocess the input data (including tokenization via the built-in TISA VM), run the model, and print the result.
+**Basic Inference Examples:**
+
+```bash
+# Vision (ResNet / MobileNetV3)
+python NACmodels_test.py resnet18.nac cat.jpg
+python NACmodels_test.py mobilenet_v3_small.nac dog.png
+
+# Fill-Mask (RoBERTa)
+python NACmodels_test.py roberta-base-fill-mask.nac "The capital of France is <mask>."
+
+# Sentiment Analysis (DistilBERT)
+python NACmodels_test.py distilbert-sst2-sentiment.nac "This is absolutely terrible."
+
+# Translation (T5)
+# Notice: T5 MEP orchestrator relies on both encoder and decoder parts 
+# combined via Python's execution logic natively written in CompileTest
+python NACmodels_test.py t5-decoder.nac "translate English to German: Hello world"
+
+# Text Generation (GPT-2)
+python NACmodels_test.py gpt2-text-generation.nac "In a shocking turn of events, "
+
+# Image Generation (Stable Diffusion)
+python NACmodels_test.py sd-vae-decoder.nac "A cyberpunk city at night, neon lights"
+```
+
+#### 2.5. Execution Modes (`--mode`)
+
+The `--mode` flag allows you to selectively execute branches within the MEP orchestrator.
+
+*   `--mode infer_train` (Default): Performs a standard forward pass (inference), shows results, and then prompts the user for a target label to perform fine-tuning.
+*   `--mode infer`: Executes only the inference branch and exits.
+*   `--mode train`: Bypasses the initial inference result printout and immediately begins fine-tuning based on the provided inputs.
+
+```bash
+# Only perform inference (no training prompts)
+python NACmodels_test.py mobilenet_v3_small.nac dog.png --mode infer
+```
+
+#### 2.6. Advanced Training Strategies (`--train-mode`)
+
+The runtime supports two fundamentally different mathematical strategies for On-Device Training.
+
+*   `--train-mode head_only` (Default): Highly efficient Transfer Learning. The runtime performs an analytical gradient calculation for the output head and dynamically auto-expands the classification layer (neurons/classes) if the target ID is higher than the current capacity. Only the final `Linear` layer is updated. Recommended for edge devices.
+*   `--train-mode trng`: Executes the complete, compiled backward graph (`TRNG` section). Propagates gradients through all registered un-frozen layers in the network. PyTorch's AOTAutograd graph is utilized. *Note: Memory intensive.*
+
+```bash
+# Provide both the input (image) and the training target (42) automatically
+# Perform full backpropagation via the TRNG graph
+python NACmodels_test.py resnet18.nac bird.jpg 42 --mode train --train-mode trng
+```
+
+#### 2.7. In-Memory Patching and Binary Rewriting (`--patch` / `--rewrite`)
+
+A revolutionary feature of the NAC format is the ability to modify hyperparameters (like epochs, learning rates, thresholds) natively mapped into the binary, without needing to re-compile the graph.
+
+*   `--patch KEY=VALUE`: Temporarily modifies a constant in memory for the current run only.
+*   `--rewrite KEY=VALUE`: Modifies the constant and surgically overwrites the actual `.nac` file on disk.
+
+```bash
+# Run fine-tuning, but temporarily change the learning rate from 0.005 to 0.0001
+# Provide inputs: [1] image path, [2] target class
+python NACmodels_test.py mobilenet_v3_small.nac tree.jpg 1000 --patch 0.005=0.0001
+
+# Permanently rewrite the "num_epochs" constant from 3 to 10 in the .nac file
+python NACmodels_test.py distilbert-sst2-sentiment.nac "Awesome" 1 --rewrite 3=10
+```
 
 ---
 
