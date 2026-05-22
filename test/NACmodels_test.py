@@ -1,4 +1,3 @@
-# --- START OF FILE NACmodels_test.py ---
 # Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import os
@@ -21,7 +20,7 @@ def _parse_kv(token: str):
         return s
     return _coerce(k_str), _coerce(v_str)
 
-def run_nac_model(nac_path: str, exec_mode: str = 'infer_train', cli_args: list = None, patches: list = None, rewrites: list = None):
+def run_nac_model(nac_path: str, exec_mode: str = 'infer_train', cli_args: list = None, patches: list = None, rewrites: list = None, train_mode: str = 'head_only'):
     from NAC_run import NacRuntime
     from MEP_compiler import MEPPatcher
 
@@ -48,7 +47,13 @@ def run_nac_model(nac_path: str, exec_mode: str = 'infer_train', cli_args: list 
     print(f"--- MEP: {len(bytecode)} bytes, {len(constants)} constants, mode={exec_mode} ({mode_note}) ---")
 
     from MEP_interpreter import MEPInterpreter
-    interp = MEPInterpreter(bytecode, constants, pre_answers=cli_args, exec_mode=exec_mode)
+    interp = MEPInterpreter(
+        bytecode, constants, 
+        pre_answers=cli_args, 
+        exec_mode=exec_mode, 
+        arrays=getattr(probe, 'arrays', {}),
+        train_mode=train_mode
+    )
     interp.resources[0] = probe
     return interp.run()
 
@@ -70,6 +75,7 @@ Examples:
 
     parser.add_argument('nac', help='Path to .nac file')
     parser.add_argument('--mode', choices=['infer', 'train', 'infer_train'], default='infer_train', help='Execution mode')
+    parser.add_argument('--train-mode', choices=['head_only', 'trng'], default='head_only', help='Training mode: head_only (fast, last layer) or trng (full backward graph)')
     parser.add_argument('--patch', action='append', default=[], metavar='KEY=VALUE', help='Temporary in-memory constant override')
     parser.add_argument('--rewrite', action='append', default=[], metavar='KEY=VALUE', help='Permanent constant rewrite in .nac')
     parser.add_argument('args', nargs='*', help='CLI pre-answers for src_user_prompt')
@@ -82,11 +88,11 @@ Examples:
     cli_args = ns.args or None
 
     try:
-        result = run_nac_model(ns.nac, exec_mode=ns.mode, cli_args=cli_args, patches=patches, rewrites=rewrites)
+        result = run_nac_model(ns.nac, exec_mode=ns.mode, cli_args=cli_args, patches=patches, rewrites=rewrites, train_mode=ns.train_mode)
         if result is not None: print(f"\n--- Result: {result} ---")
     except Exception as e:
         print(f"\n!!!!!! ERROR: {e}"); traceback.print_exc(); sys.exit(1)
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    main()
 
-# --- END OF FILE NACmodels_test.py ---
