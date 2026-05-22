@@ -1,5 +1,3 @@
-# Файл: NAC_info.py
-
 # Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import sys
@@ -67,7 +65,7 @@ def inspect_nac_file(filepath: str):
         print(f"IO Counts: {num_inputs} Inputs, {num_outputs} Outputs")
 
         # --- Section Offsets ---
-        offsets_header_format = '<H10Q'
+        offsets_header_format = '<H11Q'
         header_bytes = f.read(struct.calcsize(offsets_header_format))
         
         unpacked_header = struct.unpack(offsets_header_format, header_bytes)
@@ -75,7 +73,7 @@ def inspect_nac_file(filepath: str):
         offsets = unpacked_header[1:]
         
         mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, \
-        proc_off, orch_off, trng_off, rsrc_off = offsets
+        proc_off, orch_off, trng_off, rsrc_off, arrs_off = offsets
         
         print(f"Model Dimension (d_model): {d_model}")
 
@@ -90,6 +88,7 @@ def inspect_nac_file(filepath: str):
         print(f"  - ORCH Section:     Starts at byte {orch_off} (MEP Orchestrator)")
         print(f"  - TRNG Section:     Starts at byte {trng_off} (Training Graph)" + (" [PRESENT]" if trng_off > 0 else " [ABSENT]"))
         print(f"  - RSRC Section:     Starts at byte {rsrc_off} (Internal Resources)")
+        print(f"  - ARRS Section:     Starts at byte {arrs_off} (Binary Arrays)")
 
         # --- 1. Read Memory Map (MMAP) ---
         print("\n--- Memory Map (MMAP) ---")

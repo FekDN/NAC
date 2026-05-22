@@ -1,4 +1,3 @@
-# NAC_graph.py
 # Copyright (c) 2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 #
 # Interactive computation graph visualizer for .nac files.
@@ -97,11 +96,11 @@ class NACGraphParser:
             n_in, n_out, _ = struct.unpack('<HHB', f.read(5))
             self.io_counts = (n_in, n_out)
 
-            hdr_fmt = '<H9Q4x'
+            hdr_fmt = '<H11Q'
             raw = struct.unpack(hdr_fmt, f.read(struct.calcsize(hdr_fmt)))
             self.d_model = raw[0]
             mmap_off, ops_off, cmap_off, cnst_off, perm_off, \
-            data_off, proc_off, orch_off, rsrc_off = raw[1:]
+            data_off, proc_off, orch_off, rsrc_off, arrs_off = raw[1:]
 
             if cmap_off:
                 f.seek(cmap_off); f.read(4)

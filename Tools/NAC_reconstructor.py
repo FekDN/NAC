@@ -1,5 +1,3 @@
-# --- START OF FILE NAC_reconstructor.py ---
-
 # Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import os
@@ -37,6 +35,7 @@ class Reconstructor:
         self.param_id_to_name: Dict[int, str] = {}
         self.input_node_idx_to_name: Dict[int, str] = {}
         self.memory_map: Dict[int, List[Dict[str, Any]]] = {}
+        self.arrays_info: Dict[str, Dict[str, Any]] = {}
 
         self.CODE_TO_CATEGORY: Dict[str, str] = {
             'Q': 'offset', 'K': 'offset', 'V': 'offset', 'M': 'offset',
@@ -63,14 +62,14 @@ class Reconstructor:
     def _infer_special_cd_lengths(self, A: int, B: int) -> Tuple[int, int]:
         op_name = self.id_to_canonical.get(A)
         if op_name == "<INPUT>": 
-            # --- FIX: Универсально для TRNG. Все типы 1-6 имеют префикс длины (nC=2). ---
+            #Universal for TRNGs. All types 1-6 have a length prefix (nC=2).
             if B in (1, 2, 3, 4, 5, 6): return 2, 0  # [len_prefix, id]
             return 0, 0
         if op_name == "<OUTPUT>": 
             if B in (0, 1): # Standard output
                 num_outputs = self.io_counts[1]
                 return num_outputs + 1, num_outputs
-            # --- FIX: Учтены измененные размеры C и D в TRNG (Fused SGD). ---
+            # The changed dimensions of C and D in TRNG (Fused SGD) have been taken into account.
             if B == 2: return 2, 1  # Write Weight: C=[1, param_id], D=[offset]
             if B == 3: return 2, 2  # Fused SGD step: C=[1, param_id], D=[grad, lr]
             if B == 4: return 0, 1  # Return TRNG:  C=[], D=[offset]
@@ -117,24 +116,19 @@ class Reconstructor:
             num_inputs, num_outputs, _ = struct.unpack('<HHB', f.read(5))
             self.io_counts = (num_inputs, num_outputs)
             
-            if version >= 2:
-                offsets_header_format = '<H10Q'
-            else:
-                offsets_header_format = '<H9Q4x'
+            offsets_header_format = '<H11Q'
             header_bytes = f.read(struct.calcsize(offsets_header_format))
             unpacked = struct.unpack(offsets_header_format, header_bytes)
             self.d_model = unpacked[0]
             offsets = unpacked[1:]
 
-            if version >= 2:
-                mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, orch_off, trng_off, rsrc_off = offsets
-            else:
-                mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, orch_off, rsrc_off = offsets
-                trng_off = 0
+
+            mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, orch_off, trng_off, rsrc_off, arrs_off = offsets
 
             print(f"NAC v{version}, d_model: {self.d_model}, Quant: '{self.quantization_method}', "
                   f"IO: {self.io_counts}, Weights: {'Internal' if self.weights_stored_internally else 'External'}, "
-                  f"ORCH: {'yes' if orch_off > 0 else 'no'}, TRNG: {'yes' if trng_off > 0 else 'no'}")
+                  f"ORCH: {'yes' if orch_off > 0 else 'no'}, TRNG: {'yes' if trng_off > 0 else 'no'}, "
+                  f"ARRS: {'yes' if arrs_off > 0 else 'no'}")
 
             # --- MMAP ---
             if mmap_off > 0:
@@ -228,6 +222,24 @@ class Reconstructor:
                         
                         dummy_tensor = torch.empty(0)
                         self.loaded_param_data[p_id] = (dummy_tensor, metadata)
+
+            # --- ARRS (Standalone Arrays Metadata) ---
+            if arrs_off > 0:
+                f.seek(arrs_off)
+                if f.read(4) != b'ARRS': print("Warning: ARRS tag mismatch")
+                num_arrays = struct.unpack('<I', f.read(4))[0]
+                for _ in range(num_arrays):
+                    name_len = struct.unpack('<H', f.read(2))[0]
+                    arr_name = f.read(name_len).decode('utf-8')
+                    dtype_id, rank = struct.unpack('<BB', f.read(2))
+                    shape = list(struct.unpack(f'<{rank}I', f.read(rank * 4))) if rank > 0 else []
+                    data_len = struct.unpack('<Q', f.read(8))[0]
+                    # Skip the data; we don't need it in RAM in the reconstructor.
+                    f.seek(data_len, 1) 
+                    self.arrays_info[arr_name] = {
+                        'dtype': self._map_enum_to_dtype_str(dtype_id), 
+                        'shape': shape
+                    }
 
         self._orch_off = orch_off
         self._trng_off = trng_off
@@ -449,6 +461,13 @@ def reconstruct_from_file(nac_filepath: str, show_mmap: bool = False):
         print(f"Training Graph (TRNG): {'Present' if has_trng_section else 'Absent'} "
               f"({len(reconstructor.parsed_trng_nodes)} instructions)")
 
+        if reconstructor.arrays_info:
+            print(f"Standalone Arrays (ARRS): Present ({len(reconstructor.arrays_info)} arrays)")
+            for arr_name, info in reconstructor.arrays_info.items():
+                print(f"  - '{arr_name}': shape={info['shape']}, dtype={info['dtype']}")
+        else:
+            print("Standalone Arrays (ARRS): Absent")
+
         if input_summary:
             print("\n--- User Input Summary (in order of execution) ---")
             print(input_summary)
@@ -470,5 +489,3 @@ if __name__ == "__main__":
     if not args: print("Usage: python NAC_reconstructor.py [-m|--mmap] <path_to_model.nac>"); sys.exit(1)
         
     reconstruct_from_file(nac_filepath=args[0], show_mmap=show_mmap_flag)
-
-# --- END OF FILE NAC_reconstructor.py ---
