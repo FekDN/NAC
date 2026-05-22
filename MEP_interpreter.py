@@ -1,4 +1,3 @@
-# --- START OF FILE MEP_interpreter.py ---
 # Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import struct
@@ -11,7 +10,8 @@ from PIL import Image
 from NAC_kernels import softmax
 
 class MEPInterpreter:
-    def __init__(self, execution_plan: bytes, constants_pool: Dict[int, Any], pre_answers: List[str] = None, exec_mode: str = 'infer_train'):
+    # 1. Add the arrays argument
+    def __init__(self, execution_plan: bytes, constants_pool: Dict[int, Any], pre_answers: List[str] = None, exec_mode: str = 'infer_train', arrays: Dict[str, np.ndarray] = None, train_mode: str = 'head_only'):
         print("--- Initializing the MEP interpreter (v1.1) ---")
         self.plan       = execution_plan
         self.constants  = constants_pool
@@ -21,12 +21,15 @@ class MEPInterpreter:
         self.return_value: Any = None
         self.running    = False
         self.exec_mode  = exec_mode
+        self.train_mode = train_mode
         self.loop_stack: List[Dict[str, Any]] = []
         self._pre_answers: List[str] = list(pre_answers) if pre_answers else []
+        # 2. Initialize self.arrays
+        self.arrays = arrays or {}
 
         self._instr_lengths: Dict[int, int] = {
             0x02: 4, 0x03: 3, 0x04: 3, 0x05: 1,
-            0x10: 3, 0x11: 4, 0x12: 4, 0x13: 3, 0x18: 3, 0x1F: 2,
+            0x10: 3, 0x11: 4, 0x12: 4, 0x13: 3, 0x14: 3, 0x18: 3, 0x1F: 2,
             0x20: 3, 0x21: 3, 0x22: 4, 0x2A: -1,
             0x30: 4, 0x31: 5, 0x38: -1, 0x39: -1, 0x3A: -1, 0x3B: 3,
             0x50: -1, 0x51: -1, 0x59: 2, 0x5F: 3,
@@ -47,6 +50,7 @@ class MEPInterpreter:
             0x11: self._handle_res_load_datafile,
             0x12: self._handle_res_load_extern,
             0x13: self._handle_res_load_dynamic,
+            0x14: self._handle_res_load_array,
             0x1F: self._handle_res_unload,
             0x20: self._handle_preproc_encode,
             0x21: self._handle_preproc_decode,
@@ -91,7 +95,8 @@ class MEPInterpreter:
         if flag == 0x2A:
             return 5 + self.plan[at_ip + 4]
         if flag == 0x38:
-            return 1 + (5 if self.plan[at_ip + 1] == 1 else 3)
+            # pad (1) = 1+5=6 bytes, unsqueeze/squeeze (2,3) = 1+4=5 bytes
+            return 1 + (5 if self.plan[at_ip + 1] == 1 else 4)  # <-- Fixed: 3 -> 4
         if flag == 0x39:
             return 4 + self.plan[at_ip + 3] + (1 if self.plan[at_ip + 1] == 0 else 0)
         if flag == 0x3A:
@@ -101,7 +106,6 @@ class MEPInterpreter:
             return 4 + count_in + self.plan[at_ip + 3 + count_in]
 
         if flag == 0x82:
-            # Простой и надёжный вариант - 15 байт базово + размеры списков
             count_in = self.plan[at_ip + 3]
             count_target = self.plan[at_ip + 4 + count_in]
             return 1 + 3 + count_in + 1 + count_target + 1 + 1 + 1 + 2 + 2
@@ -123,12 +127,19 @@ class MEPInterpreter:
         self.running = True
         while self.ip < len(self.plan) and self.running:
             flag = self._read_u8()
-            #print(f"[MEP TRACE] IP={self.ip-1}, Opcode=0x{flag:02x}")   # <--- добавьте эту строку
+            #print(f"[MEP TRACE] IP={self.ip-1}, Opcode=0x{flag:02x}")
             handler = self.handlers.get(flag)
             if handler: handler()
             else: raise NotImplementedError(f"Instruction 0x{flag:02x} not implemented.")
         print("--- The MEP plan has been completed. ---")
         return self.return_value
+
+    def _handle_res_load_array(self):
+        out_key, name_cid = self._read_u8(), self._read_u16()
+        arr_name = str(self.constants[name_cid]) # Wrapped it in str() in case the key is a number 0, 1...
+        if arr_name not in self.arrays:
+            raise KeyError(f"Array '{arr_name}' not found in ARRS section.")
+        self.context[out_key] = self.arrays[arr_name].copy() # Issue a copy to avoid mutations of the original in memory
 
     def _handle_src_user_prompt(self):
         out_key, data_type, prompt_id = self._read_u8(), self._read_u8(), self._read_u16()
@@ -201,24 +212,29 @@ class MEPInterpreter:
 
     def _handle_tensor_create(self):
         out_key, dtype_code, ctype = self._read_u8(), self._read_u8(), self._read_u8()
-        dtype = {0: np.float32, 5: np.int64}.get(dtype_code, np.float32)
+        # Guarantee correct type mapping (5 -> int64)
+        dtype = {0: np.float32, 1: np.float64, 2: np.float16, 5: np.int64, 7: np.int8}.get(dtype_code, np.float32)
+        
         if ctype == 0:
             val = self.context[self._read_u8()]
             arr = np.array(val, dtype=dtype)
-            # Автоматически добавляем измерение batch_size = 1
             if arr.ndim == 0: 
-                arr = arr.reshape(1, 1) # Скаляр -> (1, 1)
+                arr = arr.reshape(1, 1)
             elif arr.ndim == 1: 
-                arr = np.expand_dims(arr, axis=0) # Список -> (1, N)
+                arr = np.expand_dims(arr, axis=0)
             self.context[out_key] = arr
+            
         elif ctype == 1:
-            # Используем _scalar для безопасного извлечения числа
             end_val = self._scalar(self.context[self._read_u8()])
             self.context[out_key] = np.arange(end_val, dtype=dtype).reshape(1, -1)
+            
         elif ctype == 2:
             shape_val = self.context[self._read_u8()]
-            # Для np.ones ожидается кортеж (tuple) размеров
             self.context[out_key] = np.ones(shape_val, dtype=dtype)
+            
+        elif ctype == 3:
+            shape_val = self.context[self._read_u8()]
+            self.context[out_key] = np.zeros(shape_val, dtype=dtype)
 
     def _handle_tensor_manipulate(self):
         op_type, out_key, in_key = self._read_u8(), self._read_u8(), self._read_u8()
@@ -226,11 +242,19 @@ class MEPInterpreter:
         if op_type == 1:
             pw, cv = self._scalar(self.context[self._read_u8()]), self._scalar(self.context[self._read_u8()])
             self.context[out_key] = np.pad(t, [(0,0)] * (t.ndim - 1) + [(pw, 0)], 'constant', constant_values=cv)
+        elif op_type == 2: # unsqueeze
+            dim = int(self._scalar(self.context[self._read_u8()]))
+            self.context[out_key] = np.expand_dims(t, axis=dim)
+        elif op_type == 3: # squeeze
+            dim = int(self._scalar(self.context[self._read_u8()]))
+            self.context[out_key] = np.squeeze(t, axis=dim)
 
     def _handle_tensor_combine(self):
         op_type, out_key, count = self._read_u8(), self._read_u8(), self._read_u8()
         tensors = [self.context[self._read_u8()] for _ in range(count)]
-        if op_type == 0: self.context[out_key] = np.concatenate(tensors, axis=self._scalar(self.context[self._read_u8()]))
+        if op_type == 0: 
+            # Force concat to preserve the type of the first element (so that it doesn't turn into a float)
+            self.context[out_key] = np.concatenate(tensors, axis=self._scalar(self.context[self._read_u8()])).astype(tensors[0].dtype)
 
     def _handle_tensor_info(self):
         op_type, out_key, in_key = self._read_u8(), self._read_u8(), self._read_u8()
@@ -241,8 +265,11 @@ class MEPInterpreter:
 
     def _handle_tensor_extract(self):
         out_key, in_t_key, in_i_key = self._read_u8(), self._read_u8(), self._read_u8()
-        t, idx = self.context[in_t_key], self._scalar(self.context[in_i_key])
-        if t.ndim == 3: self.context[out_key] = t[0, idx, :]
+        # Wrap it in int() so that NumPy doesn't crash if the loop counter becomes a float.
+        t, idx = self.context[in_t_key], int(self._scalar(self.context[in_i_key]))
+        
+        if t.ndim == 4: self.context[out_key] = t[0, idx, :, :] # Added 4D support
+        elif t.ndim == 3: self.context[out_key] = t[0, idx, :]
         elif t.ndim == 2: self.context[out_key] = t[0, idx]
         elif t.ndim == 1: self.context[out_key] = t[idx]
 
@@ -256,7 +283,13 @@ class MEPInterpreter:
 
     def _handle_math_unary(self):
         op_type, out_key, in_key = self._read_u8(), self._read_u8(), self._read_u8()
-        if op_type == 0: self.context[out_key] = softmax(self.context[in_key])
+        v = self.context[in_key]
+        if op_type == 0: self.context[out_key] = softmax(v)
+        elif op_type == 1: self.context[out_key] = np.sqrt(v)
+        elif op_type == 2: self.context[out_key] = np.abs(v)
+        elif op_type == 3: self.context[out_key] = np.negative(v)
+        elif op_type == 4: self.context[out_key] = np.exp(v)
+        elif op_type == 5: self.context[out_key] = np.reciprocal(np.asarray(v, dtype=float))
 
     def _handle_math_binary(self):
         op_type, out_key, k1, k2 = self._read_u8(), self._read_u8(), self._read_u8(), self._read_u8()
@@ -264,6 +297,10 @@ class MEPInterpreter:
         if op_type == 0: self.context[out_key] = np.add(v1, v2)
         elif op_type == 1: self.context[out_key] = np.subtract(v1, v2)
         elif op_type == 2: self.context[out_key] = np.multiply(v1, v2)
+        elif op_type == 3: self.context[out_key] = np.divide(v1, v2)
+        elif op_type == 4: self.context[out_key] = np.power(v1, v2)
+        elif op_type == 5: self.context[out_key] = np.maximum(v1, v2)
+        elif op_type == 6: self.context[out_key] = np.minimum(v1, v2)
 
     def _handle_math_aggregate(self):
         op_type, out_key, in_key = self._read_u8(), self._read_u8(), self._read_u8()
@@ -325,9 +362,10 @@ class MEPInterpreter:
             targets=[self.context[k] for k in target_keys],
             loss_type=loss_type,
             lr=float(self._scalar(self.context[lr_key])),
-            logits=self.context.get(logits_key) if logits_key != 0 else None,
+            logits=self.context[logits_key] if logits_key != 0 else None,
             head_weight_name=head_weight_name,
-            head_bias_name=head_bias_name
+            head_bias_name=head_bias_name,
+            mode=self.train_mode
         )
         
         self.context[out_loss_key] = loss
@@ -380,9 +418,33 @@ class MEPInterpreter:
     def _handle_io_write(self):
         in_key, dest_type, dest_key, write_mode = self._read_u8(), self._read_u8(), self._read_u8(), self._read_u8()
         data = self.context[in_key]
-        end_char = "" if write_mode == 2 else "\n"
-        if dest_type == 0: print(data, end=end_char, flush=True)
-        elif dest_type == 1: print(data, file=sys.stderr, end=end_char, flush=True)
+        
+        if dest_type == 0:
+            # Output to STDOUT (Console)
+            end_char = "" if write_mode == 2 else "\n"
+            print(data, end=end_char, flush=True)
+            
+        elif dest_type == 1:
+            # Output to STDERR
+            end_char = "" if write_mode == 2 else "\n"
+            print(data, file=sys.stderr, end=end_char, flush=True)
+            
+        elif dest_type == 2:
+            # Output to FILE
+            filename = str(self.context[dest_key])
+            is_bytes = isinstance(data, bytes)
+            
+            # Determine the recording mode (Text or Binary, Overwrite or Rewrite)
+            if write_mode == 0: # Overwrite
+                mode = 'wb' if is_bytes else 'w'
+            else:               # Append
+                mode = 'ab' if is_bytes else 'a'
+                
+            with open(filename, mode) as f:
+                f.write(data)
+                # Add a line break for text if it is not a stream chunk (write_mode=2)
+                if not is_bytes and write_mode != 2:
+                    f.write("\n")
 
     def _handle_exec_return(self):
         count = self._read_u8()
@@ -392,5 +454,3 @@ class MEPInterpreter:
 
     def _handle_exec_halt(self):
         self.running = False
-
-# --- END OF FILE MEP_interpreter.py ---

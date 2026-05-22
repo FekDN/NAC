@@ -1,4 +1,3 @@
-# --- START OF FILE MEP_compiler.py ---
 # Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import struct
@@ -92,7 +91,7 @@ class MEPCompiler:
         if in_keys: self.bytecode += struct.pack(f'<{len(in_keys)}B', *in_keys)
 
     # 0x30-0x4F  Tensor processing
-    def tensor_create(self, from_py: Optional[dict] = None, arange: Optional[dict] = None, ones: Optional[dict] = None):
+    def tensor_create(self, from_py: Optional[dict] = None, arange: Optional[dict] = None, ones: Optional[dict] = None, zeros: Optional[dict] = None):
         self.bytecode.append(0x30)
         if from_py:
             self.bytecode += struct.pack('<BBBB', self._get_context_key(from_py['out_var']), from_py['dtype_code'], 0, self._get_context_key(from_py['in_var']))
@@ -100,13 +99,19 @@ class MEPCompiler:
             self.bytecode += struct.pack('<BBBB', self._get_context_key(arange['out_var']), arange['dtype_code'], 1, self._get_context_key(arange['end_var']))
         elif ones:
             self.bytecode += struct.pack('<BBBB', self._get_context_key(ones['out_var']), ones['dtype_code'], 2, self._get_context_key(ones['shape_var']))
-        else: raise ValueError("Specify from_py, arange, or ones.")
+        elif zeros:
+            self.bytecode += struct.pack('<BBBB', self._get_context_key(zeros['out_var']), zeros['dtype_code'], 3, self._get_context_key(zeros['shape_var']))
+        else: raise ValueError("Specify from_py, arange, ones, or zeros.")
 
     def tensor_manipulate(self, op_type: str, out_var: str, in_var: str, **kwargs):
-        op_code = {'pad': 1}.get(op_type)
+        op_code = {'pad': 1, 'unsqueeze': 2, 'squeeze': 3}.get(op_type)
+        if op_code is None: raise ValueError(f"Unknown manipulation: {op_type}")
         self.bytecode.append(0x38)
         self.bytecode += struct.pack('<BBB', op_code, self._get_context_key(out_var), self._get_context_key(in_var))
-        if op_type == 'pad': self.bytecode += struct.pack('<BB', self._get_context_key(kwargs['pad_width_var']), self._get_context_key(kwargs['const_val_var']))
+        if op_type == 'pad': 
+            self.bytecode += struct.pack('<BB', self._get_context_key(kwargs['pad_width_var']), self._get_context_key(kwargs['const_val_var']))
+        elif op_type in ('unsqueeze', 'squeeze'):
+            self.bytecode += struct.pack('<B', self._get_context_key(kwargs['dim_var']))
 
     def tensor_combine(self, op_type: str, out_var: str, in_vars: List[str], **kwargs):
         op_code = {'concat': 0}.get(op_type)
@@ -137,12 +142,14 @@ class MEPCompiler:
 
     # 0x60-0x7F  Post-processing & logic
     def math_unary(self, op_type: str, out_var: str, in_var: str):
-        op_code = {'softmax': 0}.get(op_type)
+        op_code = {'softmax': 0, 'sqrt': 1, 'abs': 2, 'neg': 3, 'exp': 4, 'reciprocal': 5}.get(op_type)
+        if op_code is None: raise ValueError(f"Unknown math_unary op: {op_type!r}")
         self.bytecode.append(0x60)
         self.bytecode += struct.pack('<BBB', op_code, self._get_context_key(out_var), self._get_context_key(in_var))
 
     def math_binary(self, op_type: str, out_var: str, in_var1: str, in_var2: str):
-        op_code = {'add': 0, 'sub': 1, 'mul': 2}.get(op_type)
+        op_code = {'add': 0, 'sub': 1, 'mul': 2, 'div': 3, 'pow': 4, 'max_elem': 5, 'min_elem': 6}.get(op_type)
+        if op_code is None: raise ValueError(f"Unknown math_binary op: {op_type!r}")
         self.bytecode.append(0x61)
         self.bytecode += struct.pack('<BBBB', op_code, self._get_context_key(out_var), self._get_context_key(in_var1), self._get_context_key(in_var2))
 
@@ -183,7 +190,7 @@ class MEPCompiler:
                          logits_var: str = None,
                          head_weight_name: str = "",
                          head_bias_name: str = ""):
-        """Простая и надёжная версия model_train_step"""
+        """A simple and robust version of model_train_step"""
         in_keys = [self._get_context_key(v) for v in in_vars]
         target_keys = [self._get_context_key(v) for v in target_vars]
 
@@ -201,7 +208,6 @@ class MEPCompiler:
         weight_name_id = self._get_const_id(head_weight_name) if head_weight_name else 0
         bias_name_id = self._get_const_id(head_bias_name) if head_bias_name else 0
 
-        # Простая и стабильная упаковка (BBBHH вместо BBHHH)
         self.bytecode += struct.pack('<BBBHH', 
                                      self._get_context_key(out_loss_var),
                                      lr_key,
@@ -285,10 +291,15 @@ class MEPCompiler:
         const_map = {cid: val for _, (cid, val) in self.constants.items()}
         return bytes(self.bytecode), const_map
 
+    def res_load_array(self, out_var: str, array_name: str):
+        """0x14: Load binary array from NAC ARRS section"""
+        self.bytecode.append(0x14)
+        self.bytecode += struct.pack('<BH', self._get_context_key(out_var), self._get_const_id(array_name))
+
 class MEPPatcher:
     _FIXED: Dict[int, int] = {
         0x02: 4, 0x03: 3, 0x04: 3, 0x05: 1,
-        0x10: 3, 0x11: 4, 0x12: 4, 0x13: 3, 0x1F: 2,
+        0x10: 3, 0x11: 4, 0x12: 4, 0x13: 3, 0x14: 3, 0x1F: 2,
         0x20: 3, 0x21: 3, 0x22: 4, 0x2A: -1,
         0x30: 4, 0x38: -1, 0x39: -1, 0x3A: -1, 0x3B: 3,
         0x59: 2, 0x5F: 3,
@@ -306,13 +317,19 @@ class MEPPatcher:
         if length is None: raise NotImplementedError(f"Unknown opcode 0x{flag:02x}")
         if length != -1: return 1 + length
         if flag == 0x2A: return 5 + bytecode[offset + 4]
-        if flag == 0x38: return 1 + (5 if bytecode[offset + 1] == 1 else 3)
+        if flag == 0x38: 
+            op_code = bytecode[offset + 1]
+            return 1 + (5 if op_code == 1 else 4) # pad takes 6 bytes, unsqueeze/squeeze - 5
         if flag == 0x39: return 4 + bytecode[offset + 3] + (1 if bytecode[offset + 1] == 0 else 0)
         if flag == 0x3A: return 4 + (1 if bytecode[offset + 1] == 1 else 0)
         if flag == 0x80: count_in = bytecode[offset + 2]; return 4 + count_in + bytecode[offset + 3 + count_in]
         if flag == 0x82: 
             count_in = bytecode[offset + 3]
             count_target = bytecode[offset + 4 + count_in]
+            # Layout: flag(1) + model_id+loss_type+count_in(3) + in_keys(count_in)
+            #         + target_count(1) + target_keys(count_target)
+            #         + out_loss_key+lr_key+logits_key(3) + weight_name_id(2) + bias_name_id(2)
+            # Total = 12 + count_in + count_target
             return 12 + count_in + count_target
         if flag == 0xFE: return 2 + bytecode[offset + 1]
 
@@ -352,9 +369,7 @@ class MEPPatcher:
         new_blob = b'ORCH' + struct.pack('<II', len(bytecode), len(constants)) + bytecode + const_blob
         with open(nac_path, 'r+b') as f:
             f.seek(10)
-            offsets = struct.unpack('<H10Q', f.read(82))[1:]
-            f.seek(offsets[7])
+            offsets = struct.unpack('<H11Q', f.read(90))[1:]
+            f.seek(offsets[7])  # orch_off: mmap(0),ops(1),cmap(2),cnst(3),perm(4),data(5),proc(6),orch(7)
             f.write(new_blob)
         return True
-
-# --- END OF FILE MEP_compiler.py ---

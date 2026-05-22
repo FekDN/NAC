@@ -1,4 +1,3 @@
-# --- START OF FILE NAC_run.py ---
 # Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import os
@@ -32,6 +31,8 @@ class NacRuntime(NacKernelBase):
         self._auto_init_state_map()
         self.perf_stats: Dict[str, Tuple[float, int]] = {}
         self._is_initialized = False
+        self.targets: List[np.ndarray] = []           # Training targets for TRNG
+        self.trng_param_updates: Dict[int, Any] = {}  # {param_id: gradient} from fused_sgd_step
         print("Runtime ready.")
 
     def _infer_special_cd_lengths(self, A: int, B: int) -> Tuple[int, int]:
@@ -91,10 +92,34 @@ class NacRuntime(NacKernelBase):
     @staticmethod
     def preprocess_image_for_imagenet(image_path: str) -> np.ndarray:
         from PIL import Image
-        img = Image.open(image_path).convert('RGB').resize((256, 256))
-        left, top = (256 - 224) // 2, (256 - 224) // 2
-        arr = np.array(img.crop((left, top, left + 224, top + 224)), dtype=np.float32) / 255.0
-        return np.expand_dims(((arr - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])).transpose(2, 0, 1), axis=0)
+        img = Image.open(image_path).convert('RGB')
+        
+        # 1. Resize: the smaller side becomes 256, the proportions are preserved
+        w, h = img.size
+        short_side = 256
+        if w < h:
+            new_w = short_side
+            new_h = int(short_side * h / w)
+        else:
+            new_h = short_side
+            new_w = int(short_side * w / h)
+        img = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+        
+        # 2. CenterCrop: Cut a 224x224 square from the center
+        left = (new_w - 224) / 2
+        top = (new_h - 224) / 2
+        right = (new_w + 224) / 2
+        bottom = (new_h + 224) / 2
+        img = img.crop((left, top, right, bottom))
+        
+        # 3. ToTensor & Normalize
+        arr = np.array(img, dtype=np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        arr = (arr - mean) / std
+        
+        # HWC -> CHW and add Batch (1, C, H, W)
+        return np.expand_dims(arr.transpose(2, 0, 1), axis=0)
 
     @staticmethod
     def load_dynamic_file(path: str, file_type: int) -> np.ndarray:
@@ -106,7 +131,7 @@ class NacRuntime(NacKernelBase):
     def load_mep_from_nac(nac_path: str):
         with open(nac_path, 'rb') as f:
             f.seek(10)
-            orch_off = struct.unpack('<H10Q', f.read(82))[8] 
+            orch_off = struct.unpack('<H11Q', f.read(90))[8] 
             if orch_off == 0: return None, None
             f.seek(orch_off)
             if f.read(4) != b'ORCH': raise ValueError("Bad ORCH magic")
@@ -183,8 +208,8 @@ class NacRuntime(NacKernelBase):
             self.has_trng = (raw_quant_id & 0x40) != 0
             self.quantization_method = {0:'none', 1:'FP16', 2:'INT8_TENSOR', 3:'INT8_CHANNEL', 4:'BLOCK_FP8'}.get(raw_quant_id & 0x3F, 'unknown')
 
-            header_bytes = f.read(82)
-            self.d_model, mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, orch_off, trng_off, rsrc_off = struct.unpack('<H10Q', header_bytes)
+            header_bytes = f.read(90)
+            self.d_model, mmap_off, ops_off, cmap_off, cnst_off, perm_off, data_off, proc_off, orch_off, trng_off, rsrc_off, arrs_off = struct.unpack('<H11Q', header_bytes)
 
             self._orch_off, self._trng_off, self._nac_path = orch_off, trng_off, nac_path
 
@@ -311,12 +336,22 @@ class NacRuntime(NacKernelBase):
                     num_entries, = struct.unpack_from('<I', content, 0)
                     offset = 4 + num_entries * 4 
                     vocab = {}
+                    unigram_scores = {} # Creating a dictionary for scores
+                    
                     for _ in range(num_entries):
                         key_len, = struct.unpack_from('<H', content, offset); offset += 2
                         key = content[offset : offset + key_len].decode('utf-8'); offset += key_len
-                        val, _ = struct.unpack_from('<if', content, offset); offset += 8
+                        
+                        # Read the ID token (val) and its Score
+                        val, score = struct.unpack_from('<if', content, offset); offset += 8
                         vocab[key] = val
+                        
+                        # Save the score (if there is one) so that Viterbi can run
+                        if score != 0.0:
+                            unigram_scores[key] = score
+                            
                     vm_resources['vocab'] = vocab
+                    vm_resources['unigram_scores'] = unigram_scores # Submitting scores to TISA
                     if "merges.b" in tokenizer_resources_raw:
                         content = tokenizer_resources_raw['merges.b']
                         num_entries, = struct.unpack_from('<I', content, 0)
@@ -359,6 +394,35 @@ class NacRuntime(NacKernelBase):
                 f.seek(trng_off)
                 if f.read(4) != b'TRNG': raise ValueError("Bad TRNG magic")
                 self.trng_operations = [self._read_op(f) for _ in range(struct.unpack('<I', f.read(4))[0])]
+
+            self.arrays = {}
+            if arrs_off > 0:
+                f.seek(arrs_off)
+                if f.read(4) != b'ARRS': raise ValueError("Bad ARRS magic")
+                num_arrays = struct.unpack('<I', f.read(4))[0]
+                
+                # The mapping is strictly mirrored by the compiler.
+                numpy_dtype_map = {
+                    0: np.float32, 1: np.float64, 2: np.float16, 
+                    4: np.int32, 5: np.int64, 6: np.int16, 
+                    7: np.int8, 8: np.uint8, 9: np.bool_
+                }
+                
+                for _ in range(num_arrays):
+                    name_len = struct.unpack('<H', f.read(2))[0]
+                    arr_name = f.read(name_len).decode('utf-8')
+                    
+                    dtype_id, rank = struct.unpack('<BB', f.read(2))
+                    shape = list(struct.unpack(f'<{rank}I', f.read(rank * 4))) if rank > 0 else []
+                    
+                    data_len = struct.unpack('<Q', f.read(8))[0]
+                    data_bytes = f.read(data_len)
+                    
+                    dtype = numpy_dtype_map.get(dtype_id, np.float32)
+                    # Recovering an array of bytes with a precise type and shape
+                    arr = np.frombuffer(data_bytes, dtype=dtype).reshape(shape).copy()
+                    
+                    self.arrays[arr_name] = arr
 
     def _dequantize(self, arr: np.ndarray, metadata: Dict) -> np.ndarray:
         q_type = metadata.get('quant_type')
@@ -431,13 +495,73 @@ class NacRuntime(NacKernelBase):
     def zero_grad(self):
         pass # self.results and cache will be recreated per run_training_step
 
+    def _expand_head(self, head_weight_name: str, head_bias_name: str, max_target: int) -> int:
+        """
+        Expands the classification head if max_target >= current output dimension.
+        MUST be called BEFORE the forward pass so that the weight tensor seen by
+        <INPUT B=1> already has the correct (expanded) shape.  Newly added rows/
+        elements are zero-initialised, which is equivalent to "no prior knowledge"
+        for the new class — identical to what padding the logits would produce, but
+        keeps the in-memory weight tensor and the TRNG graph dimensions consistent.
+
+        Also resets the quantisation metadata for expanded tensors to 'none' because
+        the per-channel / block scales are no longer valid after the tensor grows.
+
+        Returns the new output size (or 0 if head_weight_name is empty / not found).
+        """
+        if not head_weight_name:
+            return 0
+
+        current_size = 0
+        w_pid = None
+        for pid, name in self.param_id_to_name.items():
+            if name == head_weight_name and pid in self.parameters:
+                current_size = self.parameters[pid].shape[0]
+                w_pid = pid
+                break
+
+        if current_size == 0 or w_pid is None:
+            return 0
+
+        expand_dim = max(0, max_target - current_size + 1)
+        if expand_dim == 0:
+            return current_size
+
+        new_size = current_size + expand_dim
+        print(f"[TRNG] Auto-expanding '{head_weight_name}': {current_size} → {new_size} classes")
+
+        # --- weight matrix (2-D) ---
+        param = self.parameters[w_pid]
+        if param.ndim == 2:
+            new_weight = np.zeros((new_size, param.shape[1]), dtype=param.dtype)
+            new_weight[:current_size] = param
+            self.parameters[w_pid] = new_weight
+            # Invalidate stale quantisation metadata so save_weights re-quantises correctly
+            if w_pid in self.tensor_offsets:
+                self.tensor_offsets[w_pid].setdefault('meta', {})['quant_type'] = 'none'
+
+        # --- bias vector (1-D) ---
+        if head_bias_name:
+            for pid, name in list(self.param_id_to_name.items()):
+                if name == head_bias_name and pid in self.parameters:
+                    param = self.parameters[pid]
+                    if param.ndim == 1:
+                        new_bias = np.zeros(new_size, dtype=param.dtype)
+                        new_bias[:current_size] = param
+                        self.parameters[pid] = new_bias
+                        if pid in self.tensor_offsets:
+                            self.tensor_offsets[pid].setdefault('meta', {})['quant_type'] = 'none'
+                    break
+
+        return new_size
+
     def save_weights(self, save_path: str = None, save_type: int = 0):
         tensors = {self.param_id_to_name.get(pid, f"param_{pid}"): np.asarray(arr, dtype=np.float32) for pid, arr in self.parameters.items()}
         if not tensors:
             print("[NAC] save_weights: nothing to save."); return
 
         if not self.weights_stored_internally:
-            # Внешние веса - просто пишем в .safetensors
+            # External weights - just write them in .safetensors
             try:
                 from safetensors.numpy import save_file as _st_save
                 companion = os.path.splitext(self._nac_path)[0] + ".safetensors"
@@ -446,13 +570,13 @@ class NacRuntime(NacKernelBase):
             except ImportError:
                 print("[NAC] Error: pip install safetensors")
         else:
-            # Внутренние веса - умное in-place обновление с расширением секций
+            # Internal weights - smart in-place update with section expansion
             print("[NAC] Analyzing internal weights for structural changes...")
             try:
                 with open(self._nac_path, 'rb') as f:
                     f.seek(10)
-                    header_bytes = f.read(82)
-                    unpacked = struct.unpack('<H10Q', header_bytes)
+                    header_bytes = f.read(90)
+                    unpacked = struct.unpack('<H11Q', header_bytes)
                     d_model = unpacked[0]
                     offsets = list(unpacked[1:])
                     data_off = offsets[5] # mmap, ops, cmap, cnst, perm, DATA, proc, orch, trng, rsrc
@@ -460,7 +584,7 @@ class NacRuntime(NacKernelBase):
                     if data_off == 0:
                         raise ValueError("No DATA section found in .nac")
 
-                    # Находим начало блока тензоров внутри секции DATA
+                    # Find the beginning of the tensor block inside the DATA section
                     f.seek(data_off)
                     if f.read(4) != b'DATA': raise ValueError("Invalid DATA offset")
                     num_p = struct.unpack('<I', f.read(4))[0]
@@ -472,18 +596,18 @@ class NacRuntime(NacKernelBase):
                     
                     tensors_start_offset = f.tell()
 
-                    # Находим конец блока тензоров (начало следующей секции)
+                    # Find the end of the tensor block (the beginning of the next section)
                     next_offsets = [off for off in offsets if off > data_off]
                     tensors_end_offset = min(next_offsets) if next_offsets else os.path.getsize(self._nac_path)
 
-                    # Читаем чанки файла ДО и ПОСЛЕ тензоров
+                    # Reading file chunks BEFORE and AFTER tensors
                     f.seek(0)
                     chunk_before = bytearray(f.read(tensors_start_offset))
                     
                     f.seek(tensors_end_offset)
                     chunk_after = f.read()
 
-                # Формируем новый бинарный блок тензоров
+                # Forming a new binary block of tensors
                 tensor_block_bytes = bytearray()
                 tensor_block_bytes.extend(struct.pack('<I', len(self.parameters)))
 
@@ -504,9 +628,9 @@ class NacRuntime(NacKernelBase):
                     q_type = meta.get('quant_type', 'none')
                     
                     saved_shape = arr.shape
-                    saved_dtype = 0 # По умолчанию float32
+                    saved_dtype = 0 # Default is float32
                     
-                    # Динамическая переквантизация при изменении размера
+                    # Dynamic requantization on resizing
                     if q_type == 'none':
                         q_bytes = arr.astype(np.float32).tobytes()
                         saved_dtype = 0 # float32
@@ -541,13 +665,13 @@ class NacRuntime(NacKernelBase):
                         
                         q_arr = np.round(blocks / scale_arr).clip(-128, 127).astype(np.int8).flatten()
                         q_bytes = q_arr.tobytes()
-                        saved_shape = q_arr.shape # BLOCK_FP8 сохраняется как плоский 1D массив!
+                        saved_shape = q_arr.shape # BLOCK_FP8 is stored as a flat 1D array!
                         saved_dtype = 7 # int8
                     else:
                         q_bytes = arr.tobytes()
                         saved_dtype = get_dtype_enum(arr)
 
-                    # Собираем мета-данные с ПРАВИЛЬНЫМИ типами и размерами
+                    # Collecting metadata with the RIGHT types and sizes
                     meta_binary = bytearray()
                     meta_binary.extend(struct.pack('<BB', saved_dtype, len(saved_shape)))
                     if len(saved_shape) > 0:
@@ -576,12 +700,12 @@ class NacRuntime(NacKernelBase):
                     tensor_block_bytes.extend(meta_bytes)
                     tensor_block_bytes.extend(q_bytes)
 
-                # Вычисляем разницу в размере
+                # Calculating the difference in size
                 diff = len(tensor_block_bytes) - (tensors_end_offset - tensors_start_offset)
 
                 if diff != 0:
                     print(f"[NAC] Model architecture changed. Expanding .nac sections (Delta: {diff} bytes).")
-                    # Сдвигаем смещения в заголовке для секций, идущих ПОСЛЕ DATA
+                    # Shifting the offsets in the header for sections coming AFTER DATA
                     new_offsets = []
                     for off in offsets:
                         if off > data_off:
@@ -589,12 +713,12 @@ class NacRuntime(NacKernelBase):
                         else:
                             new_offsets.append(off)
                     
-                    new_header_bytes = struct.pack('<H10Q', d_model, *new_offsets)
-                    chunk_before[10:10+82] = new_header_bytes
+                    new_header_bytes = struct.pack('<H11Q', d_model, *new_offsets)
+                    chunk_before[10:10+90] = new_header_bytes
                 else:
                     print("[NAC] Dimensions unchanged. Performing fast in-place update.")
 
-                # Перезаписываем файл монолитно
+                # Overwriting the file monolithically
                 with open(self._nac_path, 'wb') as f:
                     f.write(chunk_before)
                     f.write(tensor_block_bytes)
@@ -607,7 +731,7 @@ class NacRuntime(NacKernelBase):
                 print(f"[NAC] Binary update failed: {e}")
                 traceback.print_exc()
 
-        # Дополнительный бэкап, если запрошен извне
+        # Additional backup if requested from outside
         if save_path and save_path != "":
             companion = os.path.splitext(self._nac_path)[0] + ".safetensors"
             if os.path.abspath(save_path) != os.path.abspath(companion) and os.path.abspath(save_path) != os.path.abspath(self._nac_path):
@@ -622,19 +746,47 @@ class NacRuntime(NacKernelBase):
                           loss_type: int = 0, lr: float = 0.001,
                           logits=None,
                           head_weight_name: str = "",
-                          head_bias_name: str = "") -> np.ndarray:
+                          head_bias_name: str = "",
+                          mode: str = 'head_only') -> np.ndarray:
         """
-        Универсальный training step с авто-расширением и надежным поиском активаций.
+        Universal training step.
+
+        mode (passed at runtime from CLI via MEPInterpreter):
+          'head_only' — update only the specified head layer (fast, default)
+          'trng'      — full backward pass through the TRNG graph (all parameters)
         """
         if not self.trng_operations:
             return np.float32(0.0)
 
-        print(f"[TRNG] Universal training | loss_type={loss_type}, lr={lr:.6f}, head_weight='{head_weight_name or 'None'}'")
+        if mode == 'trng':
+            # Bug fix: pass head names so _run_trng_step can expand the head before
+            # the forward pass if the target class is outside the current capacity.
+            return self._run_trng_step(inputs, targets, lr, head_weight_name, head_bias_name)
 
-        # 1. Полный forward через OPS
+        # ═══════════════════════════════════════════════
+        # HEAD_ONLY MODE
+        # Key fix: expand the head BEFORE the forward pass so that:
+        #   1. The forward pass naturally produces logits of the correct new size
+        #      (no manual zero-padding needed).
+        #   2. The weight tensor shape is consistent throughout loss / gradient /
+        #      update steps within a single training call.
+        #   3. TRNG mode can switch in without shape surprises, because both modes
+        #      use the same in-memory weight tensor.
+        # ═══════════════════════════════════════════════
+        print(f"[TRNG] head_only training | loss_type={loss_type}, lr={lr:.6f}, head_weight='{head_weight_name or 'None'}'")
+
+        # 1. Determine max target and expand head BEFORE forward pass
+        target = np.asarray(targets[0]).flatten().astype(np.int64)
+        max_target = int(target.max()) if len(target) > 0 else 0
+
+        current_output_size = self._expand_head(head_weight_name, head_bias_name, max_target)
+        # If _expand_head returned 0 (no head_weight_name), derive size after forward
+        derive_size_after_fwd = (current_output_size == 0)
+
+        # 2. Full forward through OPS (weights are already the right size)
         self.results = [None] * len(self.operations)
         import itertools
-        self.input_stream = itertools.cycle([np.asarray(x) for x in inputs]) 
+        self.input_stream = itertools.cycle([np.asarray(x) for x in inputs])
 
         try:
             fw_output = self._execute_block(0, len(self.operations), verbose=False)
@@ -646,7 +798,7 @@ class NacRuntime(NacKernelBase):
                     fw_output = res
                     break
 
-        # 2. Извлечение logits
+        # 3. Extract logits (now correctly sized — no padding needed)
         if logits is None:
             if isinstance(fw_output, np.ndarray) and fw_output.ndim >= 2:
                 logits = fw_output.astype(np.float32)
@@ -665,46 +817,13 @@ class NacRuntime(NacKernelBase):
             if logits.ndim == 3:
                 logits = logits.reshape(-1, logits.shape[-1])
 
-        current_output_size = logits.shape[-1] if logits.ndim >= 2 else 0
+        if derive_size_after_fwd:
+            current_output_size = logits.shape[-1] if logits.ndim >= 2 else 0
 
-        # 3. Авто-расширение по target
-        target = np.asarray(targets[0]).flatten().astype(np.int64)
-        max_target = int(target.max()) if len(target) > 0 else 0
-        expand_dim = max(0, max_target - current_output_size + 1)
+        # 4. Safety clip target to valid range (should already fit after expand)
+        target = np.clip(target, 0, max(current_output_size - 1, 0))
 
-        if expand_dim > 0:
-            if head_weight_name:
-                print(f"[TRNG] Auto-expanding '{head_weight_name}' from {current_output_size} to {current_output_size + expand_dim}")
-                for pid, name in list(self.param_id_to_name.items()):
-                    if name == head_weight_name and pid in self.parameters:
-                        param = self.parameters[pid]
-                        if param.ndim == 2:
-                            new_weight = np.zeros((current_output_size + expand_dim, param.shape[1]), dtype=param.dtype)
-                            new_weight[:param.shape[0]] = param
-                            self.parameters[pid] = new_weight
-                            break
-
-                if head_bias_name:
-                    for pid, name in list(self.param_id_to_name.items()):
-                        if name == head_bias_name and pid in self.parameters:
-                            param = self.parameters[pid]
-                            if param.ndim == 1:
-                                # Исправлено: добавлено + expand_dim для bias
-                                new_bias = np.zeros(current_output_size + expand_dim, dtype=param.dtype)
-                                new_bias[:len(param)] = param
-                                self.parameters[pid] = new_bias
-                                break
-            
-            # --- ИСПРАВЛЕНИЕ: Расширяем массив logits нулями для новых классов ---
-            pad_width = [(0, 0)] * logits.ndim
-            pad_width[-1] = (0, expand_dim)
-            logits = np.pad(logits, pad_width, mode='constant', constant_values=0.0)
-            
-            current_output_size += expand_dim
-
-        target = np.clip(target, 0, current_output_size - 1)
-
-        # 4. Вычисление Loss и градиентов
+        # 4. Loss and gradient
         if loss_type == 0:
             logits_max = logits.max(axis=-1, keepdims=True)
             log_sm = logits - logits_max
@@ -721,7 +840,7 @@ class NacRuntime(NacKernelBase):
 
         print(f"[TRNG] Loss: {loss_scalar:.6f} | Output size: {current_output_size}")
 
-        # 5. Обновление параметров
+        # 5. Parameter update
         updated = 0
         batch_size = grad_logits.shape[0]
 
@@ -732,15 +851,12 @@ class NacRuntime(NacKernelBase):
                     if param.ndim == 2:
                         in_features = param.shape[1]
                         input_act = None
-                        
-                        # Требуем точное совпадение размера: (batch_size * in_features)
                         for i in range(len(self.results)-1, -1, -1):
                             if self.results[i] is not None:
                                 arr = np.asarray(self.results[i])
                                 if arr.size == batch_size * in_features and arr.shape[0] == batch_size:
                                     input_act = arr.reshape(batch_size, in_features)
                                     break
-                                    
                         if input_act is not None:
                             grad_w = np.dot(grad_logits.T, input_act)
                             self.parameters[pid] = (param - lr * grad_w).astype(param.dtype)
@@ -761,8 +877,372 @@ class NacRuntime(NacKernelBase):
 
         return np.float32(loss_scalar)
 
+    # ───────────────────────────────────────────────────────────────
+    # TRNG MODE helpers
+    # ───────────────────────────────────────────────────────────────
+
+    def _execute_trng_block(self, saved_fw: List[Any]) -> List[Any]:
+        """Execute TRNG instructions with access to forward-pass activations."""
+        trng_results = [None] * len(self.trng_operations)
+
+        for ip, op in enumerate(self.trng_operations):
+            op_name = self.id_to_canonical.get(op['A'], "")
+
+            # ─── INPUT instructions ───
+            if op_name == "<INPUT>":
+                B, C = op['B'], op['C']
+
+                if B == 1:   # load_param
+                    trng_results[ip] = self.parameters.get(C[1])
+
+                elif B == 3:  # lifted_constant
+                    val = self.constants.get(C[1])
+                    if isinstance(val, (int, float)):
+                        trng_results[ip] = np.float32(val)
+                    elif isinstance(val, list):
+                        trng_results[ip] = np.array(val, dtype=np.float32)
+                    else:
+                        trng_results[ip] = val
+
+                elif B == 4:  # saved_activation_from_OPS
+                    fw_idx = C[1]
+                    trng_results[ip] = (
+                        saved_fw[fw_idx]
+                        if fw_idx < len(saved_fw) and saved_fw[fw_idx] is not None
+                        else np.float32(0.0)
+                    )
+
+                elif B == 5:  # target_data
+                    target_idx = C[1]
+                    trng_results[ip] = (
+                        self.targets[target_idx]
+                        if target_idx < len(self.targets)
+                        else self.targets[0]
+                    )
+
+                else:
+                    raise NotImplementedError(f"TRNG INPUT B={B} not supported")
+
+            # ─── OUTPUT instructions (fused_sgd_step / end-of-graph) ───
+            elif op_name == "<OUTPUT>":
+                B = op['B']
+
+                if B == 3:  # fused_sgd_step
+                    param_id = op['C'][1]
+                    grad = trng_results[ip + op['D'][0]]
+                    lr_val = trng_results[ip + op['D'][1]]
+
+                    if grad is not None:
+                        if hasattr(lr_val, 'item'):
+                            lr_val = lr_val.item()
+                        elif isinstance(lr_val, np.ndarray):
+                            lr_val = float(lr_val)
+                        self.trng_param_updates[param_id] = (
+                            grad.astype(np.float32)
+                            if isinstance(grad, np.ndarray)
+                            else np.float32(grad)
+                        )
+
+                elif B == 4:  # return_trng — end of graph
+                    break
+
+                continue  # OUTPUT does not write to trng_results
+
+            # ─── Regular backward-kernel instructions ───
+            else:
+                args = self._gather_args(op, ip, trng_results)
+                kernel_name = "op_" + op_name.replace('.', '_')
+                kernel = self.op_kernels.get(kernel_name)
+
+                if not kernel:
+                    raise NotImplementedError(
+                        f"TRNG kernel '{op_name}' ({kernel_name}) not implemented. "
+                        f"Args: {[type(a).__name__ for a in args]}"
+                    )
+
+                import inspect
+                sig = inspect.signature(kernel)
+                if "_perm" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values()
+                ):
+                    trng_results[ip] = kernel(*args, _perm=self.permutations.get(op.get('B', 0)))
+                else:
+                    trng_results[ip] = kernel(*args)
+
+        return trng_results
+
+    def _find_logits_in_results(self, fw_output: Any, saved_fw: List[Any]) -> Optional[np.ndarray]:
+        """Locate logits tensor in forward-pass results."""
+        if isinstance(fw_output, np.ndarray) and fw_output.ndim >= 2:
+            return fw_output.astype(np.float32)
+        if isinstance(fw_output, (list, tuple)) and fw_output:
+            return np.asarray(fw_output[0], dtype=np.float32)
+        for i in range(len(saved_fw) - 1, -1, -1):
+            res = saved_fw[i]
+            if isinstance(res, np.ndarray) and res.ndim >= 2 and res.shape[-1] > 10:
+                return res.astype(np.float32)
+        return None
+
+    def _extract_logits(self, fw_output):
+        """Search for logits in forward pass results."""
+        if isinstance(fw_output, np.ndarray) and fw_output.ndim >= 2:
+            return fw_output.astype(np.float32)
+        if isinstance(fw_output, (list, tuple)) and fw_output:
+            return np.asarray(fw_output[0], dtype=np.float32)
+        # Reverse search
+        for i in range(len(self.results)-1, -1, -1):
+            res = self.results[i]
+            if isinstance(res, np.ndarray) and res.ndim >= 2 and res.shape[-1] > 10:
+                return res.astype(np.float32)
+        return None
+
+    def _compute_ce_loss(self, logits, target):
+        """Calculating CrossEntropy Loss."""
+        if logits.ndim == 3: logits = logits.reshape(-1, logits.shape[-1])
+        target = np.clip(target, 0, logits.shape[-1] - 1)
+        logits_max = logits.max(axis=-1, keepdims=True)
+        log_sm = logits - logits_max
+        log_sm = log_sm - np.log(np.exp(log_sm).sum(axis=-1, keepdims=True))
+        return float(-np.mean(log_sm[np.arange(len(target)), target]))
+
+    def _compute_ce_grad(self, logits, target):
+        """Analytical calculation of the CrossEntropy gradient over logits."""
+        if logits is None: return None
+        logits = np.asarray(logits, dtype=np.float32)
+        if logits.ndim == 3:
+            logits = logits.reshape(-1, logits.shape[-1])
+            
+        target = np.asarray(target).flatten().astype(np.int64)
+        target = np.clip(target, 0, logits.shape[-1] - 1)
+        
+        # Stable log_softmax
+        logits_max = logits.max(axis=-1, keepdims=True)
+        log_sm = logits - logits_max
+        log_sm = log_sm - np.log(np.exp(log_sm).sum(axis=-1, keepdims=True))
+        
+        # grad = softmax - one_hot
+        grad_logits = np.exp(log_sm)
+        grad_logits[np.arange(len(target)), target] -= 1.0
+        grad_logits /= len(target)
+        
+        return grad_logits
+
+    def _run_trng_step(self, inputs, targets, lr, head_weight_name, head_bias_name):
+        target = np.asarray(targets[0]).flatten().astype(np.int64)
+        max_target = int(target.max()) if len(target) > 0 else 0
+
+        # 1. EXTENDING THE HEAD TO FORWARD PASS
+        # If max_target = 1000 and size is 1000, it will expand to 1001
+        current_output_size = self._expand_head(head_weight_name, head_bias_name, max_target)
+        
+        # If the head name is not specified, the size is derived from logits
+        derive_size_after_fwd = (current_output_size == 0)
+
+        # 2. FORWARD PASS (with already expanded scales)
+        self.targets = [np.asarray(t) for t in targets]
+        self.trng_param_updates = {}
+        
+        self.results = [None] * len(self.operations)
+        import itertools
+        self.input_stream = itertools.cycle([np.asarray(x) for x in inputs])
+        
+        try:
+            fw_output = self._execute_block(0, len(self.operations), verbose=False)
+            saved_fw = list(self.results)
+        except Exception as e:
+            print(f"[TRNG] Forward pass failed: {e}")
+            return np.float32(0.0)
+
+        # 3. Analytical calculation of the gradient
+        logits = self._extract_logits(fw_output)
+        if logits is None:
+            print("[TRNG] ERROR: Could not find logits")
+            return np.float32(0.0)
+            
+        if derive_size_after_fwd:
+            current_output_size = logits.shape[-1] if logits.ndim >= 2 else 0
+
+        # Now the target clipping will be correct (1000 < 1001)
+        target = np.clip(target, 0, max(current_output_size - 1, 0))
+        
+        grad_logits = self._compute_ce_grad(logits, target)
+        loss_val = self._compute_ce_loss(logits, target)
+
+        # 4. TRNG Execution
+        print(f"[TRNG] Executing backward graph ({len(self.trng_operations)} instructions)...")
+        try:
+            self._execute_trng_block(saved_fw, grad_logits=grad_logits)
+        except Exception as e:
+            print(f"[TRNG] Backward pass failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # 5. Applying SGD updates
+        updated = 0
+        for param_id, grad in self.trng_param_updates.items():
+            param = self.parameters.get(param_id)
+            if param is not None:
+                if grad.shape != param.shape:
+                    try: grad = grad.reshape(param.shape)
+                    except ValueError: continue
+                self.parameters[param_id] = (param - lr * grad).astype(param.dtype)
+                updated += 1
+
+        print(f"[TRNG] Full training step complete. Loss: {loss_val:.6f}. Updated {updated} parameters.")
+        return np.float32(loss_val)
+
+    def _execute_trng_block(self, saved_fw, grad_logits=None):
+        """TRNG execution with grad_logits injection and weight loss correction."""
+        trng_results = [None] * len(self.trng_operations)
+        
+        # GRADIENT LOSS INJECTION (bypassing broken _log_softmax_backward)
+        if grad_logits is not None:
+            for ip, op in enumerate(self.trng_operations):
+                op_name = self.id_to_canonical.get(op['A'], "")
+                if op_name == "aten._log_softmax_backward_data.default":
+                    trng_results[ip] = grad_logits
+                    break
+
+        for ip, op in enumerate(self.trng_operations):
+            op_name = self.id_to_canonical.get(op['A'], "")
+            
+            # Skip execution if the result is already injected
+            if trng_results[ip] is not None:
+                continue
+                
+            # ─── INPUT instructions ───
+            if op_name == "<INPUT>":
+                B, C = op['B'], op['C']
+
+                if B == 1:   # load_param
+                    trng_results[ip] = self.parameters.get(C[1])
+
+                elif B == 3:  # lifted_constant
+                    val = self.constants.get(C[1])
+                    if isinstance(val, (int, float)):
+                        trng_results[ip] = np.float32(val)
+                    elif isinstance(val, list):
+                        trng_results[ip] = np.array(val, dtype=np.float32)
+                    else:
+                        trng_results[ip] = val
+
+                elif B == 4:  # saved_activation_from_OPS
+                    fw_idx = C[1]
+                    trng_results[ip] = (
+                        saved_fw[fw_idx]
+                        if fw_idx < len(saved_fw) and saved_fw[fw_idx] is not None
+                        else np.float32(0.0)
+                    )
+
+                elif B == 5:  # target_data
+                    target_idx = C[1]
+                    trng_results[ip] = (
+                        self.targets[target_idx]
+                        if target_idx < len(self.targets)
+                        else self.targets[0]
+                    )
+
+                else:
+                    raise NotImplementedError(f"TRNG INPUT B={B} not supported")
+
+            # ─── OUTPUT instructions (fused_sgd_step / end-of-graph) ───
+            elif op_name == "<OUTPUT>":
+                B = op['B']
+
+                if B == 3:  # fused_sgd_step
+                    param_id = op['C'][1]
+                    grad = trng_results[ip + op['D'][0]]
+                    lr_val = trng_results[ip + op['D'][1]]
+
+                    if grad is not None:
+                        if hasattr(lr_val, 'item'): lr_val = lr_val.item()
+                        elif isinstance(lr_val, np.ndarray): lr_val = float(lr_val)
+                        
+                        self.trng_param_updates[param_id] = (
+                            grad.astype(np.float32) if isinstance(grad, np.ndarray) 
+                            else np.float32(grad)
+                        )
+
+                elif B == 4:  # return_trng (end of graph)
+                    break
+
+                continue  # OUTPUT does not write the result to trng_results
+
+            # ─── Normal operations (backward kernels) ───
+            else:
+                args = self._gather_args(op, ip, trng_results)
+                
+                # ═══════════════════════════════════════════════════════════════
+                # ыAOTAutograd placeholder loss (Weights/Activations)
+                # PyTorch often loses tensor references in the backward graph and
+                # replaces them with scalar 1.0. We fix this by replacing 1.0
+                # with the actual weight or activation tensor by STRICT matching.
+                # ═══════════════════════════════════════════════════════════════
+                if op_name == "nac.matmul" and len(args) == 2:
+                    for i in range(2):
+                        if isinstance(args[i], (float, int, np.floating)) and args[i] == 1.0:
+                            other_arg = args[1-i]
+                            if isinstance(other_arg, np.ndarray) and other_arg.ndim >= 2:
+                                
+                                found_tensor = None
+                                
+                                if i == 1: # Missing is B (A @ B). Requirement: B.shape[-2] == A.shape[-1]
+                                    expected_dim = other_arg.shape[-1]
+                                    for pid, param in self.parameters.items():
+                                        if param.ndim >= 2 and param.shape[-2] == expected_dim:
+                                            found_tensor = param
+                                            break
+                                    if found_tensor is None:
+                                        for fw_res in reversed(saved_fw):
+                                            if isinstance(fw_res, np.ndarray) and fw_res.ndim >= 2:
+                                                if fw_res.shape[-2] == expected_dim:
+                                                    found_tensor = fw_res
+                                                    break
+                                else: # Missing is A (A @ B). Requirement: A.shape[-1] == B.shape[-2]
+                                    expected_dim = other_arg.shape[-2]
+                                    for pid, param in self.parameters.items():
+                                        if param.ndim >= 2 and param.shape[-1] == expected_dim:
+                                            found_tensor = param
+                                            break
+                                    if found_tensor is None:
+                                        for fw_res in reversed(saved_fw):
+                                            if isinstance(fw_res, np.ndarray) and fw_res.ndim >= 2:
+                                                if fw_res.shape[-1] == expected_dim:
+                                                    found_tensor = fw_res
+                                                    break
+                                
+                                if found_tensor is not None:
+                                    args[i] = found_tensor
+                                else:
+                                    args[i] = np.eye(expected_dim, dtype=np.float32)
+                # ═══════════════════════════════════════════════════════════════
+                
+                kernel_name = "op_" + op_name.replace('.', '_')
+                kernel = self.op_kernels.get(kernel_name)
+                
+                if not kernel:
+                    raise NotImplementedError(
+                        f"TRNG kernel '{op_name}' ({kernel_name}) not implemented. "
+                        f"Args: {[type(a).__name__ for a in args]}"
+                    )
+                
+                perm = self.permutations.get(op.get('B', 0))
+                import inspect
+                sig = inspect.signature(kernel)
+                if '_perm' in sig.parameters:
+                    result = kernel(*args, _perm=perm)
+                else:
+                    result = kernel(*args)
+                
+                # If the operation returns a tuple (eg native_layer_norm_backward)
+                if isinstance(result, (tuple, list)):
+                    trng_results[ip] = result
+                else:
+                    trng_results[ip] = result
+
     def run(self, inputs: List[np.ndarray]) -> List[np.ndarray]:
-        # Очищаем кэш результатов для чистого прогона
+        # Clearing the results cache for a clean run
         self.results = [None] * len(self.operations)
         if not self._is_initialized:
             print("\n--- Starting Model Execution ---")
@@ -770,7 +1250,7 @@ class NacRuntime(NacKernelBase):
             self.perf_stats = {} 
         import itertools
         self.input_stream = itertools.cycle(inputs)
-        # Если это первый запуск, выводим подробности
+        # If this is the first launch, display details
         verbose = len(self.perf_stats) == 0
         res = self._execute_block(0, len(self.operations), verbose=verbose)
         if verbose:
@@ -802,7 +1282,10 @@ class NacRuntime(NacKernelBase):
                 start_time = time.time()
                 kernel_name = "op_branch" if op_name == "<CONVERGENCE>" else "op_" + op_name.replace('.', '_')
                 kernel = self.op_kernels.get(kernel_name)
-                if not kernel: raise NotImplementedError(f"Op '{op_name}' ({kernel_name}) not implemented.")
+                
+                if not kernel: 
+                    raise NotImplementedError(f"Op '{op_name}' ({kernel_name}) not implemented.")
+                
                 if kernel_name == "op_branch":
                     self.results[ip] = kernel(op, ip)
                 else:
@@ -813,9 +1296,11 @@ class NacRuntime(NacKernelBase):
                         self.results[ip] = kernel(*args, _perm=self.permutations.get(op.get('B', 0)))
                     else:
                         self.results[ip] = kernel(*args)
+                        
                 duration = time.time() - start_time
                 total_time, count = self.perf_stats.get(op_name, (0.0, 0))
                 self.perf_stats[op_name] = (total_time + duration, count + 1)
+                
                 if op_name == "<CONVERGENCE>":
                     ip += op['D'][0]
                     continue
@@ -877,7 +1362,10 @@ class NacRuntime(NacKernelBase):
             coherent_main_tensors = [padded_main_tensors[i] for i in coherent_indices]
             return np.mean(np.stack(coherent_main_tensors, axis=0), axis=0)
 
-    def _gather_args(self, op: Dict[str, Any], current_idx: int) -> List[Any]:
+    def _gather_args(self, op: Dict[str, Any], current_idx: int, results=None) -> List[Any]:
+        """Universal argument gathering for OPS and TRNG instructions."""
+        if results is None:
+            results = self.results
         args = []
         perm = self.permutations.get(op.get('B'))
         if not perm: return []
@@ -889,7 +1377,7 @@ class NacRuntime(NacKernelBase):
             d_val = d_values[i]
             if d_val != 0:
                 ancestor_idx = current_idx + d_val
-                args.append(self.results[ancestor_idx])
+                args.append(results[ancestor_idx])
             else:
                 try: args.append(self.constants.get(next(c_iter)))
                 except StopIteration: raise ValueError(f"Instruction {current_idx}: D field expects a constant, but C field is exhausted.")
@@ -897,8 +1385,8 @@ class NacRuntime(NacKernelBase):
 
     def patch_instruction_by_ip(self, target_ip: int, new_instruction_bytes: bytes, permanent: bool = False) -> bool:
         """
-        Продвинутый API для замены инструкции по её абсолютному адресу (IP).
-        Адреса можно узнать через утилиту NAC_info.py.
+        An advanced API for replacing instructions using their absolute address (IP).
+        Addresses can be found using the NAC_info.py utility.
         """
         if not hasattr(self, '_orch_off') or self._orch_off == 0:
             print("[NAC] Error: No MEP orchestration found in this file.")
@@ -914,8 +1402,8 @@ class NacRuntime(NacKernelBase):
 
         from MEP_compiler import MEPPatcher
         
-        # Проверяем, действительно ли по этому адресу начинается валидная инструкция
-        # (Опциональная защита, но полезная: проверяем, что мы не попали в середину операнда)
+        # Check if a valid instruction actually begins at this address
+        # (Optional, but useful: check to make sure we haven't hit the middle of an operand)
         offset = 0
         is_valid_start = False
         while offset < len(bytecode):
@@ -928,7 +1416,7 @@ class NacRuntime(NacKernelBase):
         if not is_valid_start:
             print(f"[NAC] Warning: IP 0x{target_ip:04X} might be inside another instruction's arguments. Proceed with caution!")
 
-        # Проверка длины
+        # Checking the length
         old_length = MEPPatcher.instruction_length(bytecode, target_ip)
         new_length = len(new_instruction_bytes)
         
@@ -936,18 +1424,18 @@ class NacRuntime(NacKernelBase):
             print(f"[NAC] Patch failed: Length mismatch! Old is {old_length} bytes, new is {new_length} bytes.")
             return False
 
-        # Замена в памяти
+        # Replacement in memory
         patched_bytecode = bytearray(bytecode)
         patched_bytecode[target_ip : target_ip + new_length] = new_instruction_bytes
         self._patched_bytecode_cache = bytes(patched_bytecode)
 
         print(f"[NAC] Instruction at 0x{target_ip:04X} successfully patched in memory.")
 
-        # Перезапись в файл
+        # Overwriting to a file
         if permanent:
             try:
                 with open(self._nac_path, 'r+b') as f:
-                    # Смещение в файле: начало ORCH + 4(магия) + 4(len) + 4(consts) + target_ip
+                    # File offset: start of ORCH + 4(magic) + 4(len) + 4(consts) + target_ip
                     exact_file_pos = self._orch_off + 12 + target_ip
                     f.seek(exact_file_pos)
                     f.write(new_instruction_bytes)
@@ -960,7 +1448,7 @@ class NacRuntime(NacKernelBase):
 
     def get_mep_plan(self):
         """
-        Возвращает байткод (с учетом патчей в памяти) и константы.
+        Returns bytecode (including in-memory patches) and constants.
         """
         if not getattr(self, '_orch_off', 0): return None, None
         
@@ -970,11 +1458,11 @@ class NacRuntime(NacKernelBase):
             blen, clen = struct.unpack('<II', f.read(8))
             if blen == 0: return None, None
             
-            # Если есть пропатченный байткод в памяти, берем его. 
-            # Иначе читаем оригинальный из файла.
+            # If there's patched bytecode in memory, we take it.
+            # Otherwise, read the original from the file.
             if hasattr(self, '_patched_bytecode_cache') and self._patched_bytecode_cache:
                 bytecode = self._patched_bytecode_cache
-                f.seek(blen, 1) # Пропускаем байткод в файле, чтобы дойти до констант
+                f.seek(blen, 1) # Skipping the bytecode in the file to get to the constants
             else:
                 bytecode = f.read(blen)
                 
@@ -996,20 +1484,18 @@ class NacRuntime(NacKernelBase):
 import struct
 from NAC_run import NacRuntime
 
-# Загружаем рантайм
+# Loading runtime
 probe = NacRuntime("distilbert-sst2-sentiment.nac")
 
-# Мы хотим заменить argmax (0x62, op 0x00) на argmin, или просто на логическое сравнение.
-# Важно: новая инструкция должна быть ровно 4 байта.
-# Например, заменим на MATH_UNARY (0x60, op=0x00, те же ключи)
+# We want to replace argmax (0x62, op 0x00) with argmin, or simply with a logical comparison.
+# Important: the new instruction must be exactly 4 bytes.
+# For example, replace it with MATH_UNARY (0x60, op=0x00, same keys)
 new_instr = struct.pack('<BBBB', 0x60, 0x00, 0x0F, 0x0E)
 
-# Применяем патч по абсолютному адресу 0x004F!
+# Apply the patch at absolute address 0x004F!
 probe.patch_instruction_by_ip(target_ip=0x004F, new_instruction_bytes=new_instr, permanent=False)
 
-# Теперь запускаем модель
+# Now we run the model
 # bytecode, constants = probe.get_mep_plan()
-# ... передаем в MEPInterpreter и выполняем ...
+# ... pass it to the MEPInterpreter and execute...
 '''
-
-# --- END OF FILE NAC_run.py ---

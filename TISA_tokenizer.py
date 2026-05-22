@@ -90,6 +90,7 @@ class Primitives:
             if n == 0: continue
             dp, best_path = [-1e10] * (n + 1), [0] * (n + 1); dp[0] = 0
             for i in range(n):
+                if dp[i] == -1e10: continue
                 for j in range(i + 1, min(n + 1, i + 50)):
                     sub = text[i:j]
                     if sub in scores:
@@ -105,15 +106,23 @@ class Primitives:
         state['ids'] = final_ids
 
     @staticmethod
-    def BPE_ENCODE(state, res, _):
+    def BPE_ENCODE(state, res, args):
         ranks, vocab = res['ranks'], res['vocab']
+        suffix = args.get('suffix', '') if args else ''
         final_ids, unk_id = [], vocab.get('<unk>', vocab.get('[UNK]', 0))
         for frag in state['fragments']:
             if frag.is_protected: 
                 tid = vocab.get(frag.text)
                 if tid is None: tid = vocab.get(frag.text.strip(), unk_id)
                 final_ids.append(tid); continue
-            word = tuple(frag.text)
+            
+            chars = list(frag.text)
+            if not chars: continue
+            
+            if suffix:
+                chars[-1] += suffix
+                
+            word = tuple(chars)
             while len(word) > 1:
                 pairs = [(word[i], word[i+1]) for i in range(len(word)-1)]
                 best_pair = min(pairs, key=lambda p: ranks.get(p, float('inf')))
@@ -163,15 +172,17 @@ class TISAVM:
     def __init__(self, resources):
         self.res = resources
         self.id_to_token = {}
+        self.token_to_id = {}
         if self.res and 'vocab' in self.res:
             vocab_data = self.res['vocab']
             if isinstance(vocab_data, dict):
-                # Стандартный случай (BPE, WordPiece): {"токен": id}
                 self.id_to_token = {v: k for k, v in vocab_data.items()}
+                self.token_to_id = vocab_data
             elif isinstance(vocab_data, list):
-                # Случай Unigram: [["токен", score], ...]
-                # ID здесь - это просто индекс в списке
                 self.id_to_token = {i: token for i, (token, score) in enumerate(vocab_data)}
+                self.token_to_id = {token: i for i, (token, score) in enumerate(vocab_data)}
+                self.res['vocab'] = self.token_to_id
+                
         self.dispatch = {
             0x01: Primitives.LOWERCASE,
             0x02: Primitives.UNICODE_NORM,
@@ -185,6 +196,9 @@ class TISAVM:
             0x22: Primitives.UNIGRAM_ENCODE,
             0x30: Primitives.COMPOSE
         }
+
+    def get_token_id(self, token: str) -> Optional[int]:
+        return self.token_to_id.get(token)
 
     def run(self, manifest_data: Union[bytes, List], text: str):
         state = {'text': text, 'fragments': [], 'ids': []}
@@ -205,14 +219,6 @@ class TISAVM:
         for opcode, payload in commands:
             self.dispatch[opcode](state, self.res, payload)
         return state['ids']
-
-    def get_token_id(self, token: str) -> Optional[int]:
-        """Возвращает ID для строкового токена из словаря."""
-        # 'vocab' должен быть в ресурсах как словарь {токен: id}
-        vocab = self.res.get('vocab')
-        if vocab and isinstance(vocab, dict):
-            return vocab.get(token)
-        return None
 
     def decode(self, ids: List[int], skip_special_tokens: bool = True) -> str:
         tokens = []
@@ -235,8 +241,15 @@ class TISAVM:
                 for token in tokens:
                     for char in token:
                         if char in byte_decoder: full_bytes.append(byte_decoder[char])
-                return full_bytes.decode('utf-8', errors='replace')
-            except Exception: return "".join(tokens).replace('Ġ', ' ').strip()
+                decoded_str = full_bytes.decode('utf-8', errors='replace')
+                if '</w>' in decoded_str:
+                    decoded_str = decoded_str.replace('</w>', ' ')
+                return decoded_str
+            except Exception: 
+                decoded_str = "".join(tokens)
+                if '</w>' in decoded_str:
+                    return decoded_str.replace('</w>', ' ')
+                return decoded_str.replace('Ġ', ' ').strip()
         if model_type == "WordPiece":
             output_string = " ".join(tokens).replace(" ##", "")
             output_string = re.sub(r'\s+([.,!?"\'])', r'\1', output_string).replace(" ' ", "'")
@@ -272,43 +285,70 @@ class TISACompiler:
                     ])
 
     @staticmethod
-    def _process_pre_tokenizer(pre_tok_config: Dict, rules: List, frag_pipeline: List, instructions: List) -> bool:
+    # Passing has_space_handler deeper into the recursion
+    def _process_pre_tokenizer(pre_tok_config: Dict, rules: List, frag_pipeline: List, instructions: List, has_space_handler: bool = False) -> bool:
         if not pre_tok_config:
-            return False
+            return has_space_handler
+            
         pre_tok_type = pre_tok_config.get('type')
-        has_space_handler = False
+        
         if pre_tok_type == 'Sequence':
             for p in pre_tok_config.get('pre_tokenizers', []):
-                if TISACompiler._process_pre_tokenizer(p, rules, frag_pipeline, instructions):
+                # Maintaining the state of space handling while traversing the chain
+                if TISACompiler._process_pre_tokenizer(p, rules, frag_pipeline, instructions, has_space_handler):
                     has_space_handler = True
+                    
         elif pre_tok_type == 'Metaspace':
             replacement = pre_tok_config.get('replacement', '\u2581')
             instructions.append([0x03, {'pattern': ' ', 'val': replacement}])
             if pre_tok_config.get('add_prefix_space', True):
                 instructions.append([0x07, {'val': replacement}])
             has_space_handler = True
+            
         elif pre_tok_type == 'ByteLevel':
             if pre_tok_config.get('add_prefix_space'):
                 instructions.append([0x07, {'val': ' '}])
-            pattern = pre_tok_config.get('pattern')
-            if pattern:
-                rules.append({'pattern': pattern, 'regex': True})
-            else:
-                rules.append({'pattern': r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+", 'regex': True})
+            
+            if pre_tok_config.get('use_regex', True):
+                pattern = pre_tok_config.get('pattern')
+                if pattern:
+                    rules.append({'pattern': pattern, 'behavior': 'ISOLATE', 'regex': True})
+                    if not has_space_handler:
+                        rules.insert(0, {'pattern': r'\s+', 'behavior': 'REMOVE', 'regex': True})
+                        has_space_handler = True
+                else:
+                    # If spaces have ALREADY been removed (for example, WhitespaceSplit worked),
+                    # we use a regular expression without optional spaces (without '?' and '\s+'),
+                    # so it doesn't eat up indentation and generate the garbage character 'Ġ' (220).
+                    if has_space_handler:
+                        rules.append({'pattern': r"'s|'t|'re|'ve|'m|'ll|'d|\p{L}+|\p{N}+|[^\s\p{L}\p{N}]+", 'regex': True})
+                    else:
+                        rules.append({'pattern': r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+", 'regex': True})
+                        has_space_handler = True
+                        
             frag_pipeline.append({'type': 'BYTE_ENCODE'})
-            has_space_handler = True
-        elif pre_tok_type == 'Split' and pre_tok_config.get('invert'):
+            
+        elif pre_tok_type == 'Split':
             pattern_regex = pre_tok_config.get('pattern', {}).get('Regex')
             if pattern_regex:
-                rules.append({'pattern': pattern_regex, 'regex': True})
+                if pre_tok_config.get('invert'):
+                    rules.append({'pattern': pattern_regex, 'behavior': 'REMOVE', 'regex': True})
+                else:
+                    rules.append({'pattern': pattern_regex, 'behavior': 'ISOLATE', 'regex': True})
+                    if not has_space_handler:
+                        rules.insert(0, {'pattern': r'\s+', 'behavior': 'REMOVE', 'regex': True})
+                        has_space_handler = True
+                        
         elif pre_tok_type in ('BertPreTokenizer', 'WhitespaceSplit'):
             if not has_space_handler:
                 rules.insert(0, {'pattern': r'\s+', 'behavior': 'REMOVE', 'regex': True})
+                has_space_handler = True
             if pre_tok_type == 'BertPreTokenizer':
                 rules.extend([
                     {'pattern': r'\p{P}', 'behavior': 'ISOLATE', 'regex': True},
                     {'pattern': r'[\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]', 'behavior': 'ISOLATE', 'regex': True}
                 ])
+                
         return has_space_handler
 
     @staticmethod
@@ -347,21 +387,32 @@ class TISACompiler:
                  rule['trim_preceding_space'] = '\u2581'
             rules.append(rule)
         frag_pipeline = []
-        TISACompiler._process_pre_tokenizer(pre_tokenizer_config, rules, frag_pipeline, instructions)
+        
+        # start processing without spaces
+        TISACompiler._process_pre_tokenizer(pre_tokenizer_config, rules, frag_pipeline, instructions, has_space_handler=False)
+        
         instructions.append([0x10, {'rules': rules}])
         if frag_pipeline:
             instructions.append([0x15, {'pipeline': frag_pipeline}])
+            
         if model_type == 'BPE':
             if not any(op.get('type') == 'BYTE_ENCODE' for op in frag_pipeline) and \
                state.get('decoder', {}).get('type') == 'ByteLevel':
                 instructions.append([0x15, {'pipeline': [{'type': 'BYTE_ENCODE'}]}])
-            instructions.append([0x20, {}])
+                
+            bpe_args = {}
+            # universally apply the suffix to any BPE if it is in the config
+            suffix = model_config.get('end_of_word_suffix')
+            if suffix:
+                bpe_args['suffix'] = suffix
+            instructions.append([0x20, bpe_args])
+            
         elif model_type == 'WordPiece':
             instructions.append([0x21, {'marker': model_config.get('continuing_subword_prefix', '##')}])
         elif model_type == 'Unigram':
             instructions.append([0x22, {}])
+            
         post_config = state.get('post_processor')
-
         template = [('SLOT', None)]
         if post_config:
             post_type = post_config['type']
@@ -375,16 +426,14 @@ class TISACompiler:
                 template = [('FIXED', post_config['cls'][1]), ('SLOT', None), ('FIXED', post_config['sep'][1])]
         else:
             if getattr(tokenizer, 'add_bos_token', False) and hasattr(tokenizer, 'bos_token_id'):
-                # template already has ('SLOT', None), so we insert it at the beginning
                 template.insert(0, ('FIXED', tokenizer.bos_token_id))
             if getattr(tokenizer, 'add_eos_token', False) and hasattr(tokenizer, 'eos_token_id'):
                 template.append(('FIXED', tokenizer.eos_token_id))
         
-        # If the pattern remains simply [('SLOT', None)], then the COMPOSE opcode is not needed
         if template != [('SLOT', None)]:
             instructions.append([0x30, {'template': template}])
 
-        buf = bytearray(b"TISA\x01") # Magic + version
+        buf = bytearray(b"TISA\x01")
         for op, payload in instructions:
             p_bytes = TISACompiler._serialize_payload_binary(op, payload)
             buf.append(op)
@@ -394,33 +443,31 @@ class TISACompiler:
 
     @staticmethod
     def _serialize_payload_binary(opcode: int, payload: Dict) -> bytes:
-        """Serializes the payload to binary format instead of JSON."""
         buf = bytearray()
-        if opcode == 0x01: # LOWERCASE
-            pass # No payload
-        elif opcode == 0x02: # UNICODE_NORM
+        if opcode == 0x01: pass
+        elif opcode == 0x02:
             form_bytes = payload['form'].encode('utf-8')
             buf.extend(struct.pack('<B', len(form_bytes)))
             buf.extend(form_bytes)
-        elif opcode == 0x03: # REPLACE
+        elif opcode == 0x03:
             pattern_bytes = payload['pattern'].encode('utf-8')
             val_bytes = payload['val'].encode('utf-8')
             buf.extend(struct.pack('<H', len(pattern_bytes)))
             buf.extend(pattern_bytes)
             buf.extend(struct.pack('<H', len(val_bytes)))
             buf.extend(val_bytes)
-        elif opcode == 0x04: # FILTER_CATEGORY
+        elif opcode == 0x04:
             cats = payload['cats']
             buf.extend(struct.pack('<B', len(cats)))
             for cat in cats:
                 cat_bytes = cat.encode('utf-8')
                 buf.extend(struct.pack('<B', len(cat_bytes)))
                 buf.extend(cat_bytes)
-        elif opcode == 0x07: # PREPEND
+        elif opcode == 0x07:
             val_bytes = payload['val'].encode('utf-8')
             buf.extend(struct.pack('<H', len(val_bytes)))
             buf.extend(val_bytes)
-        elif opcode == 0x10: # PARTITION_RULES
+        elif opcode == 0x10:
             rules = payload.get('rules', [])
             buf.extend(struct.pack('<H', len(rules)))
             behavior_map = {'REMOVE': 1, 'ISOLATE': 2}
@@ -439,17 +486,23 @@ class TISACompiler:
                     buf.extend(struct.pack('<B', behavior_map.get(rule['behavior'], 0)))
                 if 'trim_preceding_space' in rule:
                     trim_bytes = rule['trim_preceding_space'].encode('utf-8')
-                    buf.extend(struct.pack('<B', len(trim_bytes))) # Write down the length
-                    buf.extend(trim_bytes)                         # Write the bytes themselves
-        elif opcode == 0x15: # BYTE_ENCODE
-            pass
-        elif opcode in (0x20, 0x22): # BPE_ENCODE, UNIGRAM_ENCODE
-            pass
-        elif opcode == 0x21: # WORDPIECE_ENCODE
+                    buf.extend(struct.pack('<B', len(trim_bytes))) 
+                    buf.extend(trim_bytes)                         
+        elif opcode in (0x15, 0x22):
+            pass 
+        elif opcode == 0x20:
+            suffix = payload.get('suffix', '')
+            if suffix:
+                suffix_bytes = suffix.encode('utf-8')
+                buf.extend(struct.pack('<B', len(suffix_bytes)))
+                buf.extend(suffix_bytes)
+            else:
+                buf.extend(struct.pack('<B', 0))
+        elif opcode == 0x21:
             marker_bytes = payload['marker'].encode('utf-8')
             buf.extend(struct.pack('<B', len(marker_bytes)))
             buf.extend(marker_bytes)
-        elif opcode == 0x30: # COMPOSE
+        elif opcode == 0x30:
             template = payload.get('template', [])
             buf.extend(struct.pack('<B', len(template)))
             for item_type, value in template:
@@ -477,24 +530,23 @@ class TISACompiler:
 
     @staticmethod
     def _deserialize_payload_binary(opcode: int, p_bytes: bytes) -> Dict:
-        """Deserializes the payload from binary format back to Dict."""
         payload = {}
         offset = 0
-        if opcode == 0x02: # UNICODE_NORM
+        if opcode == 0x02:
             payload['form'], offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 1)
-        elif opcode == 0x03: # REPLACE
+        elif opcode == 0x03:
             payload['pattern'], offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 2)
             payload['val'], offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 2)
-        elif opcode == 0x04: # FILTER_CATEGORY
+        elif opcode == 0x04:
             num_cats = struct.unpack('<B', p_bytes[offset:offset+1])[0]; offset += 1
             cats = []
             for _ in range(num_cats):
                 cat, offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 1)
                 cats.append(cat)
             payload['cats'] = cats
-        elif opcode == 0x07: # PREPEND
+        elif opcode == 0x07:
             payload['val'], offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 2)
-        elif opcode == 0x10: # PARTITION_RULES
+        elif opcode == 0x10:
             num_rules = struct.unpack('<H', p_bytes[offset:offset+2])[0]; offset += 2
             rules = []
             behavior_map_rev = {1: 'REMOVE', 2: 'ISOLATE'}
@@ -513,11 +565,19 @@ class TISACompiler:
                     offset += trim_len
                 rules.append(rule)
             payload['rules'] = rules
-        elif opcode == 0x15: # BYTE_ENCODE
+        elif opcode == 0x15:
              payload['pipeline'] = [{'type': 'BYTE_ENCODE'}]
-        elif opcode == 0x21: # WORDPIECE_ENCODE
+        elif opcode == 0x22:
+             pass
+        elif opcode == 0x20:
+             if len(p_bytes) > offset:
+                 suffix_len = struct.unpack('<B', p_bytes[offset:offset+1])[0]; offset += 1
+                 if suffix_len > 0:
+                     payload['suffix'] = p_bytes[offset:offset+suffix_len].decode('utf-8')
+                     offset += suffix_len
+        elif opcode == 0x21:
             payload['marker'], offset = TISACompiler._read_string_from_buffer(p_bytes, offset, 1)
-        elif opcode == 0x30: # COMPOSE
+        elif opcode == 0x30:
             num_items = struct.unpack('<B', p_bytes[offset:offset+1])[0]; offset += 1
             template = []
             for _ in range(num_items):
@@ -542,14 +602,10 @@ class TISACompiler:
         if state['model']['type'] == 'Unigram':
             for t, s in state['model']['vocab']: scores[t] = s
         res['ranks'] = ranks; res['unigram_scores'] = scores
-        # Range 1: 33-126  (from '!' to '~')
-        # Range 2: 161-172 (from '¡' to '¬')
-        # Range 3: 174-255 (from '®' to 'ÿ')
         bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
         res['byte_map'] = dict(zip(bs + [b for b in range(256) if b not in bs], [chr(c) for c in bs + [256 + i for i in range(256-len(bs))]]))
         return res
 
-# --- Opcode Name Dictionary for Disassembler ---
 OPCODE_NAMES = {
     0x01: "LOWERCASE",
     0x02: "UNICODE_NORM",
@@ -557,14 +613,13 @@ OPCODE_NAMES = {
     0x04: "FILTER_CATEGORY",
     0x07: "PREPEND",
     0x10: "PARTITION_RULES",
-    0x15: "BYTE_ENCODE", # Specific FRAG_TRANSFORM
+    0x15: "BYTE_ENCODE",
     0x20: "BPE_ENCODE",
     0x21: "WORDPIECE_ENCODE",
     0x22: "UNIGRAM_ENCODE",
     0x30: "COMPOSE"
 }
 
-# --- Disassembler Function---
 def disassemble_TISA_manifest(manifest_bytes: bytes) -> Dict[str, Any]:
     if manifest_bytes[:4] != b"TISA":
         raise ValueError("Invalid Magic. Expected b'TISA'.")
@@ -575,7 +630,6 @@ def disassemble_TISA_manifest(manifest_bytes: bytes) -> Dict[str, Any]:
         p_len = struct.unpack("<I", manifest_bytes[offset:offset+4])[0]; offset += 4
         
         payload_bytes = manifest_bytes[offset:offset+p_len]
-
         payload = TISACompiler._deserialize_payload_binary(opcode, payload_bytes)
         offset += p_len
 

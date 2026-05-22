@@ -1,5 +1,3 @@
-# --- START OF FILE NAC.py ---
-
 # Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 ## torch==2.5.1
 ## torchvision==0.20.1
@@ -85,6 +83,14 @@ class ResultManager:
     def _map_dtype_to_enum(self, dtype):
         return {torch.float32:0, torch.float64:1, torch.float16:2, torch.bfloat16:3, torch.int32:4, torch.int64:5, torch.int16:6, torch.int8:7, torch.uint8:8, torch.bool:9}.get(dtype, 255)
 
+    def _map_np_dtype_to_enum(self, dtype) -> int:
+        mapping = {
+            np.dtype('float32'): 0, np.dtype('float64'): 1, np.dtype('float16'): 2,
+            np.dtype('int32'): 4, np.dtype('int64'): 5, np.dtype('int16'): 6,
+            np.dtype('int8'): 7, np.dtype('uint8'): 8, np.dtype('bool'): 9
+        }
+        return mapping.get(np.dtype(dtype), 0) # Fallback to float32
+
     @staticmethod
     def _serialize_mep_constant(const_id: int, val) -> bytes:
         type_code, length, value_bytes = 0, 0, b''
@@ -116,7 +122,7 @@ class ResultManager:
         if value_bytes: out += value_bytes
         return out
 
-    def save_model_nac(self, model_name, used_mappings, nodes, param_data, param_id_to_name, input_node_idx_to_name, d_model=0, tokenizer_manifest=None, tokenizer_resources=None, quant_method='none', store_weights_internally=True, io_counts=(0,0), memory_map=None, mep_program=None, trng_nodes=None):
+    def save_model_nac(self, model_name, used_mappings, nodes, param_data, param_id_to_name, input_node_idx_to_name, d_model=0, tokenizer_manifest=None, tokenizer_resources=None, quant_method='none', store_weights_internally=True, io_counts=(0,0), memory_map=None, mep_program=None, trng_nodes=None, mep_arrays=None):
         filepath = os.path.join(self.output_path, f"{model_name}.nac")
         try:
             with open(filepath, 'wb') as f:
@@ -130,7 +136,7 @@ class ResultManager:
                 f.write(struct.pack('<B', quant_id))
                 f.write(struct.pack('<HHB', io_counts[0], io_counts[1], 0))
                 
-                offsets_header_format = '<H10Q' 
+                offsets_header_format = '<H11Q' 
                 f.write(b'\0' * struct.calcsize(offsets_header_format)) 
                 offsets = {}
 
@@ -293,17 +299,41 @@ class ResultManager:
                         f.write(struct.pack('<I', len(content)))
                         f.write(content)
 
+                offsets['arrs'] = f.tell()
+                f.write(b'ARRS')
+                if mep_arrays:
+                    f.write(struct.pack('<I', len(mep_arrays)))
+                    for arr_name, arr_data in mep_arrays.items():
+                        name_bytes = str(arr_name).encode('utf-8')
+                        f.write(struct.pack('<H', len(name_bytes)))
+                        f.write(name_bytes)
+                        
+                        arr_np = np.asarray(arr_data)
+                        dtype_enum = self._map_np_dtype_to_enum(arr_np.dtype)
+                        
+                        shape = list(arr_np.shape)
+                        rank = len(shape)
+                        f.write(struct.pack('<BB', dtype_enum, rank))
+                        if rank > 0:
+                            f.write(struct.pack(f'<{rank}I', *shape))
+                        
+                        data_bytes = arr_np.tobytes()
+                        f.write(struct.pack('<Q', len(data_bytes)))
+                        f.write(data_bytes)
+                else:
+                    f.write(struct.pack('<I', 0))
+
                 f.seek(10)
                 all_offsets = [
                     offsets.get('mmap', 0), offsets.get('ops',  0), offsets.get('cmap', 0),
                     offsets.get('cnst', 0), offsets.get('perm', 0), offsets.get('data', 0),
                     offsets.get('proc', 0), offsets.get('orch', 0), offsets.get('trng', 0),
-                    offsets.get('rsrc', 0),
+                    offsets.get('rsrc', 0), offsets.get('arrs', 0),
                 ]
                 f.write(struct.pack(offsets_header_format, d_model, *all_offsets))
 
             storage_method = "internally" if store_weights_internally else "externally"
-            print(f"NAC v1.7 for '{model_name}' saved successfully (Quant: {quant_method}, Weights: {storage_method}, TRNG: {has_trng}).")
+            print(f"NAC v1.8 for '{model_name}' saved successfully (Quant: {quant_method}, Weights: {storage_method}, TRNG: {has_trng}).")
         except Exception as e:
             print(f"!!!!! ERROR saving NAC for {model_name}: {e}"); traceback.print_exc()
 
@@ -437,6 +467,7 @@ class ModelProcessor:
             if isinstance(v, torch.SymInt): return v.node.meta.get("val", v)
             if isinstance(v, (list, tuple)): return type(v)(_extract_val(i) for i in v)
             return v
+            
         def _get_const_code(val, name: Optional[str] = None):
             if name and name in self.NAME_TO_CONST_CODE: return self.NAME_TO_CONST_CODE[name]
             if isinstance(val, bool): return 'b'
@@ -445,6 +476,7 @@ class ModelProcessor:
             if isinstance(val, str): return 's'
             if isinstance(val, (list, tuple)): return 'S'
             return 'c'
+            
         def _get_code_from_node(n: fx.Node, arg_name: str) -> str:
             if arg_name in self.NAME_TO_OFFSET_CODE: return self.NAME_TO_OFFSET_CODE[arg_name]
             if n.op == 'placeholder':
@@ -455,6 +487,12 @@ class ModelProcessor:
             return 'T'
 
         is_getitem = (node.op == 'call_function' and node.target is operator.getitem)
+        is_shape_op = False
+        is_cat = False
+        if node.op in ('call_function', 'call_method'):
+            target_str = str(node.target)
+            is_shape_op = any(x in target_str for x in ('view', 'reshape', 'expand', 'unsqueeze', 'squeeze', 'transpose', 'permute', 'narrow', 'chunk', 'split', 'repeat'))
+            is_cat = 'cat' in target_str
 
         if hasattr(node.target, 'schema'):
             try:
@@ -468,7 +506,9 @@ class ModelProcessor:
                     for item in items_to_process:
                         if isinstance(item, fx.Node): details.append((_get_code_from_node(item, name), None, item))
                         else:
-                            if is_getitem and isinstance(item, float) and item == int(item): item = int(item)
+                            if (is_getitem or is_shape_op) and isinstance(item, float) and item.is_integer(): item = int(item)
+                            elif is_shape_op and isinstance(item, (list, tuple)):
+                                item = type(item)(int(x) if isinstance(x, float) and x.is_integer() else x for x in item)
                             details.append((_get_const_code(item, name), item, None))
                 return details 
             except Exception: pass
@@ -477,14 +517,23 @@ class ModelProcessor:
         if node.op == 'output':
              all_args = all_args[0] if all_args and isinstance(all_args[0], (list, tuple)) else all_args
              self.io_counts = (self.io_counts[0], len(all_args))
-        for arg in all_args:
+        
+        for i, arg in enumerate(all_args):
             val = _extract_val(arg)
             items_to_process = val if isinstance(val, (list, tuple)) and any(isinstance(x, fx.Node) for x in val) else [val]
             for item in items_to_process:
                 if isinstance(item, fx.Node): details.append(('T', None, item))
                 else:
-                    if is_getitem and isinstance(item, float) and item == int(item): item = int(item)
-                    details.append((_get_const_code(item), item, None))
+                    if (is_getitem or is_shape_op) and isinstance(item, float) and item.is_integer(): 
+                        item = int(item)
+                    elif is_shape_op and isinstance(item, (list, tuple)):
+                        item = type(item)(int(x) if isinstance(x, float) and x.is_integer() else x for x in item)
+                    
+                    code = _get_const_code(item)
+                    if is_cat and isinstance(item, int) and i == 1:
+                        code = 'A'
+                        
+                    details.append((code, item, None))
         return details
 
     def _get_canonical_argument_details(self, node: fx.Node) -> List[Tuple[str, Any, Optional[fx.Node]]]:
@@ -589,12 +638,10 @@ class ModelProcessor:
             if sig == "<INPUT>":
                 is_mapped = False
 
-                # 1. Сначала проверяем на Tangent
                 if node.meta.get('is_tangent'):
                     B, C = 3, [1, one_const_id]
                     is_mapped = True
 
-                # 2. Если есть orig_node - используем жесткую привязку к исходному графу
                 elif node.meta.get('orig_node') is not None:
                     orig_node = node.meta['orig_node']
 
@@ -626,7 +673,6 @@ class ModelProcessor:
                         B, C = 3, [1, ModelProcessor.const_to_id[hc]]
                         is_mapped = True
 
-                # 3. Если это таргет тензор от LossWrapper
                 if not is_mapped:
                     meta = node.meta.get('tensor_meta')
                     if meta is not None and meta.dtype in (torch.long, torch.int, torch.int32):
@@ -835,6 +881,23 @@ class ModelProcessor:
                 self.param_to_id[mangled] = current_param_id; self.param_id_to_name[current_param_id] = clean
                 self.param_data_map[current_param_id] = state_dict[clean].detach()
                 self.param_nodes.add(node); current_param_id += 1
+                
+        for node in main_graph.nodes:
+            if node.op == 'get_attr':
+                target_str = str(node.target)
+                if target_str in state_dict:
+                    data = state_dict[target_str].detach()
+                elif hasattr(exported_program.graph_module, target_str):
+                    data = getattr(exported_program.graph_module, target_str).detach()
+                else:
+                    continue
+                    
+                if node not in self.param_nodes:
+                    self.param_to_id[target_str] = current_param_id
+                    self.param_id_to_name[current_param_id] = target_str
+                    self.param_data_map[current_param_id] = data
+                    self.param_nodes.add(node)
+                    current_param_id += 1
         
         lifted_placeholders = all_placeholders - self.data_input_nodes - self.param_nodes
         if lifted_placeholders:
@@ -1102,7 +1165,28 @@ LOSS_TYPE_MAP: Dict[str, int] = {
     'none':          255,
 }
 
-def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tuple, dummy_targets: Optional[Tuple]=None, loss_type: str='none', lr: float = 0.001, d_model: Optional[int] = None, quantization_method: str = 'none', dynamic_shapes=None, store_weights_internally=True, io_counts=(0,0), tokenizer_repo=None, optimize = True, tokenizer_input: str = 'none', optimize_memory_locality: bool = True, compile_tokenizer_resources: bool = True, mep_program=None, generate_trng: bool = False):
+def generate_artifacts(
+    model_name: str, 
+    model: torch.nn.Module, 
+    dummy_args: Tuple, 
+    dummy_targets: Optional[Tuple] = None, 
+    loss_type: str = 'none', 
+    lr: float = 0.001, 
+    d_model: Optional[int] = None, 
+    quantization_method: str = 'none', 
+    dynamic_shapes=None, 
+    store_weights_internally=True, 
+    io_counts=(0,0), 
+    tokenizer_repo=None, 
+    optimize=True, 
+    tokenizer_input: str = 'none', 
+    optimize_memory_locality: bool = True, 
+    compile_tokenizer_resources: bool = True, 
+    mep_program=None, 
+    generate_trng: bool = False, 
+    mep_arrays: Dict[str, np.ndarray] = None,
+    tokenizer_manifest: Optional[bytes] = None
+):
     print("\n" + "="*20 + f" GENERATION ({model_name}) " + "="*20)
     mep_loss_int = LOSS_TYPE_MAP.get(loss_type)
     if mep_loss_int is None:
@@ -1119,6 +1203,18 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
 
             if compile_tokenizer_resources:
                 vocab_dict = hf_tokenizer.get_vocab()
+                
+                # Extracting real scores (weights) for Unigram tokenizers
+                scores_dict = {}
+                try:
+                    state = json.loads(hf_tokenizer.backend_tokenizer.to_str())
+                    if state.get('model', {}).get('type') == 'Unigram':
+                        for t, s in state.get('model', {}).get('vocab', []):
+                            scores_dict[t] = float(s)
+                except Exception:
+                    pass
+                # -----------------------------------------------------------------------------
+
                 vocab_sorted_by_token = sorted(vocab_dict.items(), key=lambda item: item[0])
                 num_entries = len(vocab_sorted_by_token)
                 data_buffer = io.BytesIO()
@@ -1130,7 +1226,11 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
                     token_bytes = token_str.encode('utf-8')
                     data_buffer.write(struct.pack('<H', len(token_bytes)))
                     data_buffer.write(token_bytes)
-                    data_buffer.write(struct.pack('<if', token_id, 0.0))
+                    
+                    # Write the real score instead of the hard 0.0
+                    score = scores_dict.get(token_str, 0.0)
+                    data_buffer.write(struct.pack('<if', token_id, score))
+                    # -----------------------------------------------------------------
                 
                 final_vocab_b = bytearray()
                 final_vocab_b.extend(struct.pack('<I', num_entries))
@@ -1150,14 +1250,27 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
                     merges_path = hf_hub_download(repo_id=tokenizer_repo, filename="merges.txt")
                     with open(merges_path, 'r', encoding='utf-8') as f: lines = f.readlines()
                     if lines and lines[0].startswith("#"): lines = lines[1:]
-                    merges_b_content = bytearray()
-                    merges_b_content.extend(struct.pack('<I', len(lines)))
+                    
+                    valid_merges = []
                     for line in lines:
-                        parts = line.strip().split();
-                        if len(parts) != 2: continue
-                        p1_bytes, p2_bytes = parts[0].encode('utf-8'), parts[1].encode('utf-8')
-                        merges_b_content.extend(struct.pack('<H', len(p1_bytes))); merges_b_content.extend(p1_bytes)
-                        merges_b_content.extend(struct.pack('<H', len(p2_bytes))); merges_b_content.extend(p2_bytes)
+                        # Strict removal of line breaks only.
+                        # Using strip() destroys tokens containing spaces!
+                        line = line.replace('\r', '').replace('\n', '')
+                        if not line: continue
+                        
+                        # Strict split on only one space between p1 and p2
+                        parts = line.split(' ') 
+                        if len(parts) == 2:
+                            valid_merges.append((parts[0].encode('utf-8'), parts[1].encode('utf-8')))
+                            
+                    merges_b_content = bytearray()
+                    # Record the exact actual number of pairs collected
+                    merges_b_content.extend(struct.pack('<I', len(valid_merges)))
+                    for p1_bytes, p2_bytes in valid_merges:
+                        merges_b_content.extend(struct.pack('<H', len(p1_bytes)))
+                        merges_b_content.extend(p1_bytes)
+                        merges_b_content.extend(struct.pack('<H', len(p2_bytes)))
+                        merges_b_content.extend(p2_bytes)
                     tokenizer_resources['merges.b'] = bytes(merges_b_content)
                 except Exception: pass
             else:
@@ -1228,12 +1341,24 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
         except Exception: pass
 
     tokenizer_manifest_bytes = None
-    if tokenizer_repo:
+    if tokenizer_manifest is None and tokenizer_repo:
         try:
             if 'hf_tokenizer' not in locals(): hf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo)
             probe_text = tokenizer_input if tokenizer_input != 'none' else "This is a probe text."
             tokenizer_manifest_bytes = TISACompiler.compile_and_calibrate(hf_tokenizer, probe_text)
         except Exception as e: print(f"!!!!! WARNING: Failed to compile tokenizer for '{tokenizer_repo}'. Error: {e}")
+    elif tokenizer_manifest is not None:
+        if isinstance(tokenizer_manifest, bytes):
+            tokenizer_manifest_bytes = tokenizer_manifest
+        else:
+            # If passed a list of instructions (Manual Editing), compile a binary from it
+            buf = bytearray(b"TISA\x01")
+            for op, payload in tokenizer_manifest:
+                p_bytes = TISACompiler._serialize_payload_binary(op, payload)
+                buf.append(op)
+                buf.extend(struct.pack("<I", len(p_bytes)))
+                buf.extend(p_bytes)
+            tokenizer_manifest_bytes = bytes(buf)
 
     processor = ModelProcessor(existing_registry=existing_registry_data)
     if optimize and 'folder' in locals():
@@ -1253,13 +1378,30 @@ def generate_artifacts(model_name: str, model: torch.nn.Module, dummy_args: Tupl
     result_manager.save_registry(processor.op_string_to_id, ModelProcessor.const_to_id, processor.perm_tuple_to_id)
     final_d_model = d_model if isinstance(d_model, int) else _get_d_model(model)
     
-    result_manager.save_model_nac(
-        model_name, used_mappings, processor.precomputed_nodes, processor.param_data_map,
-        processor.param_id_to_name, processor.input_node_idx_to_name, d_model=final_d_model,
-        tokenizer_manifest=tokenizer_manifest_bytes, tokenizer_resources=tokenizer_resources,
-        quant_method=quantization_method, store_weights_internally=store_weights_internally, 
-        io_counts=processor.io_counts, memory_map=generated_memory_map, mep_program=mep_program,
-        trng_nodes=processor.trng_nodes if generate_trng else None
-    )
+    normalized_mep_arrays = None
+    if mep_arrays is not None:
+        if isinstance(mep_arrays, (list, tuple)):
+            normalized_mep_arrays = {str(i): np.asarray(arr) for i, arr in enumerate(mep_arrays)}
+        elif isinstance(mep_arrays, dict):
+            normalized_mep_arrays = {str(k): np.asarray(v) for k, v in mep_arrays.items()}
+        else:
+            raise ValueError("mep_arrays must be a dict, list, or tuple")
 
-# --- END OF FILE NAC.py ---
+    result_manager.save_model_nac(
+        model_name,
+        used_mappings,
+        processor.precomputed_nodes,
+        processor.param_data_map,
+        processor.param_id_to_name,
+        processor.input_node_idx_to_name,
+        d_model=final_d_model,
+        tokenizer_manifest=tokenizer_manifest_bytes,
+        tokenizer_resources=tokenizer_resources,
+        quant_method=quantization_method,
+        store_weights_internally=store_weights_internally, 
+        io_counts=processor.io_counts,
+        memory_map=generated_memory_map,
+        mep_program=mep_program,
+        trng_nodes=processor.trng_nodes if generate_trng else None, 
+        mep_arrays=normalized_mep_arrays
+    )

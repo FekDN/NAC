@@ -1,5 +1,3 @@
-# --- START OF FILE NAC_optimizer.py ---
-
 # Copyright (c) 2025-2026 Dmitry Feklin (FeklinDN@gmail.com) GNU General Public License v3.0
 
 import sys
@@ -176,10 +174,10 @@ class GraphConstantFolder:
                     node.replace_all_uses_with(a)
                     self._sync_aot_graph(node, a) 
                     to_erase.append(node); continue
-                if val == 0:
-                    node.replace_all_uses_with(b)
-                    self._sync_aot_graph(node, b) 
-                    to_erase.append(node); continue
+                #if val == 0:
+                #    node.replace_all_uses_with(b)
+                #    self._sync_aot_graph(node, b) 
+                #    to_erase.append(node); continue
                     
             if "aten.add" in tgt and isinstance(b, fx.Node) and b.name in self.computed_constants:
                 if self.computed_constants[b.name] == 0:
@@ -519,5 +517,3 @@ class GraphConstantFolder:
         
         self.generated_memory_map = self._generate_memory_map()
         print("[Folder] Cleaning are complete.")
-
-# --- END OF FILE NAC_optimizer.py ---
