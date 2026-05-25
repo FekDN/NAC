@@ -34,7 +34,7 @@ Unlike static ONNX or TFLite files, a `.nac` container is "alive". It supports i
 
 ---
 
-## Neural Architecture Code (NAC) v1.7 Specification
+## Neural Architecture Code (NAC) v1.8 Specification
 
 The NAC format is designed for the compact, unified, and machine-readable
 representation of neural network computation graphs. Each graph is a sequence
@@ -68,25 +68,27 @@ The NAC standard is built on three fundamental principles:
 *   **Canonization:** Instead of supporting hundreds of operations from deep learning frameworks, NAC reduces them to a small, orthogonal, and stable set of canonical instructions. This significantly simplifies the development and verification of the runtime (especially hardware) and makes the standard resilient to changes in upstream libraries.
 *   **Hardware Orientation:** The entire design, from the simple, sequential ABCD instruction structure to the static nature of the graph, is aimed at direct and efficient implementation in digital logic. The absence of dynamic elements, such as data-dependent control flow (in the current version), makes the graph easily parallelizable and pipelineable at the hardware level.
 
-### 1.4. Versioning (Current Version: 1.7)
+### 1.4. Versioning (Current Version: 1.8)
 
-The current version of the standard is **NAC v1.7**. The version is explicitly stated in the header of the `.nac` file, which ensures backward compatibility and allows for future extensions. Any changes to the header structure, instruction format, or the semantics of system operations will require an increment of the standard's version.
-- Added `TRNG` section for on-device fine-tuning support.
-- Extended MODEL_TRAIN_STEP (0x82) instruction with logits_key, head_weight_name_id, and head_bias_name_id for dynamic architecture expansion.
-- Bit 6 in the header quantization byte now indicates presence of training graph.
-- Improved header structure documentation (92 bytes).
-- Enhanced runtime training capabilities with more universal `run_training_step`.
+The current version of the standard is **NAC v1.8**. The version is explicitly stated in the header of the `.nac` file, which ensures backward compatibility and allows for future extensions. Any changes to the header structure, instruction format, or the semantics of system operations will require an increment of the standard's version.
+- **v1.8 Changes:**
+  - Added `ARRS` section for standalone universal binary arrays (e.g., masks, precomputed noises), fully eliminating the need for external `.npy` files.
+  - Header size increased from 92 bytes to 100 bytes to accommodate the 11th section offset (`arrs_offset`).
+- **v1.7 Changes:**
+  - Added `TRNG` section for on-device fine-tuning support.
+  - Extended MODEL_TRAIN_STEP (0x82) instruction with logits_key, head_weight_name_id, and head_bias_name_id.
+  - Bit 6 in the header quantization byte indicates the presence of a training graph.
 
 
 ## 2. Structure of the Binary File (.nac)
 
 ### 2.1. Overall File Layout (Header and Sections)
 
-A `.nac` format file is a binary container with a sequential structure. It begins with a fixed 92-byte header, followed by several sections of variable-length data. The header contains a "table of contents"—absolute offsets from the beginning of the file to the start of each section. This allows the runtime to quickly locate the necessary data without having to scan the entire file sequentially.
+A `.nac` format file is a binary container with a sequential structure. It begins with a fixed 100-byte header, followed by several sections of variable-length data. The header contains a "table of contents"—absolute offsets from the beginning of the file to the start of each section. This allows the runtime to quickly locate the necessary data without having to scan the entire file sequentially.
 
-### 2.2. File Header (92 bytes)
+### 2.2. File Header (100 bytes)
 
-The header has a fixed length of **92 bytes** and contains essential metadata. All multi-byte values are stored in **Little Endian** format.
+The header has a fixed length of **100 bytes** and contains essential metadata. All multi-byte values are stored in **Little Endian** format.
 
 #### 2.2.1. Magic Bytes and Version (4 bytes)
 *   **Offset:** `0`
@@ -113,9 +115,9 @@ The header has a fixed length of **92 bytes** and contains essential metadata. A
 *   **Type:** `uint16`
 *   **Description:** Primary model dimension (e.g. hidden size). 0 if not applicable.
 
-#### 2.2.5. Section Offset Table (80 bytes)
+#### 2.2.5. Section Offset Table (88 bytes)
 *   **Offset:** `12`
-*   **Type:** `10 × uint64` (packed as `<10Q`)
+*   **Type:** `11 × uint64` (packed as `<11Q`)
 *   **Description:** Absolute byte offsets from the start of the file to each section. `0` means the section is absent.
 
 | Index | Field            | Tag    | Description |
@@ -130,11 +132,12 @@ The header has a fixed length of **92 bytes** and contains essential metadata. A
 | 7     | `orch_offset`    | ORCH   | MEP Orchestrator plan |
 | 8     | `trng_offset`    | TRNG   | Training Graph (backward + updates) |
 | 9     | `rsrc_offset`    | RSRC   | Embedded resources |
+| 10    | `arrs_offset`    | ARRS   | Standalone binary arrays |
 
-*   **Offset:** `92`
+*   **Offset:** `100`
 *   **Length:** 0 (end of header)
 
-**Note:** Total header size is **92 bytes**. Previous documentation incorrectly stated 88 bytes and used `<H10Q` (82 bytes) for the offsets part.
+**Note:** Total header size is strictly **100 bytes** as of v1.8.
 
 ### 2.3. Section Structure
 
@@ -155,16 +158,14 @@ Each section (except the header) begins with a 4-byte ASCII tag followed by its 
 | `DATA` | **Data Section**  | Parameter metadata (names, shapes, dtypes) and optional internal storage of weight tensors. Also contains mapping from parameter IDs to human-readable names. |
 | `PROC` | **Processing**    | Preprocessing data, primarily the compiled tokenizer manifest (TISA format). |
 | `ORCH` | **Orchestrator**  | MEP (Model Execution Pipeline) bytecode and its constant pool. High-level execution recipe that orchestrates inference, training, preprocessing and I/O. |
-| `TRNG` | **Training Graph**| **New in v2.0**. Separate optimized graph for on-device training (fine-tuning). Contains backward operations and parameter update logic. Optional. |
+| `TRNG` | **Training Graph**| Separate optimized graph for on-device training (fine-tuning). Contains backward operations and parameter update logic. Optional. |
 | `RSRC` | **Resources**     | Embedded auxiliary files (tokenizer vocabularies, merges.txt, special tokens, etc.). |
+| `ARRS` | **Arrays**        | Standalone binary arrays replacing external `.npy` files. Provides 100% reversible storage for arbitrary typed N-dimensional arrays. |
 
 **Important notes:**
 - The `TRNG` section is optional. Its presence is indicated by **bit 6** in the quantization byte of the header.
-- If the `TRNG` section is absent, the model supports only inference.
-- The `ORCH` section provides high-level orchestration via MEP instructions and works in conjunction with the low-level `OPS` graph.
+- The `ARRS` section completely eliminates external static dependencies like `.npy` files, keeping the container self-sufficient.
 - Weights can be stored either internally (`DATA` section) or externally (`.safetensors` file with the same base name).
-
-**A Note on Autonomy:** The executable NAC code (`OPS`) does not require all model data (weights, resources) to be stored within a single `.nac` file. The storage flag in the header allows weights to be placed in an external `.safetensors` file, and tokenizer resources can be loaded from an external directory. This flexibility enables the creation of fully autonomous files for small models, as well as efficient handling of large models where weights can occupy tens of gigabytes.
 
 
 ## 3. The ABCD Instruction Format (OPS Section)
@@ -283,19 +284,6 @@ Each command is an atomic instruction for the memory coprocessor.
 | `30` | **FORWARD**     | The ID of the **next** instruction that will consume the result. Directly routes the result to the input of the target operation, bypassing shared memory. Used when there is only one consumer. |
 | `40` | **PRELOAD**     | The ID of an `<INPUT B=1>` (`load_param`) instruction. Instructs the coprocessor to begin asynchronously loading the specified parameter from slow to fast memory before the main core reaches that instruction. |
 
-#### Example
-
-```
-v43 = aten.relu.default(v42)   FREE -> 26,  SAVE_RESULT -> 43,  PRELOAD -> 44
-```
-
-At **tick 43**, the memory coprocessor executes three commands:
-
-1.  **Record for Tick 43** — Instruction ID: `43`, Number of Commands: `3`
-2.  **Command 1 (FREE):** Action Type: `20`, Target ID: `26`
-3.  **Command 2 (SAVE_RESULT):** Action Type: `10`, Target ID: `43`
-4.  **Command 3 (PRELOAD):** Action Type: `40`, Target ID: `44`
-
 
 ## 5. Metadata Sections
 
@@ -311,15 +299,6 @@ The `CMAP` section contains the mapping from numerical operation identifiers (`A
 *   **Name Length** (1 byte, `uint8`): The length of the operation name string in bytes (max 255).
 *   **Operation Name** (variable, UTF-8): The canonical name, e.g., `aten.special_op.default`.
 
-**Example:** Custom operation `custom.op` with ID=201: `0xC9 0x00` (ID), `0x0A` (length=10), UTF-8 bytes of `"custom.op"`.
-
-#### 5.1.3. Role of `CANONICAL_OP_MAP` in Formation
-The compiler uses an intelligent canonization mechanism:
-1.  **Normalization:** Cleans PyTorch operation names (e.g., `aten.add_.Tensor` → `add`).
-2.  **Direct Mapping:** Maps the cleaned name to a standard NAC operation (e.g., `add` → `nac.add`).
-3.  **Alias Mapping (`CANONICAL_OP_MAP`):** For non-obvious names (`mm` → `nac.matmul`) or those requiring argument reordering (`rsub`).
-4.  **Custom Operation:** If unmappable, the full original name is preserved, assigned a high-level ID (≥ 201), and this mapping is recorded in `CMAP`.
-
 ### 5.2. `PERM` Section (Permutations / Signatures)
 
 #### 5.2.1. Purpose
@@ -329,8 +308,6 @@ The `PERM` section is key to decoding instruction arguments. It maps numerical s
 *   **Signature ID** (2 bytes, `uint16`): The unique identifier used in the `B` field.
 *   **String Length** (1 byte, `uint8`): The length of the signature string in bytes (max 255).
 *   **Signature String** (variable, UTF-8): A sequence of characters, one per argument.
-
-**Example:** Signature `TSc` with ID=100: `0x64 0x00` (ID), `0x03` (length=3), `0x54 0x53 0x63` (`"TSc"`).
 
 #### 5.2.3. Specification of Codes in the Signature String
 
@@ -372,10 +349,8 @@ Centralized storage for all constant scalar and list values used in the computat
 *   **Length** (2 bytes, `uint16`): For types `2, 3, 4` — length in **bytes** of data. For types `5, 6` — number of **elements**. For types `0, 1` — ignored.
 *   **Value** (variable, binary): For `int64` — 8 bytes LE. For `float64` — 8 bytes LE. For `list[int32]` — sequence of 4-byte LE integers. For `list[float32]` — sequence of 4-byte LE floats.
 
-**Example:** Constant `[1, 2]` with ID=50: `0x32 0x00` (ID), `0x05` (type=list_int), `0x02 0x00` (length=2), `0x01 0x00 0x00 0x00`, `0x02 0x00 0x00 0x00`.
 
-
-## 6. Data and Resource Sections (DATA, RSRC, PROC)
+## 6. Data, Resource, and Array Sections (DATA, RSRC, PROC, ARRS)
 
 ### 6.1. `DATA` Section
 
@@ -413,7 +388,7 @@ Maps the absolute index of each `<INPUT B=0>` instruction to the name of the cor
 | **Parameter ID**    | `uint16` | 2                  | Links this tensor to Block 1 name mapping.          |
 | **Metadata Length** | `uint32` | 4                  | Total length of the binary metadata block in bytes. |
 | **Data Length**     | `uint64` | 8                  | Length of the raw tensor data in bytes.             |
-| **Metadata**        | binary   | `Metadata Length`  | Compact binary descriptor — see §6.1.1.             |
+| **Metadata**        | binary   | `Metadata Length`  | Compact binary descriptor.                          |
 | **Data**            | binary   | `Data Length`      | Raw contiguous tensor data, no padding.             |
 
 #### 6.1.1. Binary Tensor Metadata Format
@@ -436,19 +411,6 @@ The metadata block is a **compact binary structure**, not JSON. It is parsed seq
 | `2`  | `float16`  | `7`  | `int8`   |
 | `3`  | `bfloat16` | `8`  | `uint8`  |
 | `4`  | `int32`    | `9`  | `bool`   |
-
-**Example:** A 2-D `float16` tensor of shape `[768, 768]` with no quantization would produce the metadata block:
-```
-02        ← DType = float16 (2)
-02        ← Rank = 2
-00 03 00 00   ← 768 (LE uint32)
-00 03 00 00   ← 768 (LE uint32)
-00        ← Quant = none (0)
-```
-Total metadata length: 11 bytes.
-
-Note on BLOCK_FP8: 
-When a tensor is quantized using BLOCK_FP8 (code 4), it is flattened into a 1D array to ensure strict memory alignment for hardware accelerators. The original N-dimensional shape is preserved inside the metadata block, allowing the runtime to seamlessly reconstruct the tensor during decoding.
 
 ### 6.2. `PROC` Section (Processing)
 
@@ -473,6 +435,26 @@ The section begins with the `RSRC` tag, followed by:
     *   **Name** (variable, UTF-8), e.g., `vm_vocab.json`
     *   **Data Length** (4 bytes, `uint32`)
     *   **Data** (variable): Raw binary content.
+
+### 6.4. `ARRS` Section (Arrays)
+
+#### 6.4.1. Purpose
+The `ARRS` section replaces external `.npy` files, allowing standalone, universally typed multi-dimensional arrays to be embedded directly into the `.nac` container. These arrays are accessible by name from the MEP Orchestrator. The storage is 100% reversible, retaining exact shape and data types.
+
+#### 6.4.2. Format
+The section begins with the `ARRS` tag, followed by:
+*   **Number of Arrays** (4 bytes, `uint32`).
+*   A sequence of array records:
+
+| Field               | Type       | Size (bytes)     | Description                                             |
+|---------------------|------------|------------------|---------------------------------------------------------|
+| **Name Length**     | `uint16`   | 2                | Length of the array name string.                        |
+| **Name**            | UTF-8      | `Name Length`    | Array identifier (e.g. `const_causal_mask`).            |
+| **DType ID**        | `uint8`    | 1                | Data type enum (same table as §6.1.1).                  |
+| **Rank**            | `uint8`    | 1                | Number of dimensions.                                   |
+| **Shape**           | `uint32[]` | `Rank × 4`       | Dimensions in order (LE unsigned ints).                 |
+| **Data Length**     | `uint64`   | 8                | Total size of the raw payload in bytes.                 |
+| **Data**            | binary     | `Data Length`    | Raw contiguous array bytes.                             |
 
 
 ## 7. Special (System) Operations
@@ -664,4 +646,3 @@ The TRNG section is optional. If absent (`trng_off = 0`), training is not suppor
 The source code of this project is licensed under the **GNU General Public License v3.0**. See the `LICENSE` file for details.
 
 The accompanying documentation, including this README and the project's White Paper, is licensed under the **Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License**.
-
