@@ -54,6 +54,31 @@ v43 = aten.relu(v42)   FREE -> 26, SAVE_RESULT -> 43, PRELOAD -> 44
 
 ---
 
+## NAC_weights.py — Weights Manager
+
+A universal utility for extracting and injecting model weights between `.nac` containers and standard `.safetensors` files. It dynamically updates the binary geometry of the `.nac` file in-place and fully preserves quantization metadata.
+
+```bash
+# Extract internal weights into a single .safetensors file
+python NAC_weights.py extract <model.nac>
+
+# Extract and split weights into multiple shards (e.g., for GitHub upload limits)
+python NAC_weights.py extract <model.nac> --shards 3
+
+# Inject external .safetensors (auto-discovered) back into the .nac file
+python NAC_weights.py inject <model.nac>
+```
+
+**Key Features:**
+- **In-place Optimization:** Extracts weights to make the `.nac` file lightweight for inference, recalculating the binary section offsets automatically.
+- **Auto-Discovery & Sharding:** The `inject` command automatically finds and merges `model.safetensors` or `model-00001-of-00003.safetensors` shards. External files are safely cleaned up after successful injection.
+- **Quantization Awareness:** Fully preserves custom NAC quantization formats (`INT8_TENSOR`, `INT8_CHANNEL`, `BLOCK_FP8`) by storing native `int8` tensors alongside serialized JSON metadata (`nac_quant_meta`) inside the `.safetensors` header.
+- **Strict Validation:** Validates tensor shapes during injection against the expected NAC geometry to prevent `reshape` errors and guarantee runtime stability.
+
+**Dependencies:** `torch`, `safetensors` (`pip install torch safetensors`)
+
+---
+
 ## NAC_graph.py — Interactive Graph Viewer
 
 Launches a local web server and opens an interactive computation graph visualization in the browser. Nodes are laid out in execution order (left → right). Weight tensors cluster above their consuming op; scalar constants cluster below.
