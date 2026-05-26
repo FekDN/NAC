@@ -234,6 +234,8 @@ struct NacRuntimeContext {
     std::atomic<uint32_t> current_instruction_idx;
     std::atomic<bool> stop_flag;
     std::atomic<bool> training_mode{false}; // Training mode flag
+    bool mmap_param_residency_checked = false;
+    bool mmap_keep_params_resident = false;
     std::vector<ParsedInstruction> trng_operations;
     std::map<uint16_t, Tensor*> trng_param_updates; // Stores gradients after fused_sgd_step
     std::vector<Tensor*> targets;                   // Saved targets for TRNG
@@ -253,6 +255,33 @@ struct NacRuntimeContext {
     std::map<std::string, Tensor*> arrays;
 
     NacRuntimeContext() : cache_mutex(nullptr), current_instruction_idx(0), stop_flag(false), tensor_pool(TENSOR_POOL_SIZE), quant_mode(QuantExecMode::DEQUANT_ON_LOAD) { mmap_sync_event = xEventGroupCreate(); }
+    bool is_param_load_op(uint32_t op_idx) const {
+        if (op_idx >= decoded_ops.size()) return false;
+        const ParsedInstruction& ins = decoded_ops[op_idx];
+        return ins.A == 2 && ins.B == 1 && ins.C.size() >= 2;
+    }
+
+    uint64_t estimate_resident_param_bytes() const {
+        uint64_t total = 0;
+        for (size_t pid = 0; pid < param_locations.size(); ++pid) {
+            if (pid < param_present.size() && param_present[pid]) {
+                total += param_locations[pid].meta_len + param_locations[pid].data_size;
+            }
+        }
+        return total;
+    }
+
+    uint64_t largest_param_bytes() const {
+        uint64_t largest = 0;
+        for (size_t pid = 0; pid < param_locations.size(); ++pid) {
+            if (pid < param_present.size() && param_present[pid]) {
+                uint64_t bytes = param_locations[pid].meta_len + param_locations[pid].data_size;
+                if (bytes > largest) largest = bytes;
+            }
+        }
+        return largest;
+    }
+
     ~NacRuntimeContext() {
         if (cache_mutex) vSemaphoreDelete(cache_mutex);
         if (mmap_sync_event) delete mmap_sync_event; 

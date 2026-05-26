@@ -495,6 +495,7 @@ static void process_mmap_tick(NacRuntimeContext* ctx, uint32_t tick) {
             // Disable memory clearing in training mode to save activations
             if (ctx->training_mode.load(std::memory_order_relaxed)) break;
             uint16_t tid = cmd.target_id;
+            if (ctx->mmap_keep_params_resident && ctx->is_param_load_op(tid)) break;
             xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
             Tensor* tf = (tid < ctx->results.size()) ? ctx->results[tid] : nullptr;
             if (tf) {
@@ -519,6 +520,7 @@ static void process_mmap_tick(NacRuntimeContext* ctx, uint32_t tick) {
             uint16_t src = (uint16_t)tick, dst = cmd.target_id;
             xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
             if (src < ctx->results.size() && ctx->results[src] && dst < ctx->results.size()) {
+                // Keep src alive: gather_arguments() still resolves forwarded inputs via dst + D == src.
                 if (ctx->results[dst] && ctx->results[dst] != ctx->results[src])
                     ctx->tensor_pool.release(ctx->results[dst]);
                 ctx->results[dst] = ctx->results[src];

@@ -400,6 +400,11 @@ private:
     /// Total instruction length in bytes (opcode included) — for loop-skip.
     uint32_t instr_len(uint32_t at_ip) const;
 
+    bool current_model_call_is_looped() const;
+    void ensure_mmap_param_residency(NacRuntimeContext* ctx);
+    void release_resident_mmap_params(NacRuntimeContext* ctx);
+    void release_loop_resident_mmap_params_if_done();
+
     // ── instruction handlers ─────────────────────────────────────────────────
     void h_src_user_prompt();
     void h_src_constant();
