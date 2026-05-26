@@ -30,10 +30,17 @@ if (-not $vvpPath) {
 $root = Split-Path -Parent $PSScriptRoot
 $outDir = Join-Path $root "build"
 New-Item -ItemType Directory -Force $outDir | Out-Null
-$out = Join-Path $outDir "$Top.vvp"
+$outName = "$Top.$([System.Guid]::NewGuid().ToString('N')).vvp"
+$out = Join-Path $outDir $outName
 
 $rtl = Get-ChildItem (Join-Path $root "rtl") -Filter "*.v" | ForEach-Object { $_.FullName }
 $tb = Join-Path $root "tb\$Top.v"
 
 & $iverilogPath -g2005-sv -I (Join-Path $root "rtl") -o $out $tb $rtl
+if ($LASTEXITCODE -ne 0) {
+    throw "iverilog failed for $Top with exit code $LASTEXITCODE"
+}
 & $vvpPath $out
+if ($LASTEXITCODE -ne 0) {
+    throw "vvp failed for $Top with exit code $LASTEXITCODE"
+}
