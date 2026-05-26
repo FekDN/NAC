@@ -18,6 +18,7 @@ module nac_abcd_decoder #(
     output wire [7:0] perm_lookup_id,
     input  wire [ARITY_BITS-1:0] perm_arity,
     input  wire perm_needs_consts,
+    input  wire perm_present,
 
     output reg  instr_valid,
     input  wire instr_ready,
@@ -155,7 +156,9 @@ module nac_abcd_decoder #(
                     end
 
                     S_PERM: begin
-                        if (perm_arity > MAX_ARITY) begin
+                        if (instr_b != 8'd0 && !perm_present) begin
+                            state <= S_ERROR;
+                        end else if (perm_arity > MAX_ARITY) begin
                             state <= S_ERROR;
                         end else begin
                             d_target_count <= perm_arity;

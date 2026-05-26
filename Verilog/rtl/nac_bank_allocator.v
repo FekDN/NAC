@@ -10,9 +10,11 @@ module nac_bank_allocator #(
     input  wire alloc_req,
     output reg  alloc_valid,
     output reg  [BANK_BITS-1:0] alloc_bank,
+    output reg  alloc_fail,
 
     input  wire free_req,
-    input  wire [BANK_BITS-1:0] free_bank
+    input  wire [BANK_BITS-1:0] free_bank,
+    output reg  free_error
 );
     reg [BANKS-1:0] used;
     integer i;
@@ -23,11 +25,21 @@ module nac_bank_allocator #(
             used <= {BANKS{1'b0}};
             alloc_valid <= 1'b0;
             alloc_bank <= {BANK_BITS{1'b0}};
+            alloc_fail <= 1'b0;
+            free_error <= 1'b0;
         end else begin
             alloc_valid <= 1'b0;
+            alloc_fail <= 1'b0;
+            free_error <= 1'b0;
 
             if (free_req) begin
-                used[free_bank] <= 1'b0;
+                if (free_bank >= BANKS) begin
+                    free_error <= 1'b1;
+                end else if (!used[free_bank]) begin
+                    free_error <= 1'b1;
+                end else begin
+                    used[free_bank] <= 1'b0;
+                end
             end
 
             if (alloc_req) begin
@@ -39,6 +51,9 @@ module nac_bank_allocator #(
                         alloc_bank <= i;
                         used[i] <= 1'b1;
                     end
+                end
+                if (!found) begin
+                    alloc_fail <= 1'b1;
                 end
             end
         end

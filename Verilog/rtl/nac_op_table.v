@@ -10,7 +10,7 @@ module nac_op_table #(
     input  wire [7:0] cfg_kernel_class,
 
     input  wire [7:0] lookup_op_id,
-    output reg  [7:0] lookup_kernel_class
+    output wire [7:0] lookup_kernel_class
 );
     reg [7:0] class_ram [0:OP_ENTRIES-1];
     integer i;
@@ -27,7 +27,5 @@ module nac_op_table #(
         end
     end
 
-    always @* begin
-        lookup_kernel_class = class_ram[lookup_op_id];
-    end
+    assign lookup_kernel_class = class_ram[lookup_op_id];
 endmodule

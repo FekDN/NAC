@@ -6,7 +6,8 @@ module nac_core #(
     parameter MAX_CONSTS = 8,
     parameter DESC_WIDTH = 64,
     parameter PERM_ENTRIES = 256,
-    parameter MAX_MMAP_CMDS_PER_TICK = 4
+    parameter MAX_MMAP_CMDS_PER_TICK = 256,
+    parameter MMAP_SLOT_WIDTH = 8
 ) (
     input  wire clk,
     input  wire rst,
@@ -35,7 +36,7 @@ module nac_core #(
     // MMAP schedule load.
     input  wire mmap_cfg_we,
     input  wire [IDX_WIDTH-1:0] mmap_cfg_tick,
-    input  wire [1:0] mmap_cfg_slot,
+    input  wire [MMAP_SLOT_WIDTH-1:0] mmap_cfg_slot,
     input  wire mmap_cfg_valid,
     input  wire [7:0] mmap_cfg_action,
     input  wire [15:0] mmap_cfg_target,
@@ -77,13 +78,17 @@ module nac_core #(
 
     // MMAP command pulses for the memory subsystem.
     output wire preload_valid,
+    input  wire preload_ready,
     output wire [15:0] preload_target,
     output wire free_valid,
+    input  wire free_ready,
     output wire [15:0] free_target,
     output wire save_result_valid,
+    input  wire save_result_ready,
     output wire [15:0] save_result_src,
     output wire [15:0] save_result_target,
     output wire forward_valid,
+    input  wire forward_ready,
     output wire [15:0] forward_src,
     output wire [15:0] forward_dst,
 
@@ -92,10 +97,12 @@ module nac_core #(
     output wire error
 );
     reg core_started;
+    reg orch_finished;
 
     wire [7:0] perm_lookup_id;
     wire [3:0] perm_arity;
     wire perm_needs_consts;
+    wire perm_present;
 
     nac_perm_table #(
         .PERM_ENTRIES(PERM_ENTRIES),
@@ -108,7 +115,8 @@ module nac_core #(
         .cfg_needs_consts(perm_cfg_needs_consts),
         .lookup_id(perm_lookup_id),
         .lookup_arity(perm_arity),
-        .lookup_needs_consts(perm_needs_consts)
+        .lookup_needs_consts(perm_needs_consts),
+        .lookup_present(perm_present)
     );
 
     wire instr_valid;
@@ -148,6 +156,7 @@ module nac_core #(
         .perm_lookup_id(perm_lookup_id),
         .perm_arity(perm_arity),
         .perm_needs_consts(perm_needs_consts),
+        .perm_present(perm_present),
         .instr_valid(instr_valid),
         .instr_ready(instr_ready),
         .instr_index(instr_index),
@@ -172,10 +181,18 @@ module nac_core #(
     always @(posedge clk) begin
         if (rst) begin
             core_started <= 1'b0;
+            orch_finished <= 1'b0;
         end else if (start) begin
             core_started <= 1'b1;
-        end else if (orch_done || decoder_error || orch_error) begin
+            orch_finished <= 1'b0;
+        end else if (decoder_error || orch_error || mmap_error) begin
             core_started <= 1'b0;
+            orch_finished <= 1'b0;
+        end else if (orch_done) begin
+            core_started <= 1'b0;
+            orch_finished <= 1'b1;
+        end else if (orch_finished && !mmap_busy) begin
+            orch_finished <= 1'b0;
         end
     end
 
@@ -226,6 +243,8 @@ module nac_core #(
     );
 
     wire mmap_busy;
+    wire mmap_error;
+    wire table_free_valid;
     wire table_copy_valid;
     wire [IDX_WIDTH-1:0] table_copy_src;
     wire [IDX_WIDTH-1:0] table_copy_dst;
@@ -233,7 +252,8 @@ module nac_core #(
     nac_mmap_engine #(
         .NUM_TICKS(1 << IDX_WIDTH),
         .TICK_WIDTH(IDX_WIDTH),
-        .MAX_CMDS_PER_TICK(MAX_MMAP_CMDS_PER_TICK)
+        .MAX_CMDS_PER_TICK(MAX_MMAP_CMDS_PER_TICK),
+        .CMD_SLOT_WIDTH(MMAP_SLOT_WIDTH)
     ) mmap (
         .clk(clk),
         .rst(rst),
@@ -247,15 +267,20 @@ module nac_core #(
         .tick_id(tick_commit_id),
         .busy(mmap_busy),
         .preload_valid(preload_valid),
+        .preload_ready(preload_ready),
         .preload_target(preload_target),
         .free_valid(free_valid),
+        .free_ready(free_ready),
         .free_target(free_target),
         .save_result_valid(save_result_valid),
+        .save_result_ready(save_result_ready),
         .save_result_src(save_result_src),
         .save_result_target(save_result_target),
         .forward_valid(forward_valid),
+        .forward_ready(forward_ready),
         .forward_src(forward_src),
-        .forward_dst(forward_dst)
+        .forward_dst(forward_dst),
+        .error(mmap_error)
     );
 
     // Descriptor table is instantiated here so MMAP FORWARD/FREE semantics are
@@ -278,18 +303,19 @@ module nac_core #(
         .rd1_idx(result_rd1_idx),
         .rd1_valid(result_rd1_valid),
         .rd1_desc(result_rd1_desc),
-        .free_valid(free_valid),
+        .free_valid(table_free_valid),
         .free_idx(free_target[IDX_WIDTH-1:0]),
         .forward_valid(table_copy_valid),
         .forward_src_idx(table_copy_src),
         .forward_dst_idx(table_copy_dst)
     );
 
-    assign table_copy_valid = forward_valid | save_result_valid;
+    assign table_free_valid = free_valid & free_ready;
+    assign table_copy_valid = (forward_valid & forward_ready) | (save_result_valid & save_result_ready);
     assign table_copy_src = forward_valid ? forward_src[IDX_WIDTH-1:0] : save_result_src[IDX_WIDTH-1:0];
     assign table_copy_dst = forward_valid ? forward_dst[IDX_WIDTH-1:0] : save_result_target[IDX_WIDTH-1:0];
 
-    assign done = orch_done;
-    assign error = decoder_error | orch_error;
+    assign done = orch_finished && !mmap_busy;
+    assign error = decoder_error | orch_error | mmap_error;
     assign busy = core_started | decoder_busy | mmap_busy;
 endmodule

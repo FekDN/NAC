@@ -23,7 +23,8 @@ module nac_scratchpad #(
     output reg  [DATA_WIDTH-1:0] b_rdata
 );
     localparam DEPTH = (1 << ADDR_WIDTH);
-    localparam TOTAL_WORDS = BANKS * DEPTH;
+    localparam ENCODED_BANKS = (1 << BANK_BITS);
+    localparam TOTAL_WORDS = ENCODED_BANKS * DEPTH;
 
     reg [DATA_WIDTH-1:0] mem [0:TOTAL_WORDS-1];
     wire [ADDR_WIDTH+BANK_BITS-1:0] a_index = {a_bank, a_addr};
