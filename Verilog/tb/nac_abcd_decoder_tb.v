@@ -22,6 +22,7 @@ module nac_abcd_decoder_tb;
     wire [7:0] perm_lookup_id;
     reg [3:0] perm_arity;
     reg perm_needs_consts;
+    reg perm_present;
     wire instr_valid;
     reg instr_ready;
     wire [15:0] instr_index;
@@ -49,6 +50,7 @@ module nac_abcd_decoder_tb;
         .perm_lookup_id(perm_lookup_id),
         .perm_arity(perm_arity),
         .perm_needs_consts(perm_needs_consts),
+        .perm_present(perm_present),
         .instr_valid(instr_valid),
         .instr_ready(instr_ready),
         .instr_index(instr_index),
@@ -65,9 +67,11 @@ module nac_abcd_decoder_tb;
     always @* begin
         perm_arity = 4'd0;
         perm_needs_consts = 1'b0;
+        perm_present = 1'b0;
         if (perm_lookup_id == 8'd1) begin
             perm_arity = 4'd2;
             perm_needs_consts = 1'b0;
+            perm_present = 1'b1;
         end
     end
 
