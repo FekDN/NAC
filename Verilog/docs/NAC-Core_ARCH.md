@@ -31,7 +31,9 @@ standard's behavior.
 - `nac_mmap_engine`: receives the committed instruction index as a tick and
   emits memory-side pulses for `PRELOAD`, `FREE`, `SAVE_RESULT`, and `FORWARD`.
   `SAVE_RESULT` and `FORWARD` also copy descriptors inside the result table;
-  `FREE` invalidates descriptors, matching the reference runtime's cache logic.
+  accepted `FREE` commands invalidate descriptors, matching the reference
+  runtime's cache logic. Ready/valid backpressure is honored before descriptor
+  table state changes.
 
 The dispatcher never performs tensor math. It only builds routing and kernel
 configuration commands. The memory stream is not blocked by arithmetic kernels;
@@ -86,3 +88,7 @@ The intended FPGA integration is:
 Kernel-specific microcode must consume the emitted ABCD fields and descriptor
 ports; it must not select operands from any side channel when those operands are
 already present in ABCD `C` or `D`.
+
+For large tensors, address generators calculate candidate addresses in an
+extended signed range and raise `error` before an address wraps. Bank allocation
+also reports full, invalid-free, and double-free conditions explicitly.

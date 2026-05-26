@@ -14,6 +14,9 @@
   `SAVE_RESULT=10`, `FREE=20`, `FORWARD=30`, `PRELOAD=40`.
 - `SAVE_RESULT` copies from the MMAP active tick, not from a later dispatcher
   tick.
+- MMAP commands are committed to the descriptor table only when the matching
+  ready signal accepts the command. Backpressure cannot free or forward a
+  descriptor early.
 - Nonlinear DSP modes `EXP` and `RSQRT` require exact SFU response over the
   explicit request/response interface. The DSP pipeline does not approximate
   them internally.
@@ -47,3 +50,13 @@ special-cased, or expanded.
 The RTL contains no checks for specific model names, tensor names, layer names,
 or architecture families. Model behavior is supplied by NAC sections and by the
 standard ABCD/MEP/TISA bytecode streams.
+
+## Memory safety
+
+- `nac_mmap_engine` drains skipped ticks in order and reports invalid MMAP
+  action codes instead of executing them.
+- `nac_addr_gen` computes the next address in an extended signed range and
+  raises `error` before an address can wrap outside the configured address
+  width.
+- `nac_bank_allocator` reports allocation failure, invalid free, and
+  double-free cases without indexing outside the configured bank set.
