@@ -2083,7 +2083,6 @@ void MEPInterpreter::h_model_train_step() {
     std::string head_w_name = head_w_id ? get_const(head_w_id).to_string() : "";
     std::string head_b_name = head_b_id ? get_const(head_b_id).to_string() : "";
     
-    // ИСПРАВЛЕНИЕ: Возвращает МАССИВ всех PID, привязанных к одному имени (Weight Tying)
     auto get_editable_params = [&](const std::string& name) -> std::vector<std::pair<uint16_t, Tensor*>> {
         std::vector<std::pair<uint16_t, Tensor*>> res;
         if (name.empty()) return res;
@@ -2113,7 +2112,6 @@ void MEPInterpreter::h_model_train_step() {
     int current_output_size = 0;
     auto w_pairs = get_editable_params(head_w_name);
     
-    // ИСПРАВЛЕНИЕ: Расширяем ВСЕ связанные матрицы
     for (auto& w_pair : w_pairs) {
         if (w_pair.second && w_pair.second->shape.size() == 2) {
             current_output_size = w_pair.second->shape[0];
@@ -2126,7 +2124,7 @@ void MEPInterpreter::h_model_train_step() {
                 memset(new_p->data, 0, new_p->size);
                 memcpy(new_p->data, p->data, p->size);
                 delete p; ctx->updated_parameters[w_pair.first] = new_p;
-                w_pair.second = new_p; // Обновляем локальный указатель
+                w_pair.second = new_p;
             }
         }
     }
@@ -2314,7 +2312,6 @@ void MEPInterpreter::h_model_train_step() {
         if (!w_pairs.empty() && w_pairs[0].second && w_pairs[0].second->shape.size() == 2) {
             int in_features = w_pairs[0].second->shape[1];
 
-            // Ищем входную активацию по ПЕРВОМУ PID
             uint16_t reference_pid = w_pairs[0].first;
             for (uint32_t i = 0; i < ctx->decoded_ops.size(); ++i) {
                 const auto& ins = ctx->decoded_ops[i];
@@ -2352,7 +2349,6 @@ void MEPInterpreter::h_model_train_step() {
 
             if (input_act && input_act->dtype == DataType::FLOAT32) {
                 float* in_data = (float*)input_act->data;
-                // ИСПРАВЛЕНИЕ: Применяем градиенты ко ВСЕМ связанным матрицам весов
                 for (auto& w_pair : w_pairs) {
                     float* w_data = (float*)w_pair.second->data;
                     for (int i=0; i<current_output_size; ++i) {
@@ -2365,12 +2361,9 @@ void MEPInterpreter::h_model_train_step() {
                         }
                     }
                 }
-            } else {
-                ESP_LOGE(TAG_MEP, "TRNG: Could not locate FP32 input_act for layer '%s'", head_w_name.c_str());
             }
         }
         
-        // Применяем градиенты ко ВСЕМ связанным biases
         for (auto& b_pair : b_pairs) {
             if (b_pair.second && b_pair.second->shape.size() == 1) {
                 float* b_data = (float*)b_pair.second->data;
@@ -2385,6 +2378,29 @@ void MEPInterpreter::h_model_train_step() {
 
     ctx->tensor_pool.release(grad_logits_t);
     for (Tensor* t : outputs) ctx->tensor_pool.release(t);
+    
+    // CLEANING MEMORY AFTER THE TRNG EPOCH
+    xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
+    for (size_t i = 0; i < ctx->results.size(); ++i) {
+        if (ctx->results[i]) {
+            ctx->tensor_pool.release(ctx->results[i]);
+            ctx->results[i] = nullptr;
+        }
+    }
+    for (size_t i = 0; i < ctx->fast_memory_cache.size(); ++i) {
+        if (ctx->fast_memory_cache[i]) {
+            bool is_weight = false;
+            if (i < ctx->decoded_ops.size() && ctx->decoded_ops[i].A == 2 && ctx->decoded_ops[i].B == 1) {
+                is_weight = true;
+            }
+            if (!is_weight) {
+                ctx->tensor_pool.release(ctx->fast_memory_cache[i]);
+                ctx->fast_memory_cache[i] = nullptr;
+            }
+        }
+    }
+    xSemaphoreGive(ctx->cache_mutex);
+
     release_slot(out_loss_key);
     slot(out_loss_key).set_f64((double)loss_scalar);
 }
@@ -3102,6 +3118,7 @@ void MEPInterpreter::mmap_tick_sync(NacRuntimeContext* ctx, uint32_t tick) {
         switch (cmd.action) {
             case MmapAction::PRELOAD: {
                 uint16_t target_op_idx = cmd.target_id;
+                if (ctx->current_instruction_idx.load(std::memory_order_relaxed) >= target_op_idx) continue;
                 if (target_op_idx >= ctx->decoded_ops.size()) break;
                 const ParsedInstruction& ins = ctx->decoded_ops[target_op_idx];
                 if (ins.A != 2 || ins.B != 1 || ins.C.size() < 2) break;
@@ -3116,13 +3133,15 @@ void MEPInterpreter::mmap_tick_sync(NacRuntimeContext* ctx, uint32_t tick) {
                 break;
             }
             case MmapAction::FREE: {
-                // Stopping garbage collection during training to preserve activations
                 if (ctx->training_mode.load(std::memory_order_relaxed)) break;
-                
                 uint16_t tid = cmd.target_id;
                 if (ctx->mmap_keep_params_resident && ctx->is_param_load_op(tid)) break;
-                if (tid < ctx->results.size() && ctx->results[tid]) {
-                    Tensor* to_free = ctx->results[tid];
+                
+                Tensor* to_free = nullptr;
+                if (tid < ctx->results.size() && ctx->results[tid]) to_free = ctx->results[tid];
+                else if (tid < ctx->fast_memory_cache.size() && ctx->fast_memory_cache[tid]) to_free = ctx->fast_memory_cache[tid];
+                
+                if (to_free) {
                     for (auto& rp : ctx->results) { if (rp == to_free) rp = nullptr; }
                     for (auto& cp : ctx->fast_memory_cache) { if (cp == to_free) cp = nullptr; }
                     ctx->tensor_pool.release(to_free);
@@ -3140,8 +3159,8 @@ void MEPInterpreter::mmap_tick_sync(NacRuntimeContext* ctx, uint32_t tick) {
             case MmapAction::FORWARD: {
                 uint16_t src = (uint16_t)tick;
                 uint16_t dst = cmd.target_id;
-                if (src < ctx->results.size() && ctx->results[src] && dst < ctx->results.size()) {
-                    // Keep src alive: gather_arguments() still resolves forwarded inputs via dst + D == src.
+                if (src < ctx->results.size() && ctx->results[src]) {
+                    if (dst >= ctx->results.size()) ctx->results.resize(dst + 1, nullptr);
                     if (ctx->results[dst] && ctx->results[dst] != ctx->results[src]) {
                         ctx->tensor_pool.release(ctx->results[dst]);
                     }
@@ -3153,6 +3172,7 @@ void MEPInterpreter::mmap_tick_sync(NacRuntimeContext* ctx, uint32_t tick) {
     }
 }
 
+
 bool MEPInterpreter::run_model_sync(NacRuntimeContext* ctx, std::vector<Tensor*>& out_tensors) {
     {
         xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
@@ -3160,7 +3180,9 @@ bool MEPInterpreter::run_model_sync(NacRuntimeContext* ctx, std::vector<Tensor*>
         if (ctx->mmap_keep_params_resident) {
             for (size_t i = 0; i < ctx->fast_memory_cache.size(); ++i) {
                 Tensor* c = ctx->fast_memory_cache[i];
-                if (c && ctx->is_param_load_op((uint32_t)i)) resident_params.insert(c);
+                if (c && i < ctx->decoded_ops.size() && ctx->decoded_ops[i].A == 2 && ctx->decoded_ops[i].B == 1) {
+                    resident_params.insert(c);
+                }
             }
         }
         std::set<Tensor*> to_release;
@@ -3170,7 +3192,7 @@ bool MEPInterpreter::run_model_sync(NacRuntimeContext* ctx, std::vector<Tensor*>
         for (size_t i = 0; i < ctx->fast_memory_cache.size(); ++i) {
             Tensor* c = ctx->fast_memory_cache[i];
             if (!c) continue;
-            if (ctx->mmap_keep_params_resident && ctx->is_param_load_op((uint32_t)i)) continue;
+            if (ctx->mmap_keep_params_resident && i < ctx->decoded_ops.size() && ctx->decoded_ops[i].A == 2 && ctx->decoded_ops[i].B == 1) continue;
             if (resident_params.count(c)) {
                 ctx->fast_memory_cache[i] = nullptr;
                 continue;
@@ -3191,17 +3213,14 @@ bool MEPInterpreter::run_model_sync(NacRuntimeContext* ctx, std::vector<Tensor*>
     Tensor* last_user_input = nullptr;
 
 #ifdef DBG
-    ESP_LOGI(TAG_MEP, "--- Starting synchronous execution of model '%s' (%zu ops) ---", 
-             ctx->model_path.c_str(), ctx->decoded_ops.size());
+    uint32_t total_param_loads = 0;
+    uint32_t mmap_hits = 0;
+    uint32_t compute_fallbacks = 0;
+    uint32_t resident_hits = 0;
 #endif
-
     for (uint32_t idx = 0; idx < ctx->decoded_ops.size() && !ctx->stop_flag.load(); ++idx) {
         const ParsedInstruction& ins = ctx->decoded_ops[idx];
         Tensor* result_tensor = nullptr;
-
-#ifdef DBG
-        uint32_t op_start_ms = millis();
-#endif
 
         if (ins.A == 2) { 
             if (ins.B == 0) { 
@@ -3242,16 +3261,32 @@ bool MEPInterpreter::run_model_sync(NacRuntimeContext* ctx, std::vector<Tensor*>
                 }
             } else if (ins.B == 1) { 
                 if (ins.C.size() >= 2) {
+#ifdef DBG
+                    total_param_loads++;
+#endif
                     uint16_t param_id = ins.C[1];
+                    
                     xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
                     if (idx < ctx->fast_memory_cache.size() && ctx->fast_memory_cache[idx]) {
                         result_tensor = ctx->fast_memory_cache[idx];
-                        if (!ctx->mmap_keep_params_resident) {
+                        
+                        if (ctx->mmap_keep_params_resident) {
+#ifdef DBG
+                            resident_hits++; // Was saved in memory from the previous iteration
+#endif
+                        } else {
+#ifdef DBG
+                            mmap_hits++; // MMAP was successfully loaded by stream right now
+#endif
                             ctx->fast_memory_cache[idx] = nullptr;
                         }
                     }
                     xSemaphoreGive(ctx->cache_mutex);
+                    
                     if (!result_tensor) {
+#ifdef DBG
+                        compute_fallbacks++; // The main stream is forced to load itself
+#endif
                         result_tensor = load_param_tensor(ctx, param_id);
                         if (result_tensor && ctx->mmap_keep_params_resident) {
                             xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
@@ -3333,29 +3368,16 @@ bool MEPInterpreter::run_model_sync(NacRuntimeContext* ctx, std::vector<Tensor*>
             }
         }
 
-#ifdef DBG
-        uint32_t op_end_ms = millis();
-        uint32_t duration = op_end_ms - op_start_ms;
-        
-        std::string op_name = "Unknown";
-        auto it = ctx->id_to_name_map.find(ins.A);
-        if (it != ctx->id_to_name_map.end()) op_name = it->second;
-        else if (ins.A == 2) op_name = "<INPUT>";
-        else if (ins.A == 3) op_name = "<OUTPUT>";
-        
-        // Print operations that took more than 100 ms to catch SD freezes
-        if (duration >= 100 || (idx % 10 == 0) || idx == ctx->decoded_ops.size() - 1) {
-            ESP_LOGI("PERF", "[Model %s] Op %u (A=%u %s) took %u ms", 
-                     ctx->model_path.c_str(), idx, ins.A, op_name.c_str(), duration);
-        }
-#endif
-
         if (idx < ctx->results.size()) {
             ctx->results[idx] = result_tensor;
-            ctx->current_instruction_idx.store(idx, std::memory_order_release);
             
             if (ctx == m_primary_ctx && g_nac_memory_task_handle) {
                 if (ctx->mmap_sync_event) xEventGroupClearBits(ctx->mmap_sync_event, ctx->MMAP_DONE_BIT);
+            }
+            
+            ctx->current_instruction_idx.store(idx, std::memory_order_release);
+            
+            if (ctx == m_primary_ctx && g_nac_memory_task_handle) {
                 xTaskNotifyGive(g_nac_memory_task_handle);
                 if (ctx->mmap_sync_event) xEventGroupWaitBits(ctx->mmap_sync_event, ctx->MMAP_DONE_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
             } else {
@@ -3365,11 +3387,20 @@ bool MEPInterpreter::run_model_sync(NacRuntimeContext* ctx, std::vector<Tensor*>
             ctx->tensor_pool.release(result_tensor);
         }
     }
-
 #ifdef DBG
-    ESP_LOGI(TAG_MEP, "--- Finished synchronous execution of model '%s' ---", ctx->model_path.c_str());
+    if (total_param_loads > 0) {
+        if (ctx->mmap_keep_params_resident) {
+            float resident_rate = (float)resident_hits / total_param_loads * 100.0f;
+            printf("[MMAP PERF] '%s' | Total loads: %u | Resident RAM Hits: %u (%.1f%%) | Fallbacks: %u\n", 
+                   ctx->model_path.c_str(), total_param_loads, resident_hits, resident_rate, compute_fallbacks);
+        } else {
+            float hit_rate = (float)mmap_hits / total_param_loads * 100.0f;
+            printf("[MMAP PERF] '%s' | Total loads: %u | MMAP Hits: %u (%.1f%%) | Fallbacks: %u\n", 
+                   ctx->model_path.c_str(), total_param_loads, mmap_hits, hit_rate, compute_fallbacks);
+        }
+        fflush(stdout);
+    }
 #endif
-
     if (last_user_input) ctx->tensor_pool.release(last_user_input);
     
     if (out_tensors.empty()) {
@@ -3412,7 +3443,9 @@ bool MEPInterpreter::run_model_sync(NacRuntimeContext* ctx, std::vector<Tensor*>
             if (ctx->mmap_keep_params_resident) {
                 for (size_t i = 0; i < ctx->fast_memory_cache.size(); ++i) {
                     Tensor* c = ctx->fast_memory_cache[i];
-                    if (c && ctx->is_param_load_op((uint32_t)i)) resident_params.insert(c);
+                    if (c && i < ctx->decoded_ops.size() && ctx->decoded_ops[i].A == 2 && ctx->decoded_ops[i].B == 1) {
+                        resident_params.insert(c);
+                    }
                 }
             }
             std::set<Tensor*> to_release;
@@ -3422,7 +3455,7 @@ bool MEPInterpreter::run_model_sync(NacRuntimeContext* ctx, std::vector<Tensor*>
             for (size_t i = 0; i < ctx->fast_memory_cache.size(); ++i) {
                 Tensor* c = ctx->fast_memory_cache[i];
                 if (!c) continue;
-                if (ctx->mmap_keep_params_resident && ctx->is_param_load_op((uint32_t)i)) continue;
+                if (ctx->mmap_keep_params_resident && i < ctx->decoded_ops.size() && ctx->decoded_ops[i].A == 2 && ctx->decoded_ops[i].B == 1) continue;
                 if (resident_params.count(c)) {
                     ctx->fast_memory_cache[i] = nullptr;
                     continue;
@@ -3442,7 +3475,6 @@ bool MEPInterpreter::run_model_sync(NacRuntimeContext* ctx, std::vector<Tensor*>
     }
     return !out_tensors.empty();
 }
-
 
 // =============================================================================
 // Top-level entry point
