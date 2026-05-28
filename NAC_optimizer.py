@@ -356,18 +356,36 @@ class GraphConstantFolder:
         self.graph.lint()
 
     def _generate_memory_map(self) -> List[Dict]:
+        '''
+        Generates a Memory Management Map (MMAP) for parallel coprocessor/hardware execution.
+        
+        Hardware execution semantics:
+        - FORWARD: Applied strictly when `len(users) == 1` AND the consumer is the immediate next operation.
+        - SAVE_RESULT: Applied when `len(users) > 1` OR the consumer is NOT the immediate next operation.
+        - PRELOAD: Distributed backward in time using a strict Chronological Half-Split Ripple Algorithm.
+                   Pass 1: Attaches PRELOADs to the immediate preceding compute tick.
+                   Pass 2: Iterates forward. If an empty compute tick is found, it is remembered.
+                           If a tick WITH PRELOADs is found, but it only has 1, the empty tick is forgotten (barrier).
+                           If a tick has >1 PRELOADs and an empty tick is remembered, half are moved back.
+                           This guarantees strictly monotonic loading order.
+        - FREE: Reclaims buffers on the exact tick of last use.
+        '''
         print("[Folder] Generating a Memory Management Map (MMAP)...")
         node_list = list(self.graph.nodes)
         node_to_idx = {node: i for i, node in enumerate(node_list)}
 
-        weight_nodes_info = {
-            i: node for i, node in enumerate(node_list)
-            if node.op == 'placeholder' and any(
-                spec.arg.name == node.target and spec.kind in (InputKind.PARAMETER, InputKind.BUFFER)
-                for spec in self.signature.input_specs
-            )
-        }
+        # 1. Находим все операции загрузки весов
+        param_nodes = set()
+        for i, node in enumerate(node_list):
+            if node.op == 'placeholder':
+                for spec in self.signature.input_specs:
+                    if spec.arg.name == node.target and spec.kind in (InputKind.PARAMETER, InputKind.BUFFER):
+                        param_nodes.add(i)
+                        break
+            elif node.op == 'get_attr':
+                param_nodes.add(i)
 
+        # 2. Собираем информацию об использовании каждого узла
         usage_info = {
             i: {'node': node, 'users': [node_to_idx[u] for u in node.users if u in node_to_idx], 'is_output_tensor': False} 
             for i, node in enumerate(node_list)
@@ -377,74 +395,129 @@ class GraphConstantFolder:
         for i, node in enumerate(node_list):
             for input_node in node.all_input_nodes:
                 if input_node in node_to_idx:
-                    last_use_map[node_to_idx[input_node]] = max(last_use_map.get(node_to_idx[input_node], -1), i)
+                    idx = node_to_idx[input_node]
+                    last_use_map[idx] = max(last_use_map.get(idx, -1), i)
         
-        output_node = next(n for n in reversed(node_list) if n.op == 'output')
-        for input_node in output_node.all_input_nodes:
-            if input_node in node_to_idx: usage_info[node_to_idx[input_node]]['is_output_tensor'] = True
+        output_node = next((n for n in reversed(node_list) if n.op == 'output'), None)
+        if output_node:
+            for input_node in output_node.all_input_nodes:
+                if input_node in node_to_idx: 
+                    usage_info[node_to_idx[input_node]]['is_output_tensor'] = True
+                    if node_to_idx[input_node] in last_use_map:
+                        del last_use_map[node_to_idx[input_node]]
 
         memory_map_dict: Dict[int, List[Dict]] = {i: [] for i in range(len(node_list))}
-        preloaded_weight_indices = set()
         
-        i = 0
-        while i < len(node_list):
-            if i in weight_nodes_info and i not in preloaded_weight_indices:
-                current_group = [i]
-                j = i + 1
-                while j in weight_nodes_info and j == current_group[-1] + 1:
-                    current_group.append(j); j += 1
-                
-                first_op_in_group = i
-                desired_distance = 3
-                lookback_limit = 12
-                best_tick = first_op_in_group - 1
-                clean_ticks_found = 0
-                
-                for offset in range(1, lookback_limit + 1):
-                    current_tick = first_op_in_group - offset
-                    if current_tick < 0: break
-                    if any(cmd['action'] == 'PRELOAD' for cmd in memory_map_dict.get(current_tick, [])): break
-                    best_tick = current_tick
-                    if current_tick not in weight_nodes_info: clean_ticks_found += 1
-                    if clean_ticks_found >= desired_distance: break
+        # ─── ПРАВИЛО 1: СТРОГО ХРОНОЛОГИЧЕСКОЕ РАСПРЕДЕЛЕНИЕ PRELOAD ──────────
+        
+        compute_ticks = [i for i in range(len(node_list)) if i not in param_nodes]
+        if not compute_ticks:
+            compute_ticks = [0]
+            
+        preloads_per_tick = {ct: [] for ct in compute_ticks}
+        
+        # Проход 1: Наивно привязываем PRELOAD к ближайшему предыдущему рабочему такту
+        for p_idx in param_nodes:
+            assigned_tick = compute_ticks[0]
+            for ct in reversed(compute_ticks):
+                if ct < p_idx:
+                    assigned_tick = ct
+                    break
+            preloads_per_tick[assigned_tick].append(p_idx)
+            # Гарантируем сортировку по возрастанию сразу
+            preloads_per_tick[assigned_tick].sort()
 
-                best_tick = max(0, best_tick)
-                for weight_id in current_group:
-                    memory_map_dict[best_tick].append({'action': 'PRELOAD', 'target_id': weight_id})
-                    preloaded_weight_indices.add(weight_id)
-                i += len(current_group)
-            else: i += 1
+        # Проход 2: Строгое размазывание (Chronological Half-Split)
+        changed = True
+        while changed:
+            changed = False
+            last_empty_tick = None
+            
+            for ct in compute_ticks:
+                preloads = preloads_per_tick[ct]
+                
+                if len(preloads) == 0:
+                    # Запоминаем пустой такт как кандидат на прием PRELOAD
+                    last_empty_tick = ct
+                elif len(preloads) == 1:
+                    # ВАЖНО: Если на такте уже есть PRELOAD, мы сбрасываем кандидата,
+                    # чтобы не перенести параметры ЧЕРЕЗ этот такт и не нарушить хронологию!
+                    last_empty_tick = None
+                elif len(preloads) > 1:
+                    # Если есть несколько PRELOAD и перед ними есть свободный такт
+                    if last_empty_tick is not None:
+                        half_len = len(preloads) // 2
+                        moved_preloads = preloads[:half_len]
+                        kept_preloads  = preloads[half_len:]
+                        
+                        preloads_per_tick[last_empty_tick].extend(moved_preloads)
+                        preloads_per_tick[ct] = kept_preloads
+                        
+                        # Такт-кандидат принял параметры, теперь он не пустой (сбрасываем)
+                        last_empty_tick = None
+                        changed = True
+                    else:
+                        # У нас скопление параметров, но предыдущий такт УЖЕ ЗАНЯТ.
+                        # Это "стена" - мы ничего не можем перенести назад без нарушения хронологии.
+                        # Сбрасываем кандидата для следующих тактов.
+                        last_empty_tick = None
 
-        resources_in_memory = preloaded_weight_indices.copy()
-        for i, info in usage_info.items():
-            if i in preloaded_weight_indices or info['node'].op == 'placeholder': continue
+        # Записываем сбалансированные PRELOAD обратно
+        for ct in compute_ticks:
+            for p_idx in preloads_per_tick[ct]:
+                memory_map_dict[ct].append({'action': 'PRELOAD', 'target_id': p_idx})
+
+        # ─── ПРАВИЛО 2: FORWARD И SAVE_RESULT ─────────────────────────────────
+        forwarded_tensors = set()
+        for i in range(len(node_list)):
+            if i in param_nodes:
+                continue 
+            
+            info = usage_info[i]
+            if info['is_output_tensor'] or len(info['users']) == 0:
+                continue
+
             can_forward = False
-            if len(info['users']) == 1 and not info['is_output_tensor']:
-                user_idx = info['users'][0]
-                if all(j in preloaded_weight_indices for j in range(i + 1, user_idx)):
+            if len(info['users']) == 1:
+                if info['users'][0] == i + 1:
                     can_forward = True
-                    memory_map_dict[i].append({'action': 'FORWARD', 'target_id': user_idx})
-
-            if not can_forward and len(info['users']) > 0:
+            
+            if can_forward:
+                memory_map_dict[i].append({'action': 'FORWARD', 'target_id': info['users'][0]})
+                forwarded_tensors.add(i)
+            else:
                 memory_map_dict[i].append({'action': 'SAVE_RESULT', 'target_id': i})
-                resources_in_memory.add(i)
 
-        for resource_id in resources_in_memory:
-            if resource_id in last_use_map and not usage_info.get(resource_id, {}).get('is_output_tensor', False):
-                free_tick = last_use_map[resource_id] + 1
-                memory_map_dict[free_tick].append({'action': 'FREE', 'target_id': resource_id})
+        # ─── ПРАВИЛО 3: СБОРКА МУСОРА (FREE) ──────────────────────────────────
+        for i in range(len(node_list)):
+            if i in forwarded_tensors:
+                continue 
+            
+            if usage_info[i]['is_output_tensor']:
+                continue
+                
+            if i in last_use_map:
+                free_tick = last_use_map[i]
+                memory_map_dict[free_tick].append({'action': 'FREE', 'target_id': i})
 
+        # ─── ФИЛЬТРАЦИЯ И СОРТИРОВКА ──────────────────────────────────────────
         memory_map = []
-        action_priority = {'FORWARD': 0, 'FREE': 1, 'SAVE_RESULT': 2, 'PRELOAD': 3}
+        action_priority = {'FREE': 0, 'FORWARD': 1, 'SAVE_RESULT': 2, 'PRELOAD': 3}
+        
         for instr_id in sorted(memory_map_dict.keys()):
-            if instr_id in preloaded_weight_indices: continue
-            commands = memory_map_dict.get(instr_id, [])
-            if not commands: continue
+            if instr_id in param_nodes:
+                continue
+
+            commands = memory_map_dict[instr_id]
+            if not commands: 
+                continue
+            
             unique_commands = list({(cmd['action'], cmd['target_id']): cmd for cmd in commands}.values())
             unique_commands.sort(key=lambda cmd: (action_priority.get(cmd['action'], 99), cmd['target_id']))
-            if unique_commands: memory_map.append({'instr_id': instr_id, 'commands': unique_commands})
+            
+            memory_map.append({'instr_id': instr_id, 'commands': unique_commands})
         
-        print(f"[Folder] Generated {len(memory_map)} entries for MMAP. Skipped {len(preloaded_weight_indices)} weight loading cycles.")
+        print(f"[Folder] Generated {len(memory_map)} exact entries for MMAP.")
         return memory_map
 
     def fold(self, optimize_memory_locality: bool = False):
@@ -510,6 +583,10 @@ class GraphConstantFolder:
 
         for node in nodes_to_replace:
             if len(node.users) == 0: self.graph.erase_node(node)
+
+        # ИСПРАВЛЕНИЕ: Удаляем мертвый код (неиспользуемые getitem), 
+        # чтобы они не нарушали счетчик пользователей узла.
+        self.graph.eliminate_dead_code()
 
         self._prune_unused_parameters()
         self.graph.lint()
