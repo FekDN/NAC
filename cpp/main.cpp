@@ -111,6 +111,7 @@ bool parse_instruction_at(const uint8_t* buffer, size_t buffer_size, size_t offs
 
     if (ins.A < 10) {
         if (ins.A == 2) {
+            // B=4 (saved_fw) and B=5 (target) also have 2 elements
             if (ins.B >= 1 && ins.B <= 5) {
                 if (p + 4 > buf_end) return false;
                 int16_t v0, v1;
@@ -120,7 +121,7 @@ bool parse_instruction_at(const uint8_t* buffer, size_t buffer_size, size_t offs
                 ins.C.push_back(v1);
             }
         } else if (ins.A == 3) {
-            if (ins.B == 0 || ins.B == 1) { // inference output / subgraph
+            if (ins.B == 0) { // inference output
                 size_t nC = num_outputs + 1;
                 if (p + nC * 2 > buf_end) return false;
                 ins.C.reserve(nC);
@@ -141,15 +142,7 @@ bool parse_instruction_at(const uint8_t* buffer, size_t buffer_size, size_t offs
                 if (p + nD * 2 > buf_end) return false;
                 for (size_t i = 0; i < nD; ++i) { int16_t v; memcpy(&v, p, 2); p += 2; ins.D.push_back(v); }
             }
-        } else if (ins.A == 7) {
-            if (p + 2 > buf_end) return false;
-            int16_t nc; memcpy(&nc, p, 2); p += 2;
-            ins.C.push_back(nc);
-            if (p + nc * 2 > buf_end) return false;
-            for (int i = 0; i < nc; ++i) { int16_t v; memcpy(&v, p, 2); p += 2; ins.C.push_back(v); }
-            if (p + 2 > buf_end) return false;
-            int16_t nd; memcpy(&nd, p, 2); p += 2;
-            ins.D.push_back(nd);
+
         }
     } else {
         if (ins.B >= permutations.size() || permutations[ins.B].empty()) {
@@ -459,10 +452,6 @@ static void process_mmap_tick(NacRuntimeContext* ctx, uint32_t tick) {
 
         case MmapAction::PRELOAD: {
             uint16_t op = cmd.target_id;
-            
-            // If the main thread has already passed this instruction, then it has loaded the weight itself.
-            if (ctx->current_instruction_idx.load(std::memory_order_relaxed) >= op) continue;
-            
             if (op >= ctx->decoded_ops.size()) continue;
             const auto& ins = ctx->decoded_ops[op];
             if (ins.A != 2 || ins.B != 1 || ins.C.size() < 2) continue;
@@ -477,6 +466,7 @@ static void process_mmap_tick(NacRuntimeContext* ctx, uint32_t tick) {
             Tensor* t = ctx->tensor_pool.acquire();
             if (!t) continue;
             
+            // Read the updated tensor from RAM if it was modified during training
             if (ctx->updated_parameters.count(pid) && ctx->updated_parameters[pid]) {
                 Tensor* heap_t = ctx->updated_parameters[pid];
                 t->dtype = heap_t->dtype; 
@@ -495,38 +485,24 @@ static void process_mmap_tick(NacRuntimeContext* ctx, uint32_t tick) {
                 }
             }
 
-            // Final check: Did the main thread overtake us while we were reading from the SD card?
-            if (ctx->current_instruction_idx.load(std::memory_order_relaxed) >= op) {
-                ctx->tensor_pool.release(t);
-                continue;
-            }
-
             xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
             if (op >= ctx->fast_memory_cache.size()) ctx->fast_memory_cache.resize(op + 1, nullptr);
-            if (ctx->fast_memory_cache[op]) ctx->tensor_pool.release(ctx->fast_memory_cache[op]);
             ctx->fast_memory_cache[op] = t;
             xSemaphoreGive(ctx->cache_mutex);
             break;
         }
         case MmapAction::FREE: {
+            // Disable memory clearing in training mode to save activations
             if (ctx->training_mode.load(std::memory_order_relaxed)) break;
             uint16_t tid = cmd.target_id;
-            
             xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
-            Tensor* tf = nullptr;
-            if (tid < ctx->results.size() && ctx->results[tid]) {
-                tf = ctx->results[tid];
-            } else if (tid < ctx->fast_memory_cache.size() && ctx->fast_memory_cache[tid]) {
-                tf = ctx->fast_memory_cache[tid];
-            }
-
+            Tensor* tf = (tid < ctx->results.size()) ? ctx->results[tid] : nullptr;
             if (tf) {
                 for (auto& r : ctx->results)           { if (r  == tf) r  = nullptr; }
                 for (auto& c : ctx->fast_memory_cache) { if (c  == tf) c  = nullptr; }
             }
             xSemaphoreGive(ctx->cache_mutex);
-            
-            if (tf) ctx->tensor_pool.release(tf);
+            if (tf) { ctx->tensor_pool.release(tf); ESP_LOGD(TAG_MEM, "[Tick %u] FREE slot %u", tick, tid); }
             break;
         }
         case MmapAction::SAVE_RESULT: {
@@ -542,8 +518,7 @@ static void process_mmap_tick(NacRuntimeContext* ctx, uint32_t tick) {
         case MmapAction::FORWARD: {
             uint16_t src = (uint16_t)tick, dst = cmd.target_id;
             xSemaphoreTake(ctx->cache_mutex, portMAX_DELAY);
-            if (src < ctx->results.size() && ctx->results[src]) {
-                if (dst >= ctx->results.size()) ctx->results.resize(dst + 1, nullptr);
+            if (src < ctx->results.size() && ctx->results[src] && dst < ctx->results.size()) {
                 if (ctx->results[dst] && ctx->results[dst] != ctx->results[src])
                     ctx->tensor_pool.release(ctx->results[dst]);
                 ctx->results[dst] = ctx->results[src];
@@ -562,12 +537,16 @@ static void process_mmap_tick(NacRuntimeContext* ctx, uint32_t tick) {
 void nac_memory_task(void* param) {
     auto* ctx = static_cast<NacRuntimeContext*>(param);
     uint32_t last = UINT32_MAX;
-
+#ifdef DBG
+    ESP_LOGI(TAG_MEM, "Memory thread started.");
+#endif
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         if (ctx->stop_flag.load()) break;
 
         uint32_t cur = ctx->current_instruction_idx.load(std::memory_order_acquire);
+        
+        // If cur is reset to 0 (starting a new generation iteration), also reset from
         uint32_t from = (last == UINT32_MAX || cur <= last) ? 0u : last + 1u;
         
         for (uint32_t t = from; t <= cur; ++t) {
@@ -578,6 +557,9 @@ void nac_memory_task(void* param) {
         xEventGroupSetBits(ctx->mmap_sync_event, ctx->MMAP_DONE_BIT);
     }
     xEventGroupSetBits(g_system_events, EVT_MEMORY_TASK_DONE);
+#ifdef DBG
+    ESP_LOGI(TAG_MEM, "Memory thread finished.");
+#endif
 }
 
 // ─── Compute task (legacy non-MEP path) ──────────────────────────────────────
@@ -590,9 +572,9 @@ void nac_compute_task(void* param) {
         const auto& ins = ctx->decoded_ops[idx];
         Tensor* result = nullptr;
 
-        if (ins.A == 2) { 
+        if (ins.A == 2) { // INPUT
             Tensor* src = nullptr;
-            if (ins.B == 1) { 
+            if (ins.B == 1) {   // weight
                 if (ins.C.size() < 2) { ctx->results[idx] = nullptr; continue; }
                 uint16_t pid = ins.C[1], ck = (uint16_t)idx;
 
@@ -610,7 +592,7 @@ void nac_compute_task(void* param) {
                         if (!dequantize_tensor(src)) { ctx->tensor_pool.release(src); src = nullptr; }
                     }
                 }
-            } else if (ins.B == 0) { 
+            } else if (ins.B == 0) {    // user data
                 if (user_input_idx < ctx->user_input_tensors.size()) {
                     src = ctx->user_input_tensors[user_input_idx];
                     ctx->user_input_tensors[user_input_idx++] = nullptr;
@@ -624,6 +606,7 @@ void nac_compute_task(void* param) {
             Tensor* args[MAX_INSTRUCTION_ARITY] = {};
             size_t  argc = gather_arguments(*ctx, ins, idx, args);
 
+            // Per-op dequant if needed
             Tensor* dq[MAX_INSTRUCTION_ARITY] = {};
             std::vector<Tensor*> tmp;
             if (ctx->quant_mode == QuantExecMode::DEQUANT_EXEC_PASS_FP
@@ -653,12 +636,21 @@ void nac_compute_task(void* param) {
 
         if (idx < ctx->results.size()) {
             ctx->results[idx] = result;
+            
+            // 1. Clear the memory ready bit BEFORE waking up the memory thread
+            if (ctx->mmap_sync_event) {
+                xEventGroupClearBits(ctx->mmap_sync_event, ctx->MMAP_DONE_BIT);
+            }
+            
             ctx->current_instruction_idx.store(idx, std::memory_order_release);
             
             if (g_nac_memory_task_handle) {
-                if (ctx->mmap_sync_event) xEventGroupClearBits(ctx->mmap_sync_event, ctx->MMAP_DONE_BIT);
                 xTaskNotifyGive(g_nac_memory_task_handle);
-                if (ctx->mmap_sync_event) xEventGroupWaitBits(ctx->mmap_sync_event, ctx->MMAP_DONE_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
+                // SYNCHRONIZATION BARRIER (Stall pipeline)
+                if (ctx->mmap_sync_event) {
+                    xEventGroupWaitBits(ctx->mmap_sync_event, ctx->MMAP_DONE_BIT, 
+                                        pdTRUE, pdFALSE, portMAX_DELAY);
+                }
             }
         } else if (result) {
             ctx->tensor_pool.release(result);
@@ -666,6 +658,9 @@ void nac_compute_task(void* param) {
     }
 
     xEventGroupSetBits(g_system_events, EVT_COMPUTE_TASK_DONE);
+#ifdef DBG
+    ESP_LOGI(TAG_COMPUTE, "Compute thread finished.");
+#endif
 }
 
 // ─── NAC context initializer (no SD mutex contention in single-threaded init) ─
