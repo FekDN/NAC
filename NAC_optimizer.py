@@ -374,7 +374,7 @@ class GraphConstantFolder:
         node_list = list(self.graph.nodes)
         node_to_idx = {node: i for i, node in enumerate(node_list)}
 
-        # 1. Находим все операции загрузки весов
+        # 1. Find all scale loading operations
         param_nodes = set()
         for i, node in enumerate(node_list):
             if node.op == 'placeholder':
@@ -385,7 +385,7 @@ class GraphConstantFolder:
             elif node.op == 'get_attr':
                 param_nodes.add(i)
 
-        # 2. Собираем информацию об использовании каждого узла
+        # 2. Сollect information about the usage of each node
         usage_info = {
             i: {'node': node, 'users': [node_to_idx[u] for u in node.users if u in node_to_idx], 'is_output_tensor': False} 
             for i, node in enumerate(node_list)
@@ -408,7 +408,7 @@ class GraphConstantFolder:
 
         memory_map_dict: Dict[int, List[Dict]] = {i: [] for i in range(len(node_list))}
         
-        # ─── ПРАВИЛО 1: СТРОГО ХРОНОЛОГИЧЕСКОЕ РАСПРЕДЕЛЕНИЕ PRELOAD ──────────
+        # ─── RULE 1: STRICTLY CHRONOLOGICAL DISTRIBUTION OF PRELOAD ──────────
         
         compute_ticks = [i for i in range(len(node_list)) if i not in param_nodes]
         if not compute_ticks:
@@ -416,7 +416,7 @@ class GraphConstantFolder:
             
         preloads_per_tick = {ct: [] for ct in compute_ticks}
         
-        # Проход 1: Наивно привязываем PRELOAD к ближайшему предыдущему рабочему такту
+        # Pass 1: Naively bind PRELOAD to the closest previous work cycle
         for p_idx in param_nodes:
             assigned_tick = compute_ticks[0]
             for ct in reversed(compute_ticks):
@@ -424,10 +424,10 @@ class GraphConstantFolder:
                     assigned_tick = ct
                     break
             preloads_per_tick[assigned_tick].append(p_idx)
-            # Гарантируем сортировку по возрастанию сразу
+            # Guarantee sorting in ascending order immediately
             preloads_per_tick[assigned_tick].sort()
 
-        # Проход 2: Строгое размазывание (Chronological Half-Split)
+        # Pass 2: Strict Smearing (Chronological Half-Split)
         changed = True
         while changed:
             changed = False
@@ -437,14 +437,14 @@ class GraphConstantFolder:
                 preloads = preloads_per_tick[ct]
                 
                 if len(preloads) == 0:
-                    # Запоминаем пустой такт как кандидат на прием PRELOAD
+                    # Remember the empty bar as a candidate for the PRELOAD method
                     last_empty_tick = ct
                 elif len(preloads) == 1:
-                    # ВАЖНО: Если на такте уже есть PRELOAD, мы сбрасываем кандидата,
-                    # чтобы не перенести параметры ЧЕРЕЗ этот такт и не нарушить хронологию!
+                    # IMPORTANT: If there is already a PRELOAD on the clock, discard the candidate,
+                    # so as not to transfer parameters THROUGH this measure and not to disrupt the chronology!
                     last_empty_tick = None
                 elif len(preloads) > 1:
-                    # Если есть несколько PRELOAD и перед ними есть свободный такт
+                    # If there are several PRELOAD and there is a free cycle before them
                     if last_empty_tick is not None:
                         half_len = len(preloads) // 2
                         moved_preloads = preloads[:half_len]
@@ -453,21 +453,21 @@ class GraphConstantFolder:
                         preloads_per_tick[last_empty_tick].extend(moved_preloads)
                         preloads_per_tick[ct] = kept_preloads
                         
-                        # Такт-кандидат принял параметры, теперь он не пустой (сбрасываем)
+                        # The candidate clock has accepted the parameters and is now not empty (reset)
                         last_empty_tick = None
                         changed = True
                     else:
-                        # У нас скопление параметров, но предыдущий такт УЖЕ ЗАНЯТ.
-                        # Это "стена" - мы ничего не можем перенести назад без нарушения хронологии.
-                        # Сбрасываем кандидата для следующих тактов.
+                        # We have a cluster of parameters, but the previous cycle is ALREADY BUSY.
+                        # This is a "wall" - cannot move anything back without breaking the chronology.
+                        # Reset the candidate for the next cycles.
                         last_empty_tick = None
 
-        # Записываем сбалансированные PRELOAD обратно
+        # Write balanced PRELOAD back
         for ct in compute_ticks:
             for p_idx in preloads_per_tick[ct]:
                 memory_map_dict[ct].append({'action': 'PRELOAD', 'target_id': p_idx})
 
-        # ─── ПРАВИЛО 2: FORWARD И SAVE_RESULT ─────────────────────────────────
+        # ─── RULE 2: FORWARD AND SAVE_RESULT ─────────────────────────────────
         forwarded_tensors = set()
         for i in range(len(node_list)):
             if i in param_nodes:
@@ -488,7 +488,7 @@ class GraphConstantFolder:
             else:
                 memory_map_dict[i].append({'action': 'SAVE_RESULT', 'target_id': i})
 
-        # ─── ПРАВИЛО 3: СБОРКА МУСОРА (FREE) ──────────────────────────────────
+        # ─── RULE 3: FREE GARBAGE COLLECTION ──────────────────────────────────
         for i in range(len(node_list)):
             if i in forwarded_tensors:
                 continue 
@@ -500,7 +500,7 @@ class GraphConstantFolder:
                 free_tick = last_use_map[i]
                 memory_map_dict[free_tick].append({'action': 'FREE', 'target_id': i})
 
-        # ─── ФИЛЬТРАЦИЯ И СОРТИРОВКА ──────────────────────────────────────────
+        # ─── FILTRATION AND SORTING ──────────────────────────────────────────
         memory_map = []
         action_priority = {'FREE': 0, 'FORWARD': 1, 'SAVE_RESULT': 2, 'PRELOAD': 3}
         
@@ -583,10 +583,6 @@ class GraphConstantFolder:
 
         for node in nodes_to_replace:
             if len(node.users) == 0: self.graph.erase_node(node)
-
-        # ИСПРАВЛЕНИЕ: Удаляем мертвый код (неиспользуемые getitem), 
-        # чтобы они не нарушали счетчик пользователей узла.
-        self.graph.eliminate_dead_code()
 
         self._prune_unused_parameters()
         self.graph.lint()

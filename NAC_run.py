@@ -252,55 +252,17 @@ class NacRuntime(NacKernelBase):
                     i_idx, name_len = struct.unpack('<HH', f.read(4))
                     self.input_node_idx_to_name[i_idx] = f.read(name_len).decode('utf-8')
                 
-                # --- Auto Discovery for Safetensors (Shard Support) ---
-                import glob
-                base_name = os.path.splitext(nac_path)[0]
-                safetensors_paths = []
-                single_file = f"{base_name}.safetensors"
-                if os.path.exists(single_file):
-                    safetensors_paths.append(single_file)
-                else:
-                    safetensors_paths = sorted(glob.glob(f"{base_name}-*-of-*.safetensors"))
-
-                # 1. Loading weights if they are stored externally (or as an override for internal ones)
-                if safetensors_paths:
+                companion = os.path.splitext(nac_path)[0] + ".safetensors"
+                if os.path.isfile(companion) and self.weights_stored_internally:
                     try:
-                        from safetensors import safe_open
-                        tensors, per_tensor_metadata = {}, {}
-                        
-                        for st_path in safetensors_paths:
-                            with safe_open(st_path, framework="np", device="cpu") as st_f:
-                                file_metadata = st_f.metadata() or {}
-                                if "nac_quant_meta" in file_metadata:
-                                    per_tensor_metadata.update(json.loads(file_metadata["nac_quant_meta"]))
-                                elif "metadata" in file_metadata:
-                                    for name, meta_str in json.loads(file_metadata["metadata"]).items(): 
-                                        per_tensor_metadata[name] = json.loads(meta_str)
-                                else:
-                                    for k, v in file_metadata.items():
-                                        try: per_tensor_metadata[k] = json.loads(v)
-                                        except: pass
-                                        
-                                for key in st_f.keys(): 
-                                    tensors[key] = st_f.get_tensor(key)
-                        
-                        # Use a list of PIDs for each name so as not to lose Shared Weights!
-                        import collections
-                        n2ids = collections.defaultdict(list)
-                        for k, v in self.param_id_to_name.items():
-                            n2ids[v].append(k)
-
-                        for _name, _arr in tensors.items():
-                            if _name in n2ids: 
-                                dequantized_tensor = self._dequantize(_arr, per_tensor_metadata.get(_name, {}))
-                                for pid in n2ids[_name]:
-                                    self.parameters[pid] = dequantized_tensor
-                        
-                        print(f"[NAC] Loaded external weights from {len(safetensors_paths)} file(s).")
-                    except Exception as e:
-                        print(f"[NAC] Warning: Failed to load external weights: {e}")
+                        _st_data = load_file(companion)
+                        _n2id = {v: k for k, v in self.param_id_to_name.items()}
+                        for _name, _arr in _st_data.items():
+                            if _name in _n2id: self.parameters[_n2id[_name]] = _arr
+                        print(f"[NAC] Fast load: loaded weights from '{companion}'")
+                    except Exception: pass
                 
-                # 2. Check if we need to load internal weights
+                # Check if we need to load internal weights
                 if len(self.parameters) < len(self.param_id_to_name) and self.weights_stored_internally:
                     num_tensors = struct.unpack('<I', f.read(4))[0]
                     numpy_dtype_map = {0:np.float32, 1:np.float64, 2:np.float16, 3:"<bf16>", 4:np.int32, 5:np.int64, 6:np.int16, 7:np.int8, 8:np.uint8, 9:np.bool_}
@@ -335,6 +297,19 @@ class NacRuntime(NacKernelBase):
                             dtype = numpy_dtype_map.get(dtype_id, np.float32)
                             arr = (np.frombuffer(data_bytes, dtype=np.uint16).reshape(shape).astype(np.uint32) << 16).view(np.float32).copy() if dtype == "<bf16>" else np.frombuffer(data_bytes, dtype=dtype).reshape(shape).copy()
                             self.parameters[p_id] = self._dequantize(arr, meta)
+                
+                elif not self.weights_stored_internally:
+                    safetensors_path = os.path.splitext(nac_path)[0] + '.safetensors'
+                    if os.path.exists(safetensors_path):
+                        from safetensors import safe_open
+                        tensors, per_tensor_metadata = {}, {}
+                        with safe_open(safetensors_path, framework="np", device="cpu") as st_f:
+                            file_metadata = st_f.metadata() or {}
+                            if "metadata" in file_metadata:
+                                for name, meta_str in json.loads(file_metadata["metadata"]).items(): per_tensor_metadata[name] = json.loads(meta_str)
+                            for key in st_f.keys(): tensors[key] = st_f.get_tensor(key)
+                        for p_id, p_name in self.param_id_to_name.items():
+                            if p_name in tensors: self.parameters[p_id] = self._dequantize(tensors[p_name], per_tensor_metadata.get(p_name, {}))
             
             tokenizer_resources_raw = {}
             if rsrc_off > 0:
@@ -361,19 +336,22 @@ class NacRuntime(NacKernelBase):
                     num_entries, = struct.unpack_from('<I', content, 0)
                     offset = 4 + num_entries * 4 
                     vocab = {}
-                    unigram_scores = {} 
+                    unigram_scores = {} # Creating a dictionary for scores
                     
                     for _ in range(num_entries):
                         key_len, = struct.unpack_from('<H', content, offset); offset += 2
                         key = content[offset : offset + key_len].decode('utf-8'); offset += key_len
                         
+                        # Read the ID token (val) and its Score
                         val, score = struct.unpack_from('<if', content, offset); offset += 8
                         vocab[key] = val
+                        
+                        # Save the score (if there is one) so that Viterbi can run
                         if score != 0.0:
                             unigram_scores[key] = score
                             
                     vm_resources['vocab'] = vocab
-                    vm_resources['unigram_scores'] = unigram_scores 
+                    vm_resources['unigram_scores'] = unigram_scores # Submitting scores to TISA
                     if "merges.b" in tokenizer_resources_raw:
                         content = tokenizer_resources_raw['merges.b']
                         num_entries, = struct.unpack_from('<I', content, 0)
@@ -423,6 +401,7 @@ class NacRuntime(NacKernelBase):
                 if f.read(4) != b'ARRS': raise ValueError("Bad ARRS magic")
                 num_arrays = struct.unpack('<I', f.read(4))[0]
                 
+                # The mapping is strictly mirrored by the compiler.
                 numpy_dtype_map = {
                     0: np.float32, 1: np.float64, 2: np.float16, 
                     4: np.int32, 5: np.int64, 6: np.int16, 
@@ -440,6 +419,7 @@ class NacRuntime(NacKernelBase):
                     data_bytes = f.read(data_len)
                     
                     dtype = numpy_dtype_map.get(dtype_id, np.float32)
+                    # Recovering an array of bytes with a precise type and shape
                     arr = np.frombuffer(data_bytes, dtype=dtype).reshape(shape).copy()
                     
                     self.arrays[arr_name] = arr

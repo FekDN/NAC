@@ -217,7 +217,7 @@ class ResultManager:
                     f.write(struct.pack('<HH', i_idx, len(name_bytes))); f.write(name_bytes)
                 if store_weights_internally:
                     f.write(struct.pack('<I', len(param_data)))
-                    for p_id, data_tuple in sorted(param_data.items()):
+                    for p_id, data_tuple in param_data.items():
                         tensor, meta = (data_tuple, {}) if isinstance(data_tuple, torch.Tensor) else data_tuple
                         meta_binary = b''
                         dtype_enum = self._map_dtype_to_enum(tensor.dtype)
@@ -252,23 +252,15 @@ class ResultManager:
                         f.write(meta_binary); f.write(data_bytes)
                 else:
                     safetensors_path = os.path.join(self.output_path, f"{model_name}.safetensors")
-                    tensors_to_save = {}
-                    quant_metadata_dict = {}
-                    
+                    tensors_to_save, metadata_to_save = {}, {}
                     for p_id, data_tuple in param_data.items():
                         name = param_id_to_name.get(p_id)
                         if not name: continue
                         tensor, meta = (data_tuple, None) if isinstance(data_tuple, torch.Tensor) else data_tuple
-                        
-                        if tensor.dtype == torch.bfloat16:
-                            tensor = tensor.to(torch.float32)
-                            
                         tensors_to_save[name] = tensor
-                        if meta: quant_metadata_dict[name] = meta 
-                    
-                    st_metadata = {"nac_quant_meta": json.dumps(quant_metadata_dict)} if quant_metadata_dict else None
-                    save_file(tensors_to_save, safetensors_path, metadata=st_metadata)
-                    print(f"Weights saved to {safetensors_path} (Quantized: {bool(quant_metadata_dict)})")
+                        if meta: metadata_to_save[name] = json.dumps(meta) 
+                    save_file(tensors_to_save, safetensors_path, metadata=metadata_to_save)
+                    print(f"Weights saved to {safetensors_path}")
 
                 if tokenizer_manifest:
                     offsets['proc'] = f.tell()
@@ -296,8 +288,7 @@ class ResultManager:
                         if C: f.write(struct.pack(f'<{len(C)}h', *C))
                         if D: f.write(struct.pack(f'<{len(D)}h', *D))
 
-                # Always store RSRC (tokenizer resources) inside .nac
-                if tokenizer_resources:
+                if tokenizer_resources and store_weights_internally:
                     offsets['rsrc'] = f.tell()
                     f.write(b'RSRC')
                     f.write(struct.pack('<I', len(tokenizer_resources)))
@@ -1213,6 +1204,7 @@ def generate_artifacts(
             if compile_tokenizer_resources:
                 vocab_dict = hf_tokenizer.get_vocab()
                 
+                # Extracting real scores (weights) for Unigram tokenizers
                 scores_dict = {}
                 try:
                     state = json.loads(hf_tokenizer.backend_tokenizer.to_str())
@@ -1221,6 +1213,7 @@ def generate_artifacts(
                             scores_dict[t] = float(s)
                 except Exception:
                     pass
+                # -----------------------------------------------------------------------------
 
                 vocab_sorted_by_token = sorted(vocab_dict.items(), key=lambda item: item[0])
                 num_entries = len(vocab_sorted_by_token)
@@ -1234,8 +1227,10 @@ def generate_artifacts(
                     data_buffer.write(struct.pack('<H', len(token_bytes)))
                     data_buffer.write(token_bytes)
                     
+                    # Write the real score instead of the hard 0.0
                     score = scores_dict.get(token_str, 0.0)
                     data_buffer.write(struct.pack('<if', token_id, score))
+                    # -----------------------------------------------------------------
                 
                 final_vocab_b = bytearray()
                 final_vocab_b.extend(struct.pack('<I', num_entries))
@@ -1258,14 +1253,18 @@ def generate_artifacts(
                     
                     valid_merges = []
                     for line in lines:
+                        # Strict removal of line breaks only.
+                        # Using strip() destroys tokens containing spaces!
                         line = line.replace('\r', '').replace('\n', '')
                         if not line: continue
                         
+                        # Strict split on only one space between p1 and p2
                         parts = line.split(' ') 
                         if len(parts) == 2:
                             valid_merges.append((parts[0].encode('utf-8'), parts[1].encode('utf-8')))
                             
                     merges_b_content = bytearray()
+                    # Record the exact actual number of pairs collected
                     merges_b_content.extend(struct.pack('<I', len(valid_merges)))
                     for p1_bytes, p2_bytes in valid_merges:
                         merges_b_content.extend(struct.pack('<H', len(p1_bytes)))
@@ -1286,9 +1285,12 @@ def generate_artifacts(
                     sorted_vocab = {k: v for k, v in sorted(vocab.items(), key=lambda item: item[1])}
                     tokenizer_resources['vocab.json'] = json.dumps(sorted_vocab, ensure_ascii=False).encode('utf-8')
 
-            # Removed the block that cleared tokenizer_resources,
-            # if store_weights_internally == False.
-            # The tokenizer is now always embedded!
+            if not store_weights_internally:
+                tokenizer_dir = os.path.join(result_manager.output_path, f"{model_name}-tokenizer")
+                os.makedirs(tokenizer_dir, exist_ok=True)
+                for filename, content in tokenizer_resources.items():
+                    with open(os.path.join(tokenizer_dir, filename), 'wb') as f: f.write(content)
+                tokenizer_resources = {}
 
         except Exception as e: print(f"!!!!! WARNING: Failed to process tokenizer for '{tokenizer_repo}'. Error: {e}"); traceback.print_exc()
 
@@ -1349,6 +1351,7 @@ def generate_artifacts(
         if isinstance(tokenizer_manifest, bytes):
             tokenizer_manifest_bytes = tokenizer_manifest
         else:
+            # If passed a list of instructions (Manual Editing), compile a binary from it
             buf = bytearray(b"TISA\x01")
             for op, payload in tokenizer_manifest:
                 p_bytes = TISACompiler._serialize_payload_binary(op, payload)
