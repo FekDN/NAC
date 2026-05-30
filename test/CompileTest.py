@@ -6,59 +6,112 @@ import os
 # ============================================================
 # ENVIRONMENTAL CHECKS (STRICT VERSIONS FOR torch.export)
 # ============================================================
+
 TARGET_TORCH = "2.5.1"
 TARGET_TVISION = "0.20.1"
 TARGET_TRANSFORMERS = "4.57.3"
+TARGET_SYMPY = "1.13.1"
+
+
+def normalize_version(v: str) -> str:
+    if v is None:
+        return ""
+    return v.split("+")[0].strip()
+
 
 def verify_environment():
+    # Python version check (strictly Python 3.11)
+    if sys.version_info.major != 3 or sys.version_info.minor != 11:
+        print(
+            f"\n[!] Python version mismatch "
+            f"(Installed: {sys.version.split()[0]}, Required: 3.11.x)"
+        )
+        print_venv_instructions()
+        sys.exit(1)
+
     try:
         import torch
         import torchvision
         import transformers
+        import sympy
     except ImportError as e:
         print(f"\n[!] Missing required library: {e.name}")
         print_venv_instructions()
         sys.exit(1)
 
     mismatch = False
-    
-    # torch.__version__ often contains '+cu121', we'll strip it out for testing.
-    torch_ver = torch.__version__.split('+')[0]
-    tvision_ver = torchvision.__version__.split('+')[0]
-    trans_ver = transformers.__version__
+
+    torch_ver = normalize_version(torch.__version__)
+    tvision_ver = normalize_version(torchvision.__version__)
+    trans_ver = normalize_version(transformers.__version__)
+    sympy_ver = normalize_version(sympy.__version__)
 
     if torch_ver != TARGET_TORCH:
-        print(f"[!] Version mismatch: torch (Installed: {torch_ver}, Required: {TARGET_TORCH})")
+        print(
+            f"[!] Version mismatch: torch "
+            f"(Installed: {torch_ver}, Required: {TARGET_TORCH})"
+        )
         mismatch = True
+
     if tvision_ver != TARGET_TVISION:
-        print(f"[!] Version mismatch: torchvision (Installed: {tvision_ver}, Required: {TARGET_TVISION})")
+        print(
+            f"[!] Version mismatch: torchvision "
+            f"(Installed: {tvision_ver}, Required: {TARGET_TVISION})"
+        )
         mismatch = True
+
     if trans_ver != TARGET_TRANSFORMERS:
-        print(f"[!] Version mismatch: transformers (Installed: {trans_ver}, Required: {TARGET_TRANSFORMERS})")
+        print(
+            f"[!] Version mismatch: transformers "
+            f"(Installed: {trans_ver}, Required: {TARGET_TRANSFORMERS})"
+        )
+        mismatch = True
+
+    if sympy_ver != TARGET_SYMPY:
+        print(
+            f"[!] Version mismatch: sympy "
+            f"(Installed: {sympy_ver}, Required: {TARGET_SYMPY})"
+        )
         mismatch = True
 
     if mismatch:
         print_venv_instructions()
         sys.exit(1)
 
-def print_venv_instructions():
-    print("\n" + "!"*70)
-    print("ENVIRONMENT SETUP REQUIRED".center(70))
-    print("!"*70)
-    print("The 'torch.export' compilation engine is highly dependent on exact")
-    print("library versions. To prevent graph compilation errors, please create")
-    print("a fresh virtual environment using the commands below:\n")
-    print("For Windows:")
-    print("  python -m venv nac_env")
-    print("  nac_env\\Scripts\\activate")
-    print(f"  pip install torch=={TARGET_TORCH} torchvision=={TARGET_TVISION} transformers=={TARGET_TRANSFORMERS} sympy==1.13.1")
-    print("\nFor Linux / Mac:")
-    print("  python3 -m venv nac_env")
-    print("  source nac_env/bin/activate")
-    print(f"  pip install torch=={TARGET_TORCH} torchvision=={TARGET_TVISION} transformers=={TARGET_TRANSFORMERS} sympy==1.13.1")
-    print("!"*70 + "\n")
 
-# Run the strict version check before loading heavy machinery
+def print_venv_instructions():
+    print("\n" + "!" * 70)
+    print("ENVIRONMENT SETUP REQUIRED".center(70))
+    print("!" * 70)
+    print("Strict dependency mode for torch.export compilation.\n")
+
+    print("Required Python: 3.11.x\n")
+
+    print("For Windows:")
+    print("  py -3.11 -m venv nac_env")
+    print("  nac_env\\Scripts\\activate")
+    print(
+        f"  pip install torch=={TARGET_TORCH} "
+        f"torchvision=={TARGET_TVISION} "
+        f"transformers=={TARGET_TRANSFORMERS} "
+        f"sympy=={TARGET_SYMPY} "
+        "numpy safetensors regex"
+    )
+
+    print("\nFor Linux / Mac:")
+    print("  python3.11 -m venv nac_env")
+    print("  source nac_env/bin/activate")
+    print(
+        f"  pip install torch=={TARGET_TORCH} "
+        f"torchvision=={TARGET_TVISION} "
+        f"transformers=={TARGET_TRANSFORMERS} "
+        f"sympy=={TARGET_SYMPY} "
+        "numpy safetensors regex"
+    )
+
+    print("!" * 70 + "\n")
+
+
 verify_environment()
 
 # ============================================================
