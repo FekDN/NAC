@@ -79,6 +79,7 @@ powershell -ExecutionPolicy Bypass -File scripts/run_sim.ps1 -Top nac_scalar_alu
 powershell -ExecutionPolicy Bypass -File scripts/run_sim.ps1 -Top nac_tisa_packetizer_tb
 powershell -ExecutionPolicy Bypass -File scripts/run_sim.ps1 -Top nac_tisa_tokenizer_frontend_tb
 powershell -ExecutionPolicy Bypass -File scripts/run_sim.ps1 -Top nac_tisa_tokenizer_tb
+powershell -ExecutionPolicy Bypass -File scripts/run_sim.ps1 -Top nac_op_table_tb
 powershell -ExecutionPolicy Bypass -File scripts/run_sim.ps1 -Top nac_op_dispatch_tb
 powershell -ExecutionPolicy Bypass -File scripts/run_sim.ps1 -Top nac_core_mmap_backpressure_tb
 powershell -ExecutionPolicy Bypass -File scripts/run_sim.ps1 -Top nac_addr_gen_tb
