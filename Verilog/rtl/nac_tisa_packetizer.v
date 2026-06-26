@@ -30,7 +30,7 @@ module nac_tisa_packetizer (
     localparam S_PAYLOAD = 4'd6;
     localparam S_DONE    = 4'd7;
 
-    reg [3:0] state;
+    (* fsm_safe_state = "default_state" *) reg [3:0] state;
     reg [1:0] magic_idx;
     reg [1:0] len_idx;
     reg [31:0] bytes_seen;
@@ -90,6 +90,9 @@ module nac_tisa_packetizer (
                     S_VERSION: begin
                         if (byte_valid && byte_ready) begin
                             bytes_seen <= bytes_seen + 32'd1;
+                            if (byte_in != `TISA_VERSION_V10) begin
+                                error <= 1'b1;
+                            end
                             if (manifest_size == 32'd5) begin
                                 done <= 1'b1;
                                 state <= S_DONE;

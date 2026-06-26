@@ -50,7 +50,7 @@ module nac_abcd_decoder #(
     localparam S_EMIT       = 5'd14;
     localparam S_ERROR      = 5'd15;
 
-    reg [4:0] state;
+    (* fsm_safe_state = "default_state" *) reg [4:0] state;
     reg [15:0] tmp16;
     reg [3:0] c_target_count;
     reg [3:0] d_target_count;
@@ -58,6 +58,7 @@ module nac_abcd_decoder #(
     reg [3:0] d_idx;
     reg [15:0] sys_c_target_count;
     reg [15:0] sys_d_target_count;
+    reg sys_c_len_from_stream;
 
     assign ops_byte_ready =
         busy && !instr_valid && (
@@ -86,6 +87,7 @@ module nac_abcd_decoder #(
             d_count <= 4'd0;
             c_flat <= {MAX_CONSTS*16{1'b0}};
             d_flat <= {MAX_ARITY*16{1'b0}};
+            sys_c_len_from_stream <= 1'b0;
         end else begin
             if (start) begin
                 state <= S_A;
@@ -97,6 +99,7 @@ module nac_abcd_decoder #(
                 d_count <= 4'd0;
                 c_flat <= {MAX_CONSTS*16{1'b0}};
                 d_flat <= {MAX_ARITY*16{1'b0}};
+                sys_c_len_from_stream <= 1'b0;
             end else begin
                 case (state)
                     S_IDLE: begin
@@ -119,6 +122,7 @@ module nac_abcd_decoder #(
                     S_B: begin
                         if (accept) begin
                             instr_b <= ops_byte;
+                            sys_c_len_from_stream <= 1'b0;
                             if (instr_a < 8'd10) begin
                                 if (instr_a == `NAC_OP_INPUT && ops_byte >= 8'd1 && ops_byte <= 8'd5) begin
                                     sys_c_target_count <= 16'd2;
@@ -126,7 +130,12 @@ module nac_abcd_decoder #(
                                     c_idx <= 4'd0;
                                     state <= S_SYS_C_LO;
                                 end else if (instr_a == `NAC_OP_OUTPUT && ops_byte == 8'd0) begin
-                                    sys_c_target_count <= num_outputs + 16'd1;
+                                    sys_c_len_from_stream <= 1'b1;
+                                    sys_c_target_count <= 16'd1;
+                                    sys_d_target_count <= 16'd0;
+                                    // sys_c_target_count <= num_outputs + 16'd1;
+                                    // num_outputs + 1 уже лежит в C[0] (как length prefix)
+                                    sys_c_target_count <= c_flat[0 +: 16];  // используем ABCD-данные
                                     sys_d_target_count <= num_outputs;
                                     c_idx <= 4'd0;
                                     d_idx <= 4'd0;
@@ -146,6 +155,16 @@ module nac_abcd_decoder #(
                                     sys_d_target_count <= 16'd1;
                                     d_idx <= 4'd0;
                                     state <= S_SYS_D_LO;
+                                end else if (instr_a == `NAC_OP_CONTROL_FLOW) begin
+                                    sys_c_target_count <= 16'd3;
+                                    sys_d_target_count <= 16'd1;
+                                    c_idx <= 4'd0;
+                                    d_idx <= 4'd0;
+                                    if (MAX_CONSTS < 3 || MAX_ARITY < 1) begin
+                                        state <= S_ERROR;
+                                    end else begin
+                                        state <= S_SYS_C_LO;
+                                    end
                                 end else begin
                                     state <= S_EMIT;
                                 end

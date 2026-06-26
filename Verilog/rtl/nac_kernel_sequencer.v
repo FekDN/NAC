@@ -21,7 +21,7 @@ module nac_kernel_sequencer (
     localparam S_EMIT = 2'd1;
     localparam S_DONE = 2'd2;
 
-    reg [1:0] state;
+    (* fsm_safe_state = "default_state" *) reg [1:0] state;
     reg [3:0] pc;
     reg [3:0] last_pc;
 

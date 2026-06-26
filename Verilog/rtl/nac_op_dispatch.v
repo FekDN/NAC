@@ -3,6 +3,10 @@
 module nac_op_dispatch (
     input  wire [7:0] op_a,
     input  wire [7:0] op_table_kernel_class,
+    input  wire [7:0] op_table_dsp_mode,
+    input  wire op_table_uses_dsp,
+    input  wire op_table_multi_pass,
+    input  wire op_table_present,
     output reg  [7:0] dsp_mode,
     output reg  [7:0] kernel_class,
     output reg  uses_dsp,
@@ -60,32 +64,18 @@ module nac_op_dispatch (
                 uses_dsp = 1'b1;
             end
             default: begin
-                case (op_table_kernel_class)
-                    `NAC_KCLASS_MATMUL,
-                    `NAC_KCLASS_CONV2D: begin
-                        dsp_mode = `NAC_DSP_MAC;
-                        uses_dsp = 1'b1;
-                    end
-                    `NAC_KCLASS_LAYERNORM: begin
-                        dsp_mode = `NAC_DSP_REDUCE_SUM;
-                        uses_dsp = 1'b1;
-                        multi_pass = 1'b1;
-                    end
-                    `NAC_KCLASS_SOFTMAX: begin
-                        dsp_mode = `NAC_DSP_REDUCE_MAX;
-                        uses_dsp = 1'b1;
-                        multi_pass = 1'b1;
-                    end
-                    `NAC_KCLASS_COMPARE: begin
-                        dsp_mode = `NAC_DSP_GT;
-                        uses_dsp = 1'b1;
-                    end
-                    default: begin
-                        dsp_mode = `NAC_DSP_NOP;
-                        uses_dsp = 1'b0;
-                        supported = 1'b0;
-                    end
-                endcase
+                if (op_table_present) begin
+                    kernel_class = op_table_kernel_class;
+                    dsp_mode = op_table_dsp_mode;
+                    uses_dsp = op_table_uses_dsp;
+                    multi_pass = op_table_multi_pass;
+                    supported = 1'b1;
+                end else begin
+                    dsp_mode = `NAC_DSP_NOP;
+                    uses_dsp = 1'b0;
+                    multi_pass = 1'b0;
+                    supported = 1'b0;
+                end
             end
         endcase
     end

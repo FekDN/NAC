@@ -1,8 +1,9 @@
 `include "nac_defs.vh"
+`include "nac_descriptor.vh"
 
 module nac_orch_fsm #(
     parameter IDX_WIDTH = 10,
-    parameter DESC_WIDTH = 64,
+    parameter DESC_WIDTH = `NAC_DESC_MIN_WIDTH,
     parameter MAX_ARITY = 8,
     parameter MAX_CONSTS = 8
 ) (
@@ -21,6 +22,10 @@ module nac_orch_fsm #(
     input  wire [MAX_ARITY*16-1:0] d_flat,
 
     input  wire [7:0] op_table_kernel_class,
+    input  wire [7:0] op_table_dsp_mode,
+    input  wire op_table_uses_dsp,
+    input  wire op_table_multi_pass,
+    input  wire op_table_present,
 
     output reg  result_wr_valid,
     output reg  [IDX_WIDTH-1:0] result_wr_idx,
@@ -49,6 +54,16 @@ module nac_orch_fsm #(
     input  wire input_desc_valid,
     input  wire [DESC_WIDTH-1:0] input_desc,
 
+    output reg  branch_req_valid,
+    output reg  [IDX_WIDTH-1:0] branch_predicate_idx,
+    output reg  [IDX_WIDTH-1:0] branch_true_target,
+    output reg  [IDX_WIDTH-1:0] branch_false_target,
+    input  wire branch_req_ready,
+    input  wire branch_resp_valid,
+    input  wire branch_take_true,
+    output reg  branch_redirect_valid,
+    output reg  [IDX_WIDTH-1:0] branch_redirect_target,
+
     output reg  done,
     output reg  error
 );
@@ -60,12 +75,40 @@ module nac_orch_fsm #(
     localparam S_COMMIT     = 4'd5;
     localparam S_DONE       = 4'd6;
     localparam S_ERROR      = 4'd7;
+    localparam S_BRANCH_REQ = 4'd8;
+    localparam S_BRANCH_WAIT = 4'd9;
 
-    reg [3:0] state;
+    (* fsm_safe_state = "default_state" *) reg [3:0] state;
     reg [15:0] active_index;
     reg [7:0] active_a;
     reg [7:0] active_b;
     reg [DESC_WIDTH-1:0] pending_desc;
+    reg [IDX_WIDTH-1:0] true_target_latched;
+    reg [IDX_WIDTH-1:0] false_target_latched;
+    reg [IDX_WIDTH-1:0] skip_target_latched;
+    reg [15:0] true_len_latched;
+    reg [15:0] false_len_latched;
+    reg [15:0] branch_skip_remaining;
+
+    function [IDX_WIDTH-1:0] add_signed_offset;
+        input [15:0] base;
+        input [15:0] offset;
+        reg signed [16:0] calc;
+        begin
+            calc = $signed({1'b0, base}) + $signed(offset);
+            add_signed_offset = calc[IDX_WIDTH-1:0];
+        end
+    endfunction
+
+    function [IDX_WIDTH-1:0] add_unsigned_len;
+        input [15:0] base;
+        input [15:0] len;
+        reg [16:0] calc;
+        begin
+            calc = {1'b0, base} + {1'b0, len};
+            add_unsigned_len = calc[IDX_WIDTH-1:0];
+        end
+    endfunction
 
     wire [7:0] dispatch_dsp_mode;
     wire [7:0] dispatch_kernel_class;
@@ -76,6 +119,10 @@ module nac_orch_fsm #(
     nac_op_dispatch dispatch (
         .op_a(instr_a),
         .op_table_kernel_class(op_table_kernel_class),
+        .op_table_dsp_mode(op_table_dsp_mode),
+        .op_table_uses_dsp(op_table_uses_dsp),
+        .op_table_multi_pass(op_table_multi_pass),
+        .op_table_present(op_table_present),
         .dsp_mode(dispatch_dsp_mode),
         .kernel_class(dispatch_kernel_class),
         .uses_dsp(dispatch_uses_dsp),
@@ -105,24 +152,39 @@ module nac_orch_fsm #(
             input_req_valid <= 1'b0;
             input_kind <= 8'd0;
             input_id <= 16'd0;
+            branch_req_valid <= 1'b0;
+            branch_predicate_idx <= {IDX_WIDTH{1'b0}};
+            branch_true_target <= {IDX_WIDTH{1'b0}};
+            branch_false_target <= {IDX_WIDTH{1'b0}};
+            branch_redirect_valid <= 1'b0;
+            branch_redirect_target <= {IDX_WIDTH{1'b0}};
             done <= 1'b0;
             error <= 1'b0;
             active_index <= 16'd0;
             active_a <= 8'd0;
             active_b <= 8'd0;
             pending_desc <= {DESC_WIDTH{1'b0}};
+            true_target_latched <= {IDX_WIDTH{1'b0}};
+            false_target_latched <= {IDX_WIDTH{1'b0}};
+            skip_target_latched <= {IDX_WIDTH{1'b0}};
+            true_len_latched <= 16'd0;
+            false_len_latched <= 16'd0;
+            branch_skip_remaining <= 16'd0;
         end else begin
             result_wr_valid <= 1'b0;
             tick_commit_valid <= 1'b0;
             kernel_start <= 1'b0;
+            branch_redirect_valid <= 1'b0;
 
             case (state)
                 S_IDLE: begin
                     instr_ready <= 1'b0;
                     input_req_valid <= 1'b0;
+                    branch_req_valid <= 1'b0;
                     done <= 1'b0;
                     error <= 1'b0;
                     if (start) begin
+                        branch_skip_remaining <= 16'd0;
                         state <= S_FETCH;
                     end
                 end
@@ -142,6 +204,26 @@ module nac_orch_fsm #(
                         end else if (instr_a == `NAC_OP_OUTPUT && instr_b == 8'd0) begin
                             pending_desc <= {DESC_WIDTH{1'b0}};
                             state <= S_COMMIT;
+                            //pending_desc <= {DESC_WIDTH{1'b0}};
+                            //state <= S_COMMIT;
+                            // Генерируем SAVE_RESULT через tick_commit
+                            tick_commit_valid <= 1'b0;
+                            tick_commit_id   <= active_index[IDX_WIDTH-1:0];
+                            // Дальше MMAP сам обработает, но если MMAP нет это будет проблемой
+                        end else if (instr_a == `NAC_OP_CONTROL_FLOW) begin
+                            if (c_count != 4'd3 || d_count != 4'd1) begin
+                                state <= S_ERROR;
+                            end else begin
+                                true_len_latched <= c_flat[16 +: 16];
+                                false_len_latched <= c_flat[32 +: 16];
+                                true_target_latched <= add_unsigned_len(instr_index, 16'd1);
+                                false_target_latched <= add_unsigned_len(instr_index, 16'd1 + c_flat[16 +: 16]);
+                                skip_target_latched <= add_unsigned_len(instr_index, 16'd1 + c_flat[16 +: 16] + c_flat[32 +: 16]);
+                                branch_predicate_idx <= add_signed_offset(instr_index, d_flat[0 +: 16]);
+                                branch_true_target <= add_unsigned_len(instr_index, 16'd1);
+                                branch_false_target <= add_unsigned_len(instr_index, 16'd1 + c_flat[16 +: 16]);
+                                state <= S_BRANCH_REQ;
+                            end
                         end else if (instr_a >= 8'd10) begin
                             if (!dispatch_supported) begin
                                 state <= S_ERROR;
@@ -182,6 +264,24 @@ module nac_orch_fsm #(
                     end
                 end
 
+                S_BRANCH_REQ: begin
+                    branch_req_valid <= 1'b1;
+                    if (branch_req_valid && branch_req_ready) begin
+                        branch_req_valid <= 1'b0;
+                        state <= S_BRANCH_WAIT;
+                    end
+                end
+
+                S_BRANCH_WAIT: begin
+                    if (branch_resp_valid) begin
+                        branch_redirect_valid <= 1'b1;
+                        branch_redirect_target <= branch_take_true ? true_target_latched : false_target_latched;
+                        branch_skip_remaining <= branch_take_true ? true_len_latched : 16'd0;
+                        pending_desc <= {DESC_WIDTH{1'b0}};
+                        state <= S_COMMIT;
+                    end
+                end
+
                 S_KERNEL: begin
                     if (kernel_done) begin
                         pending_desc <= kernel_result_desc;
@@ -197,6 +297,14 @@ module nac_orch_fsm #(
                     tick_commit_id <= active_index[IDX_WIDTH-1:0];
                     if (active_a == `NAC_OP_OUTPUT && active_b == 8'd0) begin
                         state <= S_DONE;
+                    end else if (active_a != `NAC_OP_CONTROL_FLOW && branch_skip_remaining == 16'd1) begin
+                        branch_skip_remaining <= 16'd0;
+                        branch_redirect_valid <= 1'b1;
+                        branch_redirect_target <= skip_target_latched;
+                        state <= S_FETCH;
+                    end else if (active_a != `NAC_OP_CONTROL_FLOW && branch_skip_remaining != 16'd0) begin
+                        branch_skip_remaining <= branch_skip_remaining - 16'd1;
+                        state <= S_FETCH;
                     end else begin
                         state <= S_FETCH;
                     end
@@ -204,7 +312,16 @@ module nac_orch_fsm #(
 
                 S_DONE: begin
                     done <= 1'b1;
-                    state <= S_DONE;
+                    instr_ready <= 1'b0;
+                    if (start) begin
+                        done <= 1'b0;
+                        error <= 1'b0;
+                        branch_req_valid <= 1'b0;
+                        branch_skip_remaining <= 16'd0;
+                        state <= S_FETCH;
+                    end else begin
+                        state <= S_DONE;
+                    end
                 end
 
                 S_ERROR: begin

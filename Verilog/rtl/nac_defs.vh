@@ -76,6 +76,7 @@
 `define NAC_DSP_SCALE         8'd14
 `define NAC_DSP_RSQRT         8'd15
 `define NAC_DSP_EXP           8'd16
+`define NAC_DSP_WEIGHT_UPDATE 8'd17
 
 // MEP opcodes.
 `define MEP_MODEL_RUN_STATIC  8'h80
@@ -85,5 +86,19 @@
 `define MEP_FLOW_BRANCH_IF    8'ha8
 `define MEP_EXEC_RETURN       8'hfe
 `define MEP_EXEC_HALT         8'hff
+
+// TISA manifest constants.
+`define TISA_VERSION_V10      8'h01
+`define TISA_OP_LOWERCASE     8'h01
+`define TISA_OP_UNICODE_NORM  8'h02
+`define TISA_OP_REPLACE       8'h03
+`define TISA_OP_FILTER_CAT    8'h04
+`define TISA_OP_PREPEND       8'h07
+`define TISA_OP_PARTITION     8'h10
+`define TISA_OP_BYTE_ENCODE   8'h15
+`define TISA_OP_BPE_ENCODE    8'h20
+`define TISA_OP_WORDPIECE     8'h21
+`define TISA_OP_UNIGRAM       8'h22
+`define TISA_OP_COMPOSE       8'h30
 
 `endif

@@ -17,7 +17,7 @@ module nac_header_parser (
     output reg  [15:0] d_model,
     output reg  [11*64-1:0] section_offsets
 );
-    reg [6:0] pos;
+    (* fsm_safe_state = "default_state" *) reg [6:0] pos;
     reg running;
     reg [63:0] offset_shift;
     reg [3:0] offset_index;
