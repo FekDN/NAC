@@ -43,7 +43,6 @@ module nac_abcd_decoder_tb;
         .clk(clk),
         .rst(rst),
         .start(start),
-        .num_outputs(16'd1),
         .ops_byte_valid(ops_byte_valid),
         .ops_byte_ready(ops_byte_ready),
         .ops_byte(ops_byte),
