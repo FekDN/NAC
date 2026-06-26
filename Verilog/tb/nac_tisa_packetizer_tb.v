@@ -20,12 +20,13 @@ module nac_tisa_packetizer_tb;
     wire [7:0] payload_byte;
     wire done;
     wire error;
+    reg [31:0] manifest_size;
 
     nac_tisa_packetizer dut (
         .clk(clk),
         .rst(rst),
         .start(start),
-        .manifest_size(32'd11),
+        .manifest_size(manifest_size),
         .byte_valid(byte_valid),
         .byte_ready(byte_ready),
         .byte_in(byte_in),
@@ -57,6 +58,7 @@ module nac_tisa_packetizer_tb;
 
         rst = 1'b1;
         start = 1'b0;
+        manifest_size = 32'd11;
         instr_ready = 1'b1;
         instrs = 0;
         payloads = 0;
@@ -84,6 +86,27 @@ module nac_tisa_packetizer_tb;
 
         if (error) $fatal(1, "TISA packetizer error");
         if (instrs != 1 || payloads != 1) $fatal(1, "bad TISA counts");
+
+        @(negedge clk);
+        rst = 1'b1;
+        @(negedge clk);
+        rst = 1'b0;
+        rom[0] = 8'h54;
+        rom[1] = 8'h49;
+        rom[2] = 8'h53;
+        rom[3] = 8'h41;
+        rom[4] = 8'h02;
+        manifest_size = 32'd5;
+        @(negedge clk);
+        start = 1'b1;
+        @(negedge clk);
+        start = 1'b0;
+        cycles = 0;
+        while (!error && cycles < 20) begin
+            @(posedge clk);
+            cycles = cycles + 1;
+        end
+        if (!error) $fatal(1, "bad TISA version was accepted");
         $display("nac_tisa_packetizer_tb PASS");
         $finish;
     end

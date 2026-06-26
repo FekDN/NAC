@@ -24,6 +24,7 @@ module nac_dsp_pipeline_tb;
     wire sfu_req_valid;
     wire [7:0] sfu_req_mode;
     wire [LANES*DATA_WIDTH-1:0] sfu_req_vec;
+    wire error;
 
     nac_dsp_pipeline #(
         .LANES(LANES),
@@ -48,7 +49,8 @@ module nac_dsp_pipeline_tb;
         .sfu_req_mode(sfu_req_mode),
         .sfu_req_vec(sfu_req_vec),
         .sfu_resp_valid(1'b0),
-        .sfu_resp_vec({LANES*DATA_WIDTH{1'b0}})
+        .sfu_resp_vec({LANES*DATA_WIDTH{1'b0}}),
+        .error(error)
     );
 
     task put_lane;
@@ -101,6 +103,27 @@ module nac_dsp_pipeline_tb;
         if ($signed(out_vec[0 +: 32]) != 10) $fatal(1, "MUL lane0 failed");
         if ($signed(out_vec[96 +: 32]) != 160) $fatal(1, "MUL lane3 failed");
 
+        put_lane(a_vec, 0, 100);
+        put_lane(a_vec, 1, 200);
+        put_lane(a_vec, 2, 300);
+        put_lane(a_vec, 3, 400);
+        put_lane(b_vec, 0, 1);
+        put_lane(b_vec, 1, 2);
+        put_lane(b_vec, 2, 3);
+        put_lane(b_vec, 3, 4);
+        acc_in <= 3;
+        run_vec(`NAC_DSP_WEIGHT_UPDATE);
+        if ($signed(out_vec[0 +: 32]) != 97) $fatal(1, "WEIGHT_UPDATE lane0 failed");
+        if ($signed(out_vec[96 +: 32]) != 388) $fatal(1, "WEIGHT_UPDATE lane3 failed");
+
+        put_lane(a_vec, 0, 1);
+        put_lane(a_vec, 1, 2);
+        put_lane(a_vec, 2, 3);
+        put_lane(a_vec, 3, 4);
+        put_lane(b_vec, 0, 10);
+        put_lane(b_vec, 1, 20);
+        put_lane(b_vec, 2, 30);
+        put_lane(b_vec, 3, 40);
         acc_in <= 5;
         run_vec(`NAC_DSP_MAC);
         if (scalar_out != 305) $fatal(1, "MAC sum failed: %0d", scalar_out);

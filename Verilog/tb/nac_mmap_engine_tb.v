@@ -12,6 +12,8 @@ module nac_mmap_engine_tb;
     reg cfg_valid;
     reg [7:0] cfg_action;
     reg [15:0] cfg_target;
+    reg cfg_static;
+    reg clear_static;
     reg tick_valid;
     reg [3:0] tick_id;
     wire busy;
@@ -45,6 +47,8 @@ module nac_mmap_engine_tb;
         .cfg_valid(cfg_valid),
         .cfg_action(cfg_action),
         .cfg_target(cfg_target),
+        .cfg_static(cfg_static),
+        .clear_static(clear_static),
         .tick_valid(tick_valid),
         .tick_id(tick_id),
         .busy(busy),
@@ -76,6 +80,7 @@ module nac_mmap_engine_tb;
             cfg_slot <= s;
             cfg_action <= a;
             cfg_target <= target;
+            cfg_static <= 1'b0;
             cfg_valid <= 1'b1;
             cfg_we <= 1'b1;
             @(posedge clk);
@@ -91,6 +96,8 @@ module nac_mmap_engine_tb;
         cfg_valid = 0;
         cfg_action = 0;
         cfg_target = 0;
+        cfg_static = 0;
+        clear_static = 0;
         tick_valid = 0;
         tick_id = 0;
         preload_ready = 1'b1;

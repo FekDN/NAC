@@ -16,7 +16,7 @@ module nac_abcd_decoder_tb;
     wire ops_byte_ready;
     wire [7:0] ops_byte;
 
-    assign ops_byte_valid = (rp < 20);
+    assign ops_byte_valid = (rp < 24);
     assign ops_byte = rom[rp];
 
     wire [7:0] perm_lookup_id;
@@ -103,12 +103,17 @@ module nac_abcd_decoder_tb;
         rom[11] = 8'd0;
         rom[12] = 8'hff;
         rom[13] = 8'hff;
-        rom[14] = 8'd0;
+        // Instruction 2: CONTROL_FLOW B=0, C=[3, 5, 7], D=[-2].
+        rom[14] = `NAC_OP_CONTROL_FLOW;
         rom[15] = 8'd0;
-        rom[16] = 8'd0;
+        rom[16] = 8'd3;
         rom[17] = 8'd0;
-        rom[18] = 8'd0;
+        rom[18] = 8'd5;
         rom[19] = 8'd0;
+        rom[20] = 8'd7;
+        rom[21] = 8'd0;
+        rom[22] = 8'hfe;
+        rom[23] = 8'hff;
 
         rst = 1'b1;
         start = 1'b0;
@@ -122,7 +127,7 @@ module nac_abcd_decoder_tb;
         @(negedge clk);
         start = 1'b0;
 
-        while (seen < 2) begin
+        while (seen < 3) begin
             @(posedge clk);
             cycles = cycles + 1;
             if (cycles > 200) begin
@@ -135,9 +140,16 @@ module nac_abcd_decoder_tb;
                     if (d_count != 4'd2) $fatal(1, "bad D count");
                     if (d_flat[0 +: 16] != 16'hffff) $fatal(1, "bad D0");
                     if (d_flat[16 +: 16] != 16'hfffe) $fatal(1, "bad D1");
-                end else begin
+                end else if (seen == 1) begin
                     if (instr_a != `NAC_OP_OUTPUT || instr_b != 8'd0) $fatal(1, "bad output opcode");
                     if (c_count != 4'd2 || d_count != 4'd1) $fatal(1, "bad output counts");
+                end else if (seen == 2) begin
+                    if (instr_a != `NAC_OP_CONTROL_FLOW || instr_b != 8'd0) $fatal(1, "bad control-flow opcode");
+                    if (c_count != 4'd3 || d_count != 4'd1) $fatal(1, "bad control-flow counts");
+                    if (c_flat[0 +: 16] != 16'd3) $fatal(1, "bad control-flow C0");
+                    if (c_flat[16 +: 16] != 16'd5) $fatal(1, "bad control-flow true len");
+                    if (c_flat[32 +: 16] != 16'd7) $fatal(1, "bad control-flow false len");
+                    if (d_flat[0 +: 16] != 16'hfffe) $fatal(1, "bad control-flow predicate offset");
                 end
                 seen = seen + 1;
             end
