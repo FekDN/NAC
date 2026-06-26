@@ -204,12 +204,6 @@ module nac_orch_fsm #(
                         end else if (instr_a == `NAC_OP_OUTPUT && instr_b == 8'd0) begin
                             pending_desc <= {DESC_WIDTH{1'b0}};
                             state <= S_COMMIT;
-                            //pending_desc <= {DESC_WIDTH{1'b0}};
-                            //state <= S_COMMIT;
-                            // Генерируем SAVE_RESULT через tick_commit
-                            tick_commit_valid <= 1'b0;
-                            tick_commit_id   <= active_index[IDX_WIDTH-1:0];
-                            // Дальше MMAP сам обработает, но если MMAP нет это будет проблемой
                         end else if (instr_a == `NAC_OP_CONTROL_FLOW) begin
                             if (c_count != 4'd3 || d_count != 4'd1) begin
                                 state <= S_ERROR;

@@ -154,7 +154,6 @@ module nac_core #(
     wire [15:0] csr_d_model;
     wire [11*64-1:0] csr_section_offsets;
     wire csr_active_valid;
-    wire [15:0] decoder_num_outputs = (csr_active_valid && (cmd_load_model_i || load_mode || cache_run_mode)) ? csr_num_outputs : num_outputs;
 
     nac_csr_bank #(
         .CONTEXTS(CONTEXTS),
@@ -248,7 +247,6 @@ module nac_core #(
         .clk(clk),
         .rst(decoder_rst),
         .start(start_i | cmd_load_model_i),
-        .num_outputs(decoder_num_outputs),
         .ops_byte_valid(ops_byte_valid),
         .ops_byte_ready(ops_byte_ready),
         .ops_byte(ops_byte),

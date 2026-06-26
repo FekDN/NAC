@@ -9,8 +9,6 @@ module nac_abcd_decoder #(
     input  wire rst,
     input  wire start,
 
-    input  wire [15:0] num_outputs,
-
     input  wire ops_byte_valid,
     output wire ops_byte_ready,
     input  wire [7:0] ops_byte,
@@ -133,17 +131,9 @@ module nac_abcd_decoder #(
                                     sys_c_len_from_stream <= 1'b1;
                                     sys_c_target_count <= 16'd1;
                                     sys_d_target_count <= 16'd0;
-                                    // sys_c_target_count <= num_outputs + 16'd1;
-                                    // num_outputs + 1 уже лежит в C[0] (как length prefix)
-                                    sys_c_target_count <= c_flat[0 +: 16];  // используем ABCD-данные
-                                    sys_d_target_count <= num_outputs;
                                     c_idx <= 4'd0;
                                     d_idx <= 4'd0;
-                                    if ((num_outputs + 16'd1) > MAX_CONSTS || num_outputs > MAX_ARITY) begin
-                                        state <= S_ERROR;
-                                    end else begin
-                                        state <= S_SYS_C_LO;
-                                    end
+                                    state <= S_SYS_C_LO;
                                 end else if (instr_a == `NAC_OP_OUTPUT && ops_byte == 8'd3) begin
                                     sys_c_target_count <= 16'd2;
                                     sys_d_target_count <= 16'd2;
@@ -275,7 +265,23 @@ module nac_abcd_decoder #(
                             tmp16[15:8] <= ops_byte;
                             c_flat[c_idx*16 +: 16] <= {ops_byte, tmp16[7:0]};
                             c_count <= c_idx + 4'd1;
-                            if ((c_idx + 4'd1) >= sys_c_target_count[3:0]) begin
+                            if (sys_c_len_from_stream) begin
+                                sys_c_len_from_stream <= 1'b0;
+                                if ({ops_byte, tmp16[7:0]} == 16'd0 ||
+                                    {ops_byte, tmp16[7:0]} > MAX_CONSTS ||
+                                    ({ops_byte, tmp16[7:0]} - 16'd1) > MAX_ARITY) begin
+                                    state <= S_ERROR;
+                                end else begin
+                                    sys_c_target_count <= {ops_byte, tmp16[7:0]};
+                                    sys_d_target_count <= {ops_byte, tmp16[7:0]} - 16'd1;
+                                    if ({ops_byte, tmp16[7:0]} == 16'd1) begin
+                                        state <= S_EMIT;
+                                    end else begin
+                                        c_idx <= 4'd1;
+                                        state <= S_SYS_C_LO;
+                                    end
+                                end
+                            end else if ((c_idx + 4'd1) >= sys_c_target_count[3:0]) begin
                                 if (sys_d_target_count == 0) state <= S_EMIT;
                                 else state <= S_SYS_D_LO;
                             end else begin
